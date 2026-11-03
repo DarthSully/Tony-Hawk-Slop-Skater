@@ -1,0 +1,401 @@
+From 4152faa23b54a4ddaa1eabe6c88ec6bac8202588 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 22:00:26 +0000
+Subject: [PATCH 3/3] Vita: route the camera code's null-pointer reads to the
+ low page (PC_LOW)
+
+The x86 builds redirect null and near-null accesses to the low page from
+their fault handler; the Vita has none. A 40000-frame attract-mode run on
+Linux found them in CCamera (mTripod, pCurrentViewport) and
+CamPt_SetClosestCamera (pCurrentViewport); with PC_LOW there it logs no
+low-memory access. README: the PS Vita section.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01NwhU758snL1NnmSbmmwENz
+---
+ game/src/camera.cpp           | 56 +++++++++++++++++------------------
+ game/src/campt.cpp            | 16 +++++-----
+ platform/pc/README.md         | 37 +++++++++++++++++++++++
+ platform/pc/include/pc_game.h | 10 +++++++
+ platform/pc/src/pc_main.cpp   |  2 ++
+ platform/pc/tools/build.py    |  4 ++-
+ 6 files changed, 88 insertions(+), 37 deletions(-)
+
+diff --git a/game/src/camera.cpp b/game/src/camera.cpp
+index 1c7ebbd..7edc250 100644
+--- a/game/src/camera.cpp
++++ b/game/src/camera.cpp
+@@ -75,9 +75,9 @@ CCamera::CCamera(CBody *tripod, ushort mike_index)
+       mColCheckCycleCounter(0), mDownDist(0), mSpeedUpIntro(0), mStoppedExtraYRot(0) {
+ 	loose_cam_timer = 0;
+ 
+-	if (((CBruce *)mTripod)->mpPad == &Pad[0])
++	if (((CBruce *)PC_LOW(mTripod))->mpPad == &Pad[0])
+ 		mMikeIndex = 0;
+-	else if (((CBruce *)mTripod)->mpPad == &Pad[1])
++	else if (((CBruce *)PC_LOW(mTripod))->mpPad == &Pad[1])
+ 		mMikeIndex = 1;
+ 
+ 	vFront = CVector(0, 0, 4096);
+@@ -176,7 +176,7 @@ void CCamera::SetComplexMode(ushort mode) {}
+ void CCamera::LoadIntoMikeCamera() {
+ 	VECTOR v;
+ 
+-	if (((CBruce *)mTripod)->mPhysicsState == 5) {
++	if (((CBruce *)PC_LOW(mTripod))->mPhysicsState == 5) {
+ 		MikeCamera[Camera_CurrentMikeCamera].Position.vx = (mTripodPos.vx + old_offset.vx) >> 12;
+ 		MikeCamera[Camera_CurrentMikeCamera].Position.vy = (mTripodPos.vy + old_offset.vy) >> 12;
+ 		MikeCamera[Camera_CurrentMikeCamera].Position.vz = (mTripodPos.vz + old_offset.vz) >> 12;
+@@ -208,7 +208,7 @@ void CCamera::ResetOrientation() {
+ 	vtemp1.vx = 0;
+ 	vtemp1.vy = 0;
+ 	vtemp1.vz = -4096;
+-	ApplyMatrixLV(&((CBruce *)mTripod)->mRotMatrix, &vtemp1, &vtemp2);
++	ApplyMatrixLV(&((CBruce *)PC_LOW(mTripod))->mRotMatrix, &vtemp1, &vtemp2);
+ 
+ 	vFront.vx = vtemp2.vx;
+ 	vFront.vy = vtemp2.vy;
+@@ -283,7 +283,7 @@ void CCamera::ReactToCollision() {
+ 				mColAngBuffer[2] = 0;
+ 			}
+ 		} else {
+-			if (((CBruce *)mTripod)->mPhysicsState == 1)
++			if (((CBruce *)PC_LOW(mTripod))->mPhysicsState == 1)
+ 				mColAngBuffer[2] = 512;
+ 			else
+ 				mColAngBuffer[2] = mPrevColAngBuffer[2];
+@@ -291,7 +291,7 @@ void CCamera::ReactToCollision() {
+ 			mDownDist = -1;
+ 		}
+ 
+-		if (((CBruce *)mTripod)->mPhysicsState == 2) {
++		if (((CBruce *)PC_LOW(mTripod))->mPhysicsState == 2) {
+ 			vTemp.vx = 0;
+ 			vTemp.vy = Camera_CamDist << 13;
+ 			vTemp.vz = 0;
+@@ -440,7 +440,7 @@ void CCamera::ReactToCollision() {
+ 	vTemp.vz = 0;
+ 	ApplyMatrixLV(&m, &vTemp, &vOffset);
+ 
+-	if (big_air_timer <= 0 && ((CBruce *)mTripod)->mPhysicsState != 2 && mCollisionBack) {
++	if (big_air_timer <= 0 && ((CBruce *)PC_LOW(mTripod))->mPhysicsState != 2 && mCollisionBack) {
+ 		uint ratioL;
+ 		uint ratioR = 0;
+ 		int ang;
+@@ -495,7 +495,7 @@ void CCamera::ReactToCollision() {
+ 
+ 		ang = 1384;
+ 
+-		if (((CBruce *)mTripod)->mPhysicsState == 4) {
++		if (((CBruce *)PC_LOW(mTripod))->mPhysicsState == 4) {
+ 			ratioR = 0;
+ 			ratioL = 0;
+ 		}
+@@ -517,7 +517,7 @@ void CCamera::ReactToCollision() {
+ 		}
+ 	}
+ 
+-	if (big_air_timer > 0 || ((CBruce *)mTripod)->mPhysicsState == 2) {
++	if (big_air_timer > 0 || ((CBruce *)PC_LOW(mTripod))->mPhysicsState == 2) {
+ 		mColAngBuffer[3] = 0;
+ 		mPrevColAngBuffer[3] = 0;
+ 	}
+@@ -614,7 +614,7 @@ void CCamera::ReactToCollision() {
+ 			mStoppedOValid = 0;
+ 	}
+ 
+-	if (mSpeed < 4 || mTripodPos == mOldTripodPos || ((CBruce *)mTripod)->mInAir) {
++	if (mSpeed < 4 || mTripodPos == mOldTripodPos || ((CBruce *)PC_LOW(mTripod))->mInAir) {
+ 		if (!mStoppedOValid && mDownDist >= 0) {
+ 			Quat_Slerp(mO, mDesiredO, 1536, mStoppedO);
+ 
+@@ -707,9 +707,9 @@ void CCamera::MoveToDesiredPos(uint normal_slerp) {
+ 	int temptime;
+ 
+ 	old_pos = mPos;
+-	Dist = mTripod->mVel;
++	Dist = PC_LOW(mTripod)->mVel;
+ 
+-	if (((CBruce *)mTripod)->mPhysicsState == 0 || ((CBruce *)mTripod)->mPhysicsState == 4) {
++	if (((CBruce *)PC_LOW(mTripod))->mPhysicsState == 0 || ((CBruce *)PC_LOW(mTripod))->mPhysicsState == 4) {
+ 		{
+ 			int i;
+ 
+@@ -777,7 +777,7 @@ void CCamera::MoveToDesiredPos(uint normal_slerp) {
+ 			mDesiredO = wouldbeO;
+ 	}
+ 
+-	if ((big_air && ((CBruce *)mTripod)->mDoingATrick) || big_air_timer > 0) {
++	if ((big_air && ((CBruce *)PC_LOW(mTripod))->mDoingATrick) || big_air_timer > 0) {
+ 		ReactToCollision();
+ 
+ 		if (!big_air_timer)
+@@ -842,11 +842,11 @@ void CCamera::MoveToDesiredPos(uint normal_slerp) {
+ 		mDesiredO = mDesiredO * Quat_FromXRot(Camera_CamPitch);
+ 		ReactToCollision();
+ 
+-		if (((CBruce *)mTripod)->m740) {
+-			if (((CBruce *)mTripod)->mPhysicsState == 3) {
++		if (((CBruce *)PC_LOW(mTripod))->m740) {
++			if (((CBruce *)PC_LOW(mTripod))->mPhysicsState == 3) {
+ 				loosen_up = 1;
+ 				loose_cam_timer = 20;
+-			} else if (((CBruce *)mTripod)->mPhysicsState == 1) {
++			} else if (((CBruce *)PC_LOW(mTripod))->mPhysicsState == 1) {
+ 				mDesiredO = mDesiredO * Quat_FromXRot(200);
+ 			}
+ 		}
+@@ -1250,16 +1250,16 @@ void CCamera::AI() {
+ 			mZoom += mZoomIncrement;
+ 		}
+ 
+-		pCurrentViewport->Zoom = mZoom;
++		PC_LOW(pCurrentViewport)->Zoom = mZoom;
+ 		Utils_CalcAim(mAngles, mPos, mFocusPos);
+ 
+-		if (((CBruce *)mTripod)->m8FE && mTripodPosYDamper) {
+-			if (mTripod->mVel.vy < 0)
++		if (((CBruce *)PC_LOW(mTripod))->m8FE && mTripodPosYDamper) {
++			if (PC_LOW(mTripod)->mVel.vy < 0)
+ 				jump_uptimer++;
+ 			else
+ 				jump_uptimer--;
+ 
+-			jump_acc += (-mTripod->mVel.vy >> 12) * mTripodPosYDamper;
++			jump_acc += (-PC_LOW(mTripod)->mVel.vy >> 12) * mTripodPosYDamper;
+ 
+ 			if (jump_uptimer > 0)
+ 				mTripodPos.vy += jump_acc;
+@@ -1271,7 +1271,7 @@ void CCamera::AI() {
+ 		short damp = mPitchDamper;
+ 
+ 		if (damp) {
+-			int vy = mTripod->mVel.vy;
++			int vy = PC_LOW(mTripod)->mVel.vy;
+ 
+ 			if (vy < 0)
+ 				Camera_CamPitch -= damp;
+@@ -1294,13 +1294,13 @@ void CCamera::AI() {
+ 				goto Done;
+ 		}
+ 
+-		if (((CBruce *)mTripod)->mInAir)
++		if (((CBruce *)PC_LOW(mTripod))->mInAir)
+ 			MoveToDesiredPos(311);
+ 		else if (mTripodPos == mOldTripodPos)
+ 			MoveToDesiredPos(151);
+ 		else if (mSpeed < 4)
+ 			MoveToDesiredPos(151);
+-		else if (((CBruce *)mTripod)->mPhysicsState == 1) {
++		else if (((CBruce *)PC_LOW(mTripod))->mPhysicsState == 1) {
+ 			if (mTimer < 18)
+ 				MoveToDesiredPos(311);
+ 			else
+@@ -1359,7 +1359,7 @@ void CCamera::CM_Normal() {
+ 	int dot_front;
+ 	CVector temp_vel = mTripodPos - mOldTripodPos;
+ 
+-	vUp = ((CBruce *)mTripod)->mUp;
++	vUp = ((CBruce *)PC_LOW(mTripod))->mUp;
+ 	CVector Down(0, 4096, 0);
+ 	CVector Zero(0, 0, 0);
+ 	CVector temp_front;
+@@ -1373,9 +1373,9 @@ void CCamera::CM_Normal() {
+ 	in_pool_timer++;
+ 
+ 	if (dot_up < 3572 &&
+-	    (((CBruce *)mTripod)->mPhysicsState == 2 || ((CBruce *)mTripod)->mPhysicsState == 8)) {
+-		if (!big_air && ((CBruce *)mTripod)->m740)
+-			((CBruce *)mTripod)->mBigAirs++;
++	    (((CBruce *)PC_LOW(mTripod))->mPhysicsState == 2 || ((CBruce *)PC_LOW(mTripod))->mPhysicsState == 8)) {
++		if (!big_air && ((CBruce *)PC_LOW(mTripod))->m740)
++			((CBruce *)PC_LOW(mTripod))->mBigAirs++;
+ 
+ 		if (++turn_delay_timer >= 4)
+ 			vFront = CVector(0, 0x1000000, 0);
+@@ -1568,7 +1568,7 @@ void CCamera::CM_NoBigAir() {
+ 	int dot_front;
+ 	CVector temp_vel = mTripodPos - mOldTripodPos;
+ 
+-	vUp = ((CBruce *)mTripod)->mUp;
++	vUp = ((CBruce *)PC_LOW(mTripod))->mUp;
+ 	CVector Down(0, 4096, 0);
+ 	CVector Zero(0, 0, 0);
+ 	CVector temp_front;
+diff --git a/game/src/campt.cpp b/game/src/campt.cpp
+index 2eec23f..748b239 100644
+--- a/game/src/campt.cpp
++++ b/game/src/campt.cpp
+@@ -183,21 +183,21 @@ void CamPt_SetClosestCamera(CBruce *pSkater) {
+ 				case 0:
+ 					camDist = 245;
+ 					camPitch = 215;
+-					pCurrentViewport->TanHalf = 2410;
++					PC_LOW(pCurrentViewport)->TanHalf = 2410;
+ 					pSkater->mpCamera->extra_YRot = 0;
+ 					camYOffset = -70;
+ 					break;
+ 				case 1:
+ 					camDist = 175;
+ 					camPitch = 50;
+-					pCurrentViewport->TanHalf = 2930;
++					PC_LOW(pCurrentViewport)->TanHalf = 2930;
+ 					pSkater->mpCamera->extra_YRot = 0;
+ 					camYOffset = -17;
+ 					break;
+ 				case 2:
+ 					camDist = 290;
+ 					camPitch = 150;
+-					pCurrentViewport->TanHalf = 3410;
++					PC_LOW(pCurrentViewport)->TanHalf = 3410;
+ 					pSkater->mpCamera->extra_YRot = 0;
+ 					camYOffset = -108;
+ 					break;
+@@ -207,27 +207,27 @@ void CamPt_SetClosestCamera(CBruce *pSkater) {
+ 					camDist = 245;
+ 					camPitch = 215;
+ 					camYOffset = -70;
+-					pCurrentViewport->TanHalf = 2410;
++					PC_LOW(pCurrentViewport)->TanHalf = 2410;
+ 					pSkater->mpCamera->extra_YRot = 2048;
+ 					break;
+ 				case 5:
+ 					camDist = 195;
+ 					camPitch = 50;
+ 					camYOffset = -17;
+-					pCurrentViewport->TanHalf = 2930;
++					PC_LOW(pCurrentViewport)->TanHalf = 2930;
+ 					pSkater->mpCamera->extra_YRot = 2048;
+ 					break;
+ 				case 6:
+ 					camDist = 290;
+ 					camPitch = 150;
+ 					camYOffset = -108;
+-					pCurrentViewport->TanHalf = 3410;
++					PC_LOW(pCurrentViewport)->TanHalf = 3410;
+ 					pSkater->mpCamera->extra_YRot = 2048;
+ 					break;
+ 			}
+ 		} else if (*pFlags & 0x400) {
+ 			if (*pFlags & 0x200) {
+-				pCurrentViewport->TanHalf = (256 - (*pFlags & 255)) * 10 + 300;
++				PC_LOW(pCurrentViewport)->TanHalf = (256 - (*pFlags & 255)) * 10 + 300;
+ 			} else if (*pFlags & 0x100) {
+ 				int Dist;
+ 				int FogDist;
+@@ -244,7 +244,7 @@ void CamPt_SetClosestCamera(CBruce *pSkater) {
+ 
+ 				DpqMin = FogDist + LastDpqMin;
+ 				DpqMax = DpqMin + (LastDpqMax - LastDpqMin);
+-				pCurrentViewport->TanHalf = (int)(*pFlags & 255) * 34130 / Dist;
++				PC_LOW(pCurrentViewport)->TanHalf = (int)(*pFlags & 255) * 34130 / Dist;
+ 			}
+ 		}
+ 	}
+diff --git a/platform/pc/README.md b/platform/pc/README.md
+index 6b9be3e..df0df0f 100644
+--- a/platform/pc/README.md
++++ b/platform/pc/README.md
+@@ -244,6 +244,43 @@ from their files (`src/pc_stream.cpp`). The disc image is read only by the extra
+ back). Playlist entries are relative to `Data/Music` or absolute; an STR the game doesn't know
+ plays with its first song's settings.
+ 
++### PS Vita
++
++`THPS_ARCH=vita` cross-compiles with [VitaSDK](https://vitasdk.org) (`VITASDK`, default
++`/usr/local/vitasdk`; its SDL2 and vitaGL) and packages a VPK:
++
++```
++export VITASDK=/usr/local/vitasdk
++THPS_ARCH=vita python3 platform/pc/tools/build.py   # -> build/vita/thps.vpk (title ID THPS00001)
++```
++
++The build needs the same inputs as the PC ones (`extern/thps1_retail/SLUS_008.60`, the GNU v2
++demangler, `build/psyq_names.tsv`). To run it on the console:
++
++- Install `thps.vpk` with VitaShell.
++- Put the disc image in `ux0:data/THPS/` as `thps1.bin` (or `Tony Hawk's Pro Skater (USA).bin`).
++  The first start extracts `Data/` next to it (about 630 MB; the image can be deleted afterwards).
++- vitaGL compiles the renderer's shaders at runtime: `ur0:data/libshacccg.suprx` must be present
++  (extracted from the firmware with ShaRKBR33D or the like).
++- `ux0:data/THPS/thps.log` is the log (written straight through, so it survives a crash);
++  `ux0:data/THPS/env.txt` holds `NAME=value` lines that stand in for environment variables
++  (`THPS_TRACE=1` ...). Saves go in `ux0:data/THPS` too.
++
++How the Vita build differs:
++
++- ARM EABI: game code and data are compiled with `-fno-short-enums` (the game's structs have
++  4-byte enums) and `-fpcc-struct-return` (aggregates returned through memory, as egcs on MIPS
++  does). The Cortex-A9 has no divide instruction; the EABI division helpers are wrapped
++  (`src/pc_vita.cpp`) to give the R3000's division-by-zero results.
++- There are no fault handlers: null and near-null reads the x86 builds redirect to the low page
++  are routed there by `PC_LOW()` (`include/pc_game.h`) at the sites they were found at. A new
++  one crashes the Vita build; on Linux it shows in the log as a "low-memory access" line.
++- The renderer is the OpenGL ES 2 one (`include/pc/gl_shaders_gles.h`, `PC_GLES`): the same
++  pipeline as the GL 3.3 one, with float palette lookups from a luminance-alpha texture store,
++  depth from clip space instead of `gl_FragDepth`, and blending without dual-source outputs. It
++  draws at 1x (320x240) and scales to the 960x544 screen. No shadows or MSAA.
++  `THPS_GLES=1` builds it for Linux (with its own `THPS_BUILD_DIR`) to test it on a desktop.
++
+ ### The Dreamcast version's data
+ 
+ The first extraction can come from the **Dreamcast** disc instead (Treyarch's port; a `.gdi`
+diff --git a/platform/pc/include/pc_game.h b/platform/pc/include/pc_game.h
+index e640fae..f633161 100644
+--- a/platform/pc/include/pc_game.h
++++ b/platform/pc/include/pc_game.h
+@@ -20,6 +20,16 @@ void pc_vdelete(void *vtable, int slot, void *obj);
+  * has no GTE; use the geometry maths (pc_geom.h). */
+ void PC_GteAsmInPcBuild(void)
+     __attribute__((error("GTE asm in the game's code: use the geometry maths (pc_geom.h)")));
++
++/* A pointer the game can leave null (or near it) where retail read and wrote low RAM: the same
++ * address in the low page (64 KB, zero until written; pc_main.cpp), which is where the x86 builds'
++ * fault handler redirects such an access. The PS Vita has no such handler: the sites it was
++ * found at go through this. */
++extern unsigned char *pc_low_page;
++static inline void *PC_LowPtr(void *p) {
++    return (unsigned long)p < 0x10000ul ? (void *)(pc_low_page + (unsigned long)p) : p;
++}
++#define PC_LOW(p) ((__typeof__(p))PC_LowPtr((void *)(p)))
+ #ifdef __cplusplus
+ }
+ template <class T> static inline void pc_delete(T *p) {
+diff --git a/platform/pc/src/pc_main.cpp b/platform/pc/src/pc_main.cpp
+index c5553e4..eaf272e 100644
+--- a/platform/pc/src/pc_main.cpp
++++ b/platform/pc/src/pc_main.cpp
+@@ -48,6 +48,7 @@ typedef uint32_t u32;
+ 
+ 
+ volatile uint32_t pc_heartbeat; /* bumped by every presented frame */
++unsigned char *pc_low_page;     /* Diagnostics::AllocLowPage, for PC_LOW (pc_game.h) */
+ int pc_trace;
+ 
+ extern "C" const char *PC_SymbolName(uint32_t addr); /* generated: names.c */
+@@ -605,6 +606,7 @@ void Diagnostics::AllocLowPage() {
+         PC_Fatal("out of memory");
+     m_lowFatal = getenv("THPS_LOWMEM_FATAL") && atoi(getenv("THPS_LOWMEM_FATAL"));
+     m_lowPage = (uint8_t *)(((uintptr_t)p + LOW_PAGE - 1) & ~(uintptr_t)(LOW_PAGE - 1));
++    pc_low_page = m_lowPage;
+ }
+ 
+ } // namespace pc
+diff --git a/platform/pc/tools/build.py b/platform/pc/tools/build.py
+index 764dc7f..78f48a1 100644
+--- a/platform/pc/tools/build.py
++++ b/platform/pc/tools/build.py
+@@ -365,7 +365,9 @@ NATIVE_OK = re.compile(r"^(__alloca|___chkstk.*|__[a-z]*div[sd]i3|__[a-z]*mod[sd
+                        r"_?memmove|__fixunsdfdi|__floatdidf|_?abort|_?pc_geom\w*|_?M3dMaths_LastVec|"
+                        r"_?M3dAsm_ColourCode|__ZTV.*|___cxa_.*|"
+                        r"___gxx_personality.*|__Unwind.*|___dso_handle|_atexit|"
+-                       r"__GLOBAL_OFFSET_TABLE_|_?pc_delete_mark|_?pc_vdelete|"
++                       r"__GLOBAL_OFFSET_TABLE_|_?pc_delete_mark|_?pc_vdelete|_?pc_low_page|"
++                       # ARM's EABI helpers (division, the Vita)
++                       r"_?__aeabi_\w+|"
+                        # the C library: the host's, not Psy-Q's LIBC at its retail addresses
+                        r"_?sprintf|_?strcpy|_?strlen|_?strcmp|_?strncmp|_?memchr|_?malloc|_?free)$")
+ 
+-- 
+2.43.0
+

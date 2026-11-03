@@ -1,0 +1,539 @@
+From a83a55c99c68c9edaea64f84a544f4cb80c595e8 Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Sat, 31 Oct 2026 15:04:06 +0300
+Subject: [PATCH] Vita: writes outside the texels in use leave cached pages
+ alone (level video screens); STR pictures decoded on four cores with a
+ transform that skips zeros
+
+- t31's dips (15-17 fps, ~6 pages freed and ~6 updated a frame): no palette writes in a level,
+  and the same-bytes skip stays 0 because the bytes do change: the writes are the song's 96-wide
+  video going to a level's screen (PC_VdecToTexture), ~100 rows ~15 times a second into a page
+  other textures share. Every cached page on that VRAM page (each CLUT) was redone per picture.
+- Each slot keeps the box of texels its faces have used (SlotUse, from GlVert.uvr; a texture
+  window: all). A write outside the box leaves the slot alone; its rows are decoded when a
+  face first reaches them, and CacheCheck skips them till then (THPS_GL_USEDBOX=0: as t31).
+  Updates in place have no row limit now and use the decode threads from 32 rows. No GPU wait
+  in them. [gl] line: writes outside the texels in use.
+- FMV: STR pictures took ~70 ms each on the game's core (14 fps): a full 1024-multiply transform
+  per block. VideoDecoder::Block skips zero rows and coefficients (a DC-only block is one value),
+  Clamp8 no longer calls lrintf, and Frame decodes columns of macroblocks on the game thread and
+  3 threads on cores 1-3 (a first walk through the codes finds where each share starts;
+  THPS_FMV_THREAD=0: the game thread alone). Boot of a movie logs "[fmv] ...". The levels' video
+  screens use the same decoder. Off-device, a synthetic 320x240 frame: 15-bit identical, 24-bit
+  1 byte of 230400 off by 1 (rounding), split by shares identical to whole.
+---
+ platform/pc/README.md           |   2 +
+ platform/pc/include/pc/gl_gpu.h |   9 ++
+ platform/pc/include/pc/vdec.h   |  14 ++-
+ platform/pc/src/pc_gpu_gl.cpp   |  90 +++++++++++----
+ platform/pc/src/pc_vdec.cpp     | 195 +++++++++++++++++++++++++++-----
+ 5 files changed, 255 insertions(+), 55 deletions(-)
+
+diff --git a/platform/pc/README.md b/platform/pc/README.md
+index 0bbb987..1986348 100644
+--- a/platform/pc/README.md
++++ b/platform/pc/README.md
+@@ -579,6 +579,8 @@ window, `THPS_FAST`, `THPS_DETERMINISTIC`) never wait for a display.
+ | `THPS_GL_SAMEBYTES=0` | texture writes of the bytes already there are done anyway (default t31: skipped) |
+ | `THPS_GL_PRECISEINV=0` | a texture write reaches the cached pages by 16x16 cells at the next draw (default t31: its exact rectangle) |
+ | `THPS_GL_PARTIAL=0` | cached pages a write reaches are freed (default t31: pages drawn lately have the written rows decoded again in place) |
++| `THPS_GL_USEDBOX=0` | a texture write reaches a cached page wherever it lands on it (default t32: only if a face has used those texels) |
++| `THPS_FMV_THREAD=0` | Vita: STR movie pictures and video screens decoded by the game thread alone (default t32: with 3 threads on cores 1-3) |
+ | `THPS_FILE_DIRECT=0` | Vita: game files read with stdio as before t28 (default: sceIoRead in pieces of 1 MB, an open reads only the header) |
+ | `THPS_GL_DECODE_THREADS=n` | Vita: texture cache pages decoded by n threads on cores 1-3 with the game thread (default 3, 0 = the game thread alone) |
+ | `THPS_GL_NODISCARD=0` | OpenGL ES (Vita), batched 3D: no separate no-discard, no-blend program for opaque faces with no transparent texel under them |
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index c93ed13..31d9c81 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -252,6 +252,7 @@ class GlGpu {
+         int store_cells, store_switches, store_copies, blit_pool, blit_copies;
+         int cache_stale, own_fixed;
+         int cache_same, cache_partial;  /* t31: writes skipped (same bytes), slots updated in place */
++        int cache_outside;              /* t32: writes that reached no texel a slot's faces use */
+         int gl_draws, layer_draws, split[PC_GL_SPLITS];
+         int layer_bufs, layer_client;   /* 3D layers drawn from a buffer; 3D draws not */
+         int layer_batches;              /* t20: 3D draws made by LayerBatch */
+@@ -357,6 +358,10 @@ class GlGpu {
+         int dirty;           /* its texels or CLUT were written */
+         int x, y, w;         /* its texels in VRAM (halfwords) */
+         int cx, cy, cw;      /* its CLUT (cw 0: 15-bit, none) */
++        /* t32: the box of its texels faces have used (ux1 < ux0: none yet), and the rows written
++         * outside that box since it was decoded, which no face has read (sy1 < sy0: none) */
++        int ux0, uy0, ux1, uy1;
++        int sy0, sy1;
+     };
+     static constexpr int kCacheSlots = 128, kAtlasUnit = 4;
+     /* the atlas: 16x8 slots of 256x256, or 8x16 (the boot self-test, SelfTest) */
+@@ -438,6 +443,10 @@ private:
+     /* t31 (THPS_GL_PRECISEINV=0: by 16x16 cells at the next Prepare, which reached every CLUT in
+      * those 16 rows; THPS_GL_PARTIAL=0: no updates in place) */
+     bool m_preciseInv = true, m_partial = true;
++    /* t32 (THPS_GL_USEDBOX=0: every write to a page counts): the box a slot's faces used */
++    bool m_usedBox = true;
++    void SlotUse(int s, const GlVert *v);
++    void DecodeRows(int s, int y0, int y1);
+     void CacheRefresh();
+     /* row y of a slot's texels, decoded from the store into out (256 RGBA texels) */
+     void DecodeRow(const CacheSlot &c, int y, uint32_t *out);
+diff --git a/platform/pc/include/pc/vdec.h b/platform/pc/include/pc/vdec.h
+index 247f11f..c175854 100644
+--- a/platform/pc/include/pc/vdec.h
++++ b/platform/pc/include/pc/vdec.h
+@@ -17,12 +17,18 @@ public:
+      * rgb24) at y, h high. */
+     void ToTexture(const void *runlevel, bool rgb24, int x, int y, int xend, int h);
+ 
++    /* the run-level halfwords still to read (t32: one per thread decoding) */
++    struct Cursor {
++        const uint16_t *in, *end;
++    };
++    /* macroblock columns c0..c1-1, the first starting at cur */
++    void Columns(Cursor cur, int c0, int c1, int h, uint8_t *out, int pitch, int bpp);
++
+ private:
+-    uint32_t Next();
+-    void Block(float out[64]);
+-    void Macroblock(uint8_t *out, int pitch, int h);
++    void Block(Cursor &cur, float out[64]);
++    void Macroblock(Cursor &cur, uint8_t *out, int pitch, int h);
++    static void SkipMacroblock(Cursor &cur);
+ 
+-    const uint16_t *m_in = nullptr, *m_end = nullptr; /* run-level halfwords still to decode */
+     bool m_rgb24 = false;
+     uint16_t *m_texBuf = nullptr; /* ToTexture's picture, before it goes to the texture store */
+     int m_texCap = 0;
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index 6a3da00..b252928 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -861,6 +861,8 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+         const char *pi = getenv("THPS_GL_PRECISEINV"), *pa = getenv("THPS_GL_PARTIAL");
+         m_preciseInv = !(pi && pi[0] == '0');
+         m_partial = !(pa && pa[0] == '0');
++        const char *ub = getenv("THPS_GL_USEDBOX");
++        m_usedBox = !(ub && ub[0] == '0');
+         fprintf(stderr, "[gl] texture cache writes: %s, %s, %s\n",
+                 m_preciseInv ? "exact rectangles (THPS_GL_PRECISEINV=0: 16x16 cells)" : "16x16 cells",
+                 m_partial ? "pages updated in place (THPS_GL_PARTIAL=0: freed)" : "pages freed",
+@@ -1816,16 +1818,22 @@ void GlGpu::TexturesWritten(int x, int y, int w, int h)
+             continue;
+ #ifdef __vita__
+         int y0 = (y > c.y ? y - c.y : 0) & ~7, y1 = (y + h - 1 - c.y < 255 ? y + h - 1 - c.y : 255) | 7;
+-        if (m_partial && !clut && (uint32_t)(c.key >> 32) == 0xffffu && c.x + c.w <= VRAM_W &&
+-            y1 - y0 < 64 && m_frameNo - c.frame < 4) {
+-            uint32_t row[256];
+-            for (int b = y0 >> 3; b <= y1 >> 3; b++)
+-                m_slotTransp[s][b] = 0;
+-            for (int r = y0; r <= y1; r++) {
+-                DecodeRow(c, r, row);
+-                memcpy(AtlasRow(s, r), row, sizeof row);
+-                TranspRow(s, r, row);
++        bool plain = !clut && (uint32_t)(c.key >> 32) == 0xffffu && c.x + c.w <= VRAM_W;
++        if (plain && m_usedBox) {
++            /* t32: the page's other textures share it with a level's video screen, whose picture
++             * is written ~15 times a second: a slot none of whose faces read there keeps its
++             * pixels; the rows wait until a face does (SlotUse) */
++            int m = (int)((c.key >> 1) & 3) == 0 ? 4 : (int)((c.key >> 1) & 3) == 1 ? 2 : 1;
++            int tx0 = (x - c.x) * m, tx1 = (x + w - c.x) * m - 1;
++            if (tx1 < c.ux0 || tx0 > c.ux1 || y + h - 1 - c.y < c.uy0 || y - c.y > c.uy1) {
++                c.sy0 = y0 < c.sy0 ? y0 : c.sy0;
++                c.sy1 = y1 > c.sy1 ? y1 : c.sy1;
++                m_st.cache_outside++;
++                continue;
+             }
++        }
++        if (m_partial && plain && m_frameNo - c.frame < 4) {
++            DecodeRows(s, y0, y1);
+             m_st.cache_partial++;
+             continue;
+         }
+@@ -3556,7 +3564,7 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                         "class %d, texture %d, 2D between %d, layer end %d); 3D layers in a "
+                         "buffer %d, 3D draws not %d, batched %d; framebuffer binds %.0f a frame; opaque batched tris %d without discard, "
+                         "%d with, %d colour runs (%d batches over 48); texture writes: %d skipped as "
+-                        "the same bytes, %d pages updated in place, %d freed\n",
++                        "the same bytes, %d outside the texels in use, %d pages updated in place, %d freed\n",
+                 m_st.draws, m_st.readbacks, m_st.tex_ups, m_st.blits, m_st.cache_hits,
+                 m_st.cache_misses, m_st.cache_inval, m_st.cache_full, m_st.cache_deferred,
+                 m_st.cache_stale, m_st.fast_batches, m_st.fast_tris, m_st.slow_batches,
+@@ -3567,7 +3575,8 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                 m_st.split[PC_GL_SPLIT_TEXTURE], m_st.split[PC_GL_SPLIT_2D],
+                 m_st.split[PC_GL_SPLIT_END], m_st.layer_bufs, m_st.layer_client,
+                 m_st.layer_batches, s_fbBinds / 60.0, m_st.solid_tris, m_st.cut_tris, m_st.colour_runs,
+-                m_st.colour_unordered, m_st.cache_same, m_st.cache_partial, m_st.cache_inval);
++                m_st.colour_unordered, m_st.cache_same, m_st.cache_outside, m_st.cache_partial,
++                m_st.cache_inval);
+         s_fbBinds = 0;
+         m_st = Stats{};
+         m_st.on = 1;
+@@ -3716,6 +3725,32 @@ void GlGpu::SlotFill(CacheSlot &c, uint64_t key)
+     c.cx = (int)(clut & 63) * 16;
+     c.cy = (int)(clut >> 6) & 511;
+     c.cw = depth == 0 ? 16 : depth == 1 ? 256 : 0;
++    c.ux0 = c.uy0 = 256;
++    c.ux1 = c.uy1 = -1;
++    c.sy0 = 256;
++    c.sy1 = -1;
++}
++
++/* t32: a triangle draws from slot s: the box of used texels grows to hold it (GlVert.uvr; a
++ * texture window's texels are anywhere). Rows written while no face used them are decoded
++ * now, if the box reaches them */
++void GlGpu::SlotUse(int s, const GlVert *v)
++{
++    CacheSlot &c = m_slot[s];
++    bool win = (uint32_t)(c.key >> 32) != 0xffffu;
++    int x0 = win ? 0 : v->uvr[0], y0 = win ? 0 : v->uvr[1];
++    int x1 = win ? 255 : v->uvr[2], y1 = win ? 255 : v->uvr[3];
++    if (x0 >= c.ux0 && y0 >= c.uy0 && x1 <= c.ux1 && y1 <= c.uy1)
++        return;
++    c.ux0 = x0 < c.ux0 ? x0 : c.ux0;
++    c.uy0 = y0 < c.uy0 ? y0 : c.uy0;
++    c.ux1 = x1 > c.ux1 ? x1 : c.ux1;
++    c.uy1 = y1 > c.uy1 ? y1 : c.uy1;
++    if (c.sy1 >= c.sy0) {
++        DecodeRows(s, c.sy0, c.sy1);
++        c.sy0 = 256;
++        c.sy1 = -1;
++    }
+ }
+ 
+ /* t24: the fast program with no discard at all, for LayerBatch's opaque faces no texel of which is
+@@ -3989,28 +4024,40 @@ void GlGpu::DecodeBand(int s, int y0, int y1)
+     }
+ }
+ 
+-void GlGpu::CacheDecode(int s)
++/* rows y0..y1 of slot s (whole 8-row bands) from the store, on every decode thread when
++ * they are many */
++void GlGpu::DecodeRows(int s, int y0, int y1)
+ {
+ #ifdef __vita__
+     PC_VITA_PROF_SCOPE(PC_PROF_DECODE);
+     if (s_dwN < 0)
+         DecodeThreadsStart();
+-    memset(m_slotTransp[s], 0, sizeof m_slotTransp[s]);
+-    if (s_dwN > 0) {
+-        int band = (256 / (s_dwN + 1)) & ~7;
++    for (int b = y0 >> 3; b <= y1 >> 3; b++)
++        m_slotTransp[s][b] = 0;
++    int rows = y1 - y0 + 1;
++    if (s_dwN > 0 && rows >= 32) {
++        int band = (rows / (s_dwN + 1)) & ~7;
+         for (int i = 0; i < s_dwN; i++) {
+             s_dw[i].gpu = this;
+             s_dw[i].s = s;
+-            s_dw[i].y0 = i * band;
+-            s_dw[i].y1 = (i + 1) * band;
++            s_dw[i].y0 = y0 + i * band;
++            s_dw[i].y1 = y0 + (i + 1) * band;
+             sceKernelSignalSema(s_dw[i].start, 1);
+         }
+-        DecodeBand(s, s_dwN * band, 256);
++        DecodeBand(s, y0 + s_dwN * band, y1 + 1);
+         sceKernelWaitSema(s_dwDone, s_dwN, NULL);
+     } else {
+-        /* a row at a time into the slot's rows of the atlas */
+-        DecodeBand(s, 0, 256);
++        DecodeBand(s, y0, y1 + 1);
+     }
++#else
++    (void)s, (void)y0, (void)y1;
++#endif
++}
++
++void GlGpu::CacheDecode(int s)
++{
++#ifdef __vita__
++    DecodeRows(s, 0, 255);
+ #else
+     memset(m_slotTransp[s], 0, sizeof m_slotTransp[s]);
+     for (int y = 0; y < 256; y++) {
+@@ -4053,6 +4100,7 @@ int GlGpu::CacheVerts(GlVert *v, int n, uint32_t *before)
+             slow++;
+             continue;
+         }
++        SlotUse(s, &v[i]);
+         uint16_t w = (uint16_t)(0x8000 | s);
+         v[i].clut = v[i + 1].clut = v[i + 2].clut = w;
+     }
+@@ -4100,6 +4148,8 @@ void GlGpu::CacheCheck()
+         if (!m_slot[s].key)
+             continue;
+         int y = m_checkRow = (m_checkRow + 97) & 255;
++        if (y >= m_slot[s].sy0 && y <= m_slot[s].sy1)
++            continue;   /* (t32: written, no face reads them: SlotUse decodes them) */
+         DecodeRow(m_slot[s], y, fresh);
+         n++;
+         if (!memcmp(fresh, AtlasRow(s, y), sizeof fresh))
+diff --git a/platform/pc/src/pc_vdec.cpp b/platform/pc/src/pc_vdec.cpp
+index 8e8d0df..e38cfa3 100644
+--- a/platform/pc/src/pc_vdec.cpp
++++ b/platform/pc/src/pc_vdec.cpp
+@@ -5,12 +5,22 @@
+  * code 0xfe00; coefficients come in zigzag order and are scaled by libpress's quantisation table
+  * (MPEG-1's intra matrix); a macroblock is Cr, Cb and four Y blocks covering 16x16 pixels. The
+  * inverse DCT is done in floating point and the colour conversion with the MDEC's coefficients,
+- * so pictures can differ from the hardware's in the last bit, not visibly. */
++ * so pictures can differ from the hardware's in the last bit, not visibly.
++ *
++ * t32: the intro movie took ~70 ms a picture (14 fps) on the game's core: a full 8x8 transform for
++ * each block's few coefficients. The transform now skips what is zero, and on the Vita the
++ * picture's columns of macroblocks are decoded by the game thread and 3 threads on cores 1-3
++ * (THPS_FMV_THREAD=0: the game thread alone). The same decoder draws the levels' video screens. */
+ #include <math.h>
+ #include <stdint.h>
+ #include <stdlib.h>
++#include <stdio.h>
+ #include <string.h>
+ 
++#ifdef __vita__
++#include <psp2/kernel/threadmgr.h>
++#endif
++
+ #include "pc/vdec.h"
+ #include "pc_texstore.h"
+ #include "pc_vdec.h"
+@@ -53,35 +63,84 @@ int Signed10(uint32_t v) {
+     return (int)((v & 0x3ff) ^ 0x200) - 0x200;
+ }
+ 
+-int Clamp8(float v) {
+-    int i = (int)lrintf(v);
+-    return i < -128 ? 0 : i > 127 ? 255 : i + 128;
++inline int Clamp8(float v) {
++    int i = (int)(v + 128.5f);
++    return i < 0 ? 0 : i > 255 ? 255 : i;
+ }
+ 
+-} // namespace
++inline uint32_t Next(VideoDecoder::Cursor &c) {
++    return c.in >= c.end ? kEob : *c.in++;
++}
+ 
+-uint32_t VideoDecoder::Next() {
+-    uint32_t h;
+-    if (m_in >= m_end)
+-        return kEob;
+-    h = *m_in++;
+-    return h;
++#ifdef __vita__
++/* up to 3 threads, each a share of a picture's columns */
++struct Share {
++    SceUID start = -1;
++    VideoDecoder *dec = nullptr;
++    VideoDecoder::Cursor cur = {};
++    int c0 = 0, c1 = 0, h = 0, pitch = 0, bpp = 0;
++    uint8_t *out = nullptr;
++};
++Share s_share[3];
++SceUID s_shareDone = -1;
++int s_shares = -1;
++
++int ShareThread(SceSize, void *arg) {
++    Share *w = *(Share **)arg;
++    for (;;) {
++        if (sceKernelWaitSema(w->start, 1, NULL) < 0)
++            return 0;
++        w->dec->Columns(w->cur, w->c0, w->c1, w->h, w->out, w->pitch, w->bpp);
++        sceKernelSignalSema(s_shareDone, 1);
++    }
+ }
+ 
++void SharesStart() {
++    const char *e = getenv("THPS_FMV_THREAD");
++    s_shares = 0;
++    if (e && e[0] == '0') {
++        fprintf(stderr, "[fmv] pictures decoded by the game thread (THPS_FMV_THREAD=0)\n");
++        return;
++    }
++    static const int masks[3] = { 0x20000, 0x40000, 0x80000 };
++    s_shareDone = sceKernelCreateSema("thps-fmv-done", 0, 0, 3, NULL);
++    for (int i = 0; i < 3 && s_shareDone >= 0; i++) {
++        Share *w = &s_share[i];
++        w->start = sceKernelCreateSema("thps-fmv", 0, 0, 1, NULL);
++        SceUID th = sceKernelCreateThread("thps-fmv", ShareThread, 0x10000100 - 8, 0x4000, 0,
++                                          masks[i], NULL);
++        if (th < 0)   /* (core 3 without CapUnlocker) */
++            th = sceKernelCreateThread("thps-fmv", ShareThread, 0x10000100 - 8, 0x4000, 0,
++                                       0x20000 | 0x40000, NULL);
++        if (w->start < 0 || th < 0)
++            break;
++        sceKernelStartThread(th, sizeof w, &w);
++        s_shares++;
++    }
++    fprintf(stderr, "[fmv] pictures decoded by %d threads with the game thread "
++                    "(THPS_FMV_THREAD=0 turns them off)\n", s_shares);
++}
++#endif
++
++} // namespace
++
+ /* One block: coefficients, then the inverse DCT into out (signed samples, row-major 8x8). */
+-void VideoDecoder::Block(float out[64]) {
++void VideoDecoder::Block(Cursor &cur, float out[64]) {
+     float coef[64], tmp[64];
+     uint32_t h;
+     int k, q, i, x, y, u;
++    /* t32: which columns of each row hold a coefficient, and which rows */
++    uint8_t rowu[8] = { 1, 0, 0, 0, 0, 0, 0, 0 };
++    int rows = 1;
+     memset(coef, 0, sizeof coef);
+     do
+-        h = Next();
+-    while (h == kEob && m_in < m_end); /* the MDEC skips end codes between blocks */
++        h = Next(cur);
++    while (h == kEob && cur.in < cur.end); /* the MDEC skips end codes between blocks */
+     q = (int)(h >> 10);
+     coef[0] = (float)(Signed10(h) * kQuant[0]);
+     for (k = 0;;) {
+         int v;
+-        h = Next();
++        h = Next(cur);
+         if (h == kEob)
+             break;
+         k += (int)(h >> 10) + 1;
+@@ -94,32 +153,69 @@ void VideoDecoder::Block(float out[64]) {
+         else if (v > 1023)
+             v = 1023;
+         coef[i] = (float)v;
++        rowu[i >> 3] |= (uint8_t)(1u << (i & 7));
++        rows |= 1 << (i >> 3);
++    }
++    if (rows == 1 && rowu[0] == 1) {
++        /* the DC alone: one value */
++        float v = coef[0] * s_cos[0][0] * s_cos[0][0];
++        for (i = 0; i < 64; i++)
++            out[i] = v;
++        return;
+     }
+-    /* rows then columns */
+-    for (y = 0; y < 8; y++)
++    /* rows then columns, skipping what is zero */
++    int nrow = 0, rowlist[8];
++    for (y = 0; y < 8; y++) {
++        int nu = 0, ulist[8];
++        if (!(rows >> y & 1))
++            continue;
++        rowlist[nrow++] = y;
++        for (u = 0; u < 8; u++)
++            if (rowu[y] >> u & 1)
++                ulist[nu++] = u;
+         for (x = 0; x < 8; x++) {
+             float s = 0;
+-            for (u = 0; u < 8; u++)
+-                s += coef[y * 8 + u] * s_cos[x][u];
++            for (i = 0; i < nu; i++)
++                s += coef[y * 8 + ulist[i]] * s_cos[x][ulist[i]];
+             tmp[y * 8 + x] = s;
+         }
++    }
+     for (x = 0; x < 8; x++)
+         for (y = 0; y < 8; y++) {
+             float s = 0;
+-            for (u = 0; u < 8; u++)
+-                s += tmp[u * 8 + x] * s_cos[y][u];
++            for (i = 0; i < nrow; i++)
++                s += tmp[rowlist[i] * 8 + x] * s_cos[y][rowlist[i]];
+             out[y * 8 + x] = s;
+         }
+ }
+ 
++/* past a macroblock's six blocks, as Block reads them */
++void VideoDecoder::SkipMacroblock(Cursor &cur) {
++    for (int b = 0; b < 6; b++) {
++        uint32_t h;
++        int k = 0;
++        do
++            h = Next(cur);
++        while (h == kEob && cur.in < cur.end);
++        for (;;) {
++            h = Next(cur);
++            if (h == kEob)
++                break;
++            k += (int)(h >> 10) + 1;
++            if (k > 63)
++                break;
++        }
++    }
++}
++
+ /* Decode the next macroblock into out (pitch bytes per row), at most h rows of it. */
+-void VideoDecoder::Macroblock(uint8_t *out, int pitch, int h) {
++void VideoDecoder::Macroblock(Cursor &cur, uint8_t *out, int pitch, int h) {
+     float cr[64], cb[64], y[4][64];
+     int i, px, py;
+-    Block(cr);
+-    Block(cb);
++    Block(cur, cr);
++    Block(cur, cb);
+     for (i = 0; i < 4; i++)
+-        Block(y[i]);
++        Block(cur, y[i]);
+     for (py = 0; py < 16 && py < h; py++)
+         for (px = 0; px < 16; px++) {
+             int c = (py >> 1) * 8 + (px >> 1);
+@@ -139,16 +235,53 @@ void VideoDecoder::Macroblock(uint8_t *out, int pitch, int h) {
+         }
+ }
+ 
++void VideoDecoder::Columns(Cursor cur, int c0, int c1, int h, uint8_t *out, int pitch, int bpp) {
++    for (int c = c0; c < c1; c++)
++        for (int y = 0; y < h; y += 16)
++            Macroblock(cur, out + y * pitch + c * 16 * bpp, pitch, h - y);
++}
++
+ void VideoDecoder::Frame(const void *runlevel, int fmt, int cols, int h, void *out, int pitch) {
+     const uint32_t *p = (const uint32_t *)runlevel;
+-    int bpp = fmt == PC_VDEC_RGB24 ? 3 : 2, c, y;
++    int bpp = fmt == PC_VDEC_RGB24 ? 3 : 2;
++    Cursor cur;
+     InitTables();
+-    m_in = (const uint16_t *)(p + 1);
+-    m_end = (const uint16_t *)(p + 1 + (p[0] & 0xffff));
++    cur.in = (const uint16_t *)(p + 1);
++    cur.end = (const uint16_t *)(p + 1 + (p[0] & 0xffff));
+     m_rgb24 = fmt == PC_VDEC_RGB24;
+-    for (c = 0; c < cols; c++)
+-        for (y = 0; y < h; y += 16)
+-            Macroblock((uint8_t *)out + y * pitch + c * 16 * bpp, pitch, h - y);
++#ifdef __vita__
++    if (s_shares < 0)
++        SharesStart();
++    if (s_shares > 0 && cols >= s_shares + 1) {
++        /* where each share's first column starts: a walk through the codes, far quicker than
++         * decoding them */
++        int n = s_shares + 1, at = 0, mbs = (h + 15) / 16;
++        Cursor start[4];
++        for (int i = 0; i < n; i++) {
++            int to = cols * (i + 1) / n;
++            start[i] = cur;
++            for (; at < to; at++)
++                for (int m = 0; m < mbs; m++)
++                    SkipMacroblock(cur);
++        }
++        for (int i = 0; i < s_shares; i++) {
++            Share &w = s_share[i];
++            w.dec = this;
++            w.cur = start[i + 1];
++            w.c0 = cols * (i + 1) / n;
++            w.c1 = cols * (i + 2) / n;
++            w.h = h;
++            w.out = (uint8_t *)out;
++            w.pitch = pitch;
++            w.bpp = bpp;
++            sceKernelSignalSema(w.start, 1);
++        }
++        Columns(start[0], 0, cols / n, h, (uint8_t *)out, pitch, bpp);
++        sceKernelWaitSema(s_shareDone, s_shares, NULL);
++        return;
++    }
++#endif
++    Columns(cur, 0, cols, h, (uint8_t *)out, pitch, bpp);
+ }
+ 
+ void VideoDecoder::ToTexture(const void *runlevel, bool rgb24, int x, int y, int xend, int h) {
+-- 
+2.53.0
+

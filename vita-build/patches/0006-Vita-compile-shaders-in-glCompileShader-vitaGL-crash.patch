@@ -1,0 +1,93 @@
+From 7b2877d157b64297602b0a3f640df041ed39b2ec Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 22:54:22 +0000
+Subject: [PATCH 6/6] Vita: compile shaders in glCompileShader (vitaGL crashed
+ linking a failed one)
+
+vitaGL's default compiles GLSL in glLinkProgram and crashes there on a
+shader that failed to compile. Compile in pairs instead
+(VGL_MODE_SHADER_PAIR) so a failure is logged and Init fails cleanly;
+report a missing libshacccg.suprx; bind only attributes the vertex
+shader declares.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01NwhU758snL1NnmSbmmwENz
+---
+ platform/pc/src/pc_gpu_gl.cpp | 38 +++++++++++++++++++++++++++++++----
+ 1 file changed, 34 insertions(+), 4 deletions(-)
+
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index c035fec..8931b5b 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -86,12 +86,25 @@ GLuint Compile(GLenum type, const char *src)
+     GLuint s = glCreateShader(type);
+     GLint ok;
+     glShaderSource(s, 1, &src, NULL);
++#ifdef __vita__
++    while (glGetError() != GL_NO_ERROR) {
++    }
++    glCompileShader(s);
++    /* vitaGL compiles GLSL with the system's shader compiler, which the console doesn't come
++     * with: without it glCompileShader fails this way and the program crashes at link time */
++    if (glGetError() == GL_INVALID_OPERATION)
++        PC_Fatal("The shader compiler is missing: put libshacccg.suprx in ur0:data/ (extract it "
++                 "from your firmware with ShaRKBR33D).");
++#else
+     glCompileShader(s);
++#endif
+     glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+     if (!ok) {
+         char log[2048];
+         glGetShaderInfoLog(s, sizeof log, NULL, log);
+         fprintf(stderr, "[gl] shader compile error:\n%s\n", log);
++        glDeleteShader(s);
++        return 0;
+     }
+     return s;
+ }
+@@ -101,13 +114,25 @@ GLuint Program(const char *vs, const char *fs)
+     GLuint p = glCreateProgram(), v = Compile(GL_VERTEX_SHADER, vs),
+            f = Compile(GL_FRAGMENT_SHADER, fs);
+     GLint ok;
++    if (!v || !f) {
++        glDeleteShader(v);
++        glDeleteShader(f);
++        glDeleteProgram(p);
++        return 0;
++    }
+     glAttachShader(p, v);
+     glAttachShader(p, f);
+ #ifdef PC_GLES
+-    /* ES 2 has no layout(location): one numbering for every program's attributes */
+-    static const char *const attrs[] = { "a_pos", "a_color", "a_uv", "a_tex", "a_twin", "a_uvr" };
+-    for (GLuint i = 0; i < 6; i++)
+-        glBindAttribLocation(p, i, attrs[i]);
++    /* ES 2 has no layout(location): one numbering for every program's attributes (the ones
++     * this vertex shader declares) */
++    static const char *const attrs[] = { "a_pos;", "a_color;", "a_uv;", "a_tex;", "a_twin;", "a_uvr;" };
++    for (GLuint i = 0; i < 6; i++) {
++        char name[16];
++        if (!strstr(vs, attrs[i]))
++            continue;
++        snprintf(name, sizeof name, "%.*s", (int)strlen(attrs[i]) - 1, attrs[i]);
++        glBindAttribLocation(p, i, name);
++    }
+ #endif
+     glLinkProgram(p);
+     glDeleteShader(v);
+@@ -497,6 +522,11 @@ bool GlGpu::AnyDrawn(int x0, int y0, int x1, int y1) const
+ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+ {
+ #ifdef PC_GLES
++#ifdef __vita__
++    /* compile each shader in glCompileShader, where a failure is reported, not in
++     * glLinkProgram (vitaGL's default), which crashes on one; Program() compiles them in pairs */
++    vglSetSemanticBindingMode(VGL_MODE_SHADER_PAIR);
++#endif
+     /* the screens at the PS1's resolution, scaled when shown (pc/gl_shaders_gles.h) */
+     (void)fixed_scale;
+     fixed_scale = 1;
+-- 
+2.43.0
+

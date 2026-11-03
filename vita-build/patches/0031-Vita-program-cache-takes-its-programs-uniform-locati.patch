@@ -1,0 +1,301 @@
+From f31da643b1cd0b11657dea664e5dafb2e06c3d2d Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Wed, 28 Oct 2026 15:35:16 +0300
+Subject: [PATCH] Vita: program cache takes its programs (uniform locations are
+ vitaGL's own), PS1 order in every colour pass, 960x544 by default again
+
+- Program cache: t25's second start took none of the 5 saved programs ("not taken"). Each load
+  compared every uniform's location with the saved one, and vitaGL's locations are its own
+  values, new at each start. Now a uniform only has to be there (or not) as before; attributes
+  must be where they were, and their numbers are bound before glProgramBinary as before
+  glLinkProgram (BindAttribs). A rejected one names the check that failed.
+- Decals: t25's colour pass gave up the PS1's order past 48 program runs in a batch (solid
+  faces, then the rest), which let a floor cover its decal: the flicker left in t25 (graffiti,
+  lighting, sometimes). Every batch now keeps the order; the [gl] line counts batches over 48
+  runs (each run is a GL draw).
+- THPS_R3D_ZNUDGE (t25's trial) is gone: it flickered.
+- 960x544 by default again (t25: GPU ~7 ms a frame at 720x408); THPS_VITA_RES=720x408 for the
+  lighter one.
+---
+ platform/pc/README.md           |   3 +-
+ platform/pc/include/pc/gl_gpu.h |   8 +--
+ platform/pc/src/pc_gpu_gl.cpp   | 102 ++++++++++++++++++--------------
+ platform/pc/src/pc_vitagfx.cpp  |   6 +-
+ 4 files changed, 66 insertions(+), 53 deletions(-)
+
+diff --git a/platform/pc/README.md b/platform/pc/README.md
+index 6afa206..c8c661d 100644
+--- a/platform/pc/README.md
++++ b/platform/pc/README.md
+@@ -561,9 +561,8 @@ window, `THPS_FAST`, `THPS_DETERMINISTIC`) never wait for a display.
+ | `THPS_RENDER3D=psx` | OpenGL: draw the world and models through the PS1 path (default `native`, see Graphics) |
+ | `THPS_PGXP=0` | OpenGL: both of the above off (`THPS_GL_PRECISE=0 THPS_GL_PERSPECTIVE=0`) |
+ | `THPS_R3D_BATCH=0` | OpenGL ES (Vita): a native 3D layer's faces drawn in the PS1's order, split where they overlap (before t20); default: each run of faces between 2D primitives in one depth pass and one colour pass for the opaque faces, then the semi-transparent ones in order |
+-| `THPS_VITA_RES=WxH` | Vita: screens drawn at most 512x240, 720x408 (default, t24) or 960x544, scaled up to the screen |
++| `THPS_VITA_RES=WxH` | Vita: screens drawn at most 512x240, 720x408 or 960x544 (default; t24-t25: 720x408), scaled up to the screen |
+ | `THPS_R3D_PREPASS=0` | OpenGL ES (Vita), batched 3D: opaque faces in one pass at the true depth (t24; decals can flicker); default (t25): depth first, then colour with the decal tolerance, the no-discard program in both where it can |
+-| `THPS_R3D_ZNUDGE=1` | OpenGL ES (Vita), batched 3D, a trial: one pass, each opaque face of a layer moved nearer by up to 1/256 of its depth in the PS1's order |
+ | `THPS_GL_DECODE_THREADS=n` | Vita: texture cache pages decoded by n threads on cores 1-3 with the game thread (default 3, 0 = the game thread alone) |
+ | `THPS_GL_NODISCARD=0` | OpenGL ES (Vita), batched 3D: no separate no-discard, no-blend program for opaque faces with no transparent texel under them |
+ | `THPS_GL_WARMFRAMES=n` | OpenGL ES: frames after a stretch without 3D (loading screens, menus) that decode every texture page they draw, uncapped (default 30, 0 off) |
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index 1a59e62..be9d8a9 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -252,6 +252,7 @@ class GlGpu {
+         int layer_batches;              /* t20: 3D draws made by LayerBatch */
+         int solid_tris, cut_tris;       /* t24: LayerBatch opaque triangles without / with discard */
+         int colour_runs;                /* t25: program runs of the opaque colour passes */
++        int colour_unordered;           /* t26: batches whose colour pass lost the PS1's order */
+     };
+ 
+     /* targets */
+@@ -385,12 +386,9 @@ class GlGpu {
+     GLuint m_drawProgSolid = 0;
+     DrawLocs m_locSolid = {};
+     /* t25: the batched opaque faces' depth pass, then their colour within the decal tolerance,
+-     * the no-discard program in both where it can (default; THPS_R3D_PREPASS=0 or
+-     * THPS_R3D_ZNUDGE=1: t24's single pass) */
++     * the no-discard program in both where it can (default; THPS_R3D_PREPASS=0: t24's single
++     * pass) */
+     bool m_prepass = true;
+-    /* t25 (THPS_R3D_ZNUDGE=1, a trial): single pass, each opaque view-space face of a layer moved
+-     * nearer by up to 1/256 of its depth in the PS1's order (later = nearer) */
+-    bool m_zNudge = false;
+     /* t25: the opaque faces of a batch in the PS1's order, in runs of one program (3 solid, 0
+      * with discard): the colour pass keeps the order (a decal over its floor is the later) */
+     std::vector<uint16_t> m_batchOrd;
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index effc4b0..ec5422b 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -168,6 +168,22 @@ static void ForgetFb()
+     s_vp[0] = -1;
+ }
+ 
++#ifdef PC_GLES
++/* ES 2 has no layout(location): one numbering for every program's attributes (the ones this
++ * vertex shader declares), before linking or loading */
++void BindAttribs(GLuint p, const char *vs)
++{
++    static const char *const attrs[] = { "a_pos;", "a_color;", "a_uv;", "a_tex;", "a_twin;", "a_uvr;" };
++    for (GLuint i = 0; i < 6; i++) {
++        char name[16];
++        if (!strstr(vs, attrs[i]))
++            continue;
++        snprintf(name, sizeof name, "%.*s", (int)strlen(attrs[i]) - 1, attrs[i]);
++        glBindAttribLocation(p, i, name);
++    }
++}
++#endif
++
+ #ifdef __vita__
+ /* ---- programs kept on the card ----
+  * vitaGL compiles GLSL with the console's shader compiler at every start, seconds a program. A
+@@ -215,17 +231,21 @@ int SourceNames(const char *src, const char *kw, char names[][32], int n)
+     return n;
+ }
+ 
+-/* where program p has the names its sources declare: uniforms (vs, fs), then attributes */
+-int ProgramLocs(GLuint p, const char *vs, const char *fs, int32_t *locs)
++/* where program p has the names its sources declare: uniforms (vs, fs), then attributes; *nu:
++ * how many are uniforms */
++int ProgramLocs(GLuint p, const char *vs, const char *fs, int32_t *locs, int *nu_out = nullptr)
+ {
+     char names[kProgNames][32];
+     int nu = SourceNames(fs, "uniform", names, SourceNames(vs, "uniform", names, 0));
+     int n = SourceNames(vs, "attribute", names, nu);
+     for (int i = 0; i < n; i++)
+         locs[i] = i < nu ? glGetUniformLocation(p, names[i]) : glGetAttribLocation(p, names[i]);
++    if (nu_out)
++        *nu_out = nu;
+     return n;
+ }
+ 
++
+ GLuint ProgramLoad(const char *path, const char *vs, const char *fs)
+ {
+     FILE *f = fopen(path, "rb");
+@@ -235,14 +255,33 @@ GLuint ProgramLoad(const char *path, const char *vs, const char *fs)
+     int32_t locs[kProgNames], now[kProgNames];
+     void *data = nullptr;
+     GLuint p = 0;
++    char why[96] = "header or size";
+     if (fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, "THPSPRG1", 8) && h.n <= kProgNames &&
+         fread(locs, 4, h.n, f) == h.n && h.len && h.len < (8u << 20) &&
+         (data = malloc(h.len)) && fread(data, 1, h.len, f) == h.len) {
+         p = glCreateProgram();
++#ifdef PC_GLES
++        BindAttribs(p, vs);
++#endif
+         glProgramBinary(p, (GLenum)h.format, data, (GLsizei)h.len);
+         GLint ok = 0;
+         glGetProgramiv(p, GL_LINK_STATUS, &ok);
+-        if (!ok || ProgramLocs(p, vs, fs, now) != (int)h.n || memcmp(now, locs, h.n * 4)) {
++        int nu = 0, n = ok ? ProgramLocs(p, vs, fs, now, &nu) : 0;
++        /* t26: a uniform's location is vitaGL's own (it differed at every start, t25: no
++         * program was ever taken): only that each is there or not as before; attributes must
++         * be where they were */
++        int bad = -1;
++        for (int i = 0; ok && n == (int)h.n && i < n && bad < 0; i++)
++            if (i < nu ? (now[i] < 0) != (locs[i] < 0) : now[i] != locs[i])
++                bad = i;
++        if (!ok)
++            snprintf(why, sizeof why, "link status 0 after glProgramBinary (format 0x%x)", h.format);
++        else if (n != (int)h.n)
++            snprintf(why, sizeof why, "%d names, %u saved", n, h.n);
++        else if (bad >= 0)
++            snprintf(why, sizeof why, "%s %d at %d, saved %d", bad < nu ? "uniform" : "attribute",
++                     bad, (int)now[bad], (int)locs[bad]);
++        if (!ok || n != (int)h.n || bad >= 0) {
+             glDeleteProgram(p);
+             p = 0;
+         }
+@@ -251,8 +290,7 @@ GLuint ProgramLoad(const char *path, const char *vs, const char *fs)
+     fclose(f);
+     if (!p) {
+         /* t24: every start compiled all 4 (t23): say why a saved one wasn't taken */
+-        fprintf(stderr, "[gl] program cache: %s not taken (header/size/link/locations), compiled\n",
+-                path);
++        fprintf(stderr, "[gl] program cache: %s not taken (%s), compiled\n", path, why);
+         remove(path);   /* (stale or foreign: compiled and saved again) */
+     }
+     else if (s_progPathN < 8)
+@@ -288,8 +326,8 @@ void ProgramSave(GLuint p, const char *path, const char *vs, const char *fs)
+         fclose(f);
+         if (!ok)
+             remove(path);
+-        fprintf(stderr, "[gl] program cache: %s %s (%d bytes)\n", path, ok ? "saved" : "NOT saved",
+-                (int)got);
++        if (!ok)
++            fprintf(stderr, "[gl] program cache: %s NOT saved (%d bytes)\n", path, (int)got);
+     } else {
+         fprintf(stderr, "[gl] program cache: %s not saved (%s)\n", path,
+                 got > 0 ? "cannot create" : "no binary");
+@@ -331,16 +369,7 @@ GLuint Program(const char *vs, const char *fs)
+     glAttachShader(p, v);
+     glAttachShader(p, f);
+ #ifdef PC_GLES
+-    /* ES 2 has no layout(location): one numbering for every program's attributes (the ones
+-     * this vertex shader declares) */
+-    static const char *const attrs[] = { "a_pos;", "a_color;", "a_uv;", "a_tex;", "a_twin;", "a_uvr;" };
+-    for (GLuint i = 0; i < 6; i++) {
+-        char name[16];
+-        if (!strstr(vs, attrs[i]))
+-            continue;
+-        snprintf(name, sizeof name, "%.*s", (int)strlen(attrs[i]) - 1, attrs[i]);
+-        glBindAttribLocation(p, i, name);
+-    }
++    BindAttribs(p, vs);
+ #endif
+     glLinkProgram(p);
+     glDeleteShader(v);
+@@ -897,13 +926,11 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+         }
+     }
+     {
+-        const char *pp = getenv("THPS_R3D_PREPASS"), *zn = getenv("THPS_R3D_ZNUDGE");
+-        m_zNudge = zn && atoi(zn) != 0;
+-        m_prepass = !(pp && pp[0] == '0') && !m_zNudge;
++        const char *pp = getenv("THPS_R3D_PREPASS");
++        m_prepass = !(pp && pp[0] == '0');
+         fprintf(stderr, "[r3d] opaque batches: %s\n",
+-                m_zNudge ? "one pass, faces nudged nearer in the PS1's order (THPS_R3D_ZNUDGE=1, a trial)"
+-                : m_prepass ? "depth pass, then colour within the decal tolerance (THPS_R3D_PREPASS=0: one pass)"
+-                            : "one pass (THPS_R3D_PREPASS=0; decals can flicker)");
++                m_prepass ? "depth pass, then colour within the decal tolerance (THPS_R3D_PREPASS=0: one pass)"
++                          : "one pass (THPS_R3D_PREPASS=0; decals can flicker)");
+         const char *wf = getenv("THPS_GL_WARMFRAMES");
+         m_warmFrames = wf ? atoi(wf) : 30;
+     }
+@@ -2443,21 +2470,6 @@ void GlGpu::LayerBegin(const GlLayerParams *lp, const GlVert *v, int nv)
+         l.verts = m_layerConv;
+         CacheVerts(m_layerConv, nv, m_slowBefore);
+         l.conv_gen = m_cacheGen;
+-        if (m_zNudge && nv >= 3) {
+-            /* the whole position scaled: the same pixels, a nearer depth (view z) */
+-            int nt = nv / 3;
+-            for (int t = 0; t < nt; t++) {
+-                GlVert *v = &m_layerConv[t * 3];
+-                if (!(v->info & PC_GL_I_VIEW) || (v->info & PC_GL_I_SEMI))
+-                    continue;
+-                float k = 1.0f - (1.0f / 256.0f) * (float)t / (float)nt;
+-                for (int j = 0; j < 3; j++) {
+-                    v[j].x *= k;
+-                    v[j].y *= k;
+-                    v[j].z *= k;
+-                }
+-            }
+-        }
+     }
+     if (m_layerVbo && nv > 0) {
+         if (!m_layerBufs[0])
+@@ -2732,7 +2744,8 @@ bool GlGpu::LayerBatch(int first, int count, int cls, int why)
+              * shader discards write none), then their colour where it is within the tolerance
+              * of the nearest: a decal over its floor passes, and the later of the two (the PS1's
+              * order) is the one left. The colour pass keeps that order across both programs
+-             * (up to 48 runs; past that, solid then the rest) */
++             * (t25 gave up past 48 runs, drawing solid then the rest: a floor could then cover
++             * its decal, the flicker left in t25; t26 keeps it always) */
+             glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+             glDepthMask(GL_TRUE);
+             if (!so.empty()) {
+@@ -2752,7 +2765,9 @@ bool GlGpu::LayerBatch(int first, int count, int cls, int why)
+                 n++;
+             }
+             glDepthMask(GL_FALSE);
+-            int nseg = (int)m_batchSeg.size(), ordered = nseg <= 48;
++            int nseg = (int)m_batchSeg.size(), ordered = 1;
++            if (nseg > 48)
++                m_st.colour_unordered++;   /* (t26: counted, still in order) */
+             int runs = ordered ? nseg : (!so.empty()) + (!op.empty());
+             for (int r = 0; r < runs; r++) {
+                 int c, a, e;
+@@ -2802,7 +2817,7 @@ bool GlGpu::LayerBatch(int first, int count, int cls, int why)
+             DrawUniforms(ts[i]);
+             if (!op.empty()) {
+                 /* t24: one pass at the true depth, written as it goes; decals within one run
+-                 * lose the 1/256 tolerance (THPS_R3D_ZNUDGE=1 moves the later faces nearer) */
++                 * lose the 1/256 tolerance */
+                 SetBlend(0);
+                 DPass(1);
+                 glDepthMask(GL_TRUE);
+@@ -3461,7 +3476,7 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                         "GL draws %.0f a frame; 3D %.0f draws a frame (new draw for depth %d, "
+                         "class %d, texture %d, 2D between %d, layer end %d); 3D layers in a "
+                         "buffer %d, 3D draws not %d, batched %d; framebuffer binds %.0f a frame; opaque batched tris %d without discard, "
+-                        "%d with, %d colour runs\n",
++                        "%d with, %d colour runs (%d batches over 48)\n",
+                 m_st.draws, m_st.readbacks, m_st.tex_ups, m_st.blits, m_st.cache_hits,
+                 m_st.cache_misses, m_st.cache_inval, m_st.cache_full, m_st.cache_deferred,
+                 m_st.cache_stale, m_st.fast_batches, m_st.fast_tris, m_st.slow_batches,
+@@ -3471,7 +3486,8 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                 m_st.split[PC_GL_SPLIT_DEPTH], m_st.split[PC_GL_SPLIT_CLASS],
+                 m_st.split[PC_GL_SPLIT_TEXTURE], m_st.split[PC_GL_SPLIT_2D],
+                 m_st.split[PC_GL_SPLIT_END], m_st.layer_bufs, m_st.layer_client,
+-                m_st.layer_batches, s_fbBinds / 60.0, m_st.solid_tris, m_st.cut_tris, m_st.colour_runs);
++                m_st.layer_batches, s_fbBinds / 60.0, m_st.solid_tris, m_st.cut_tris, m_st.colour_runs,
++                m_st.colour_unordered);
+         s_fbBinds = 0;
+         m_st = Stats{};
+         m_st.on = 1;
+diff --git a/platform/pc/src/pc_vitagfx.cpp b/platform/pc/src/pc_vitagfx.cpp
+index 8cb1884..97f748e 100644
+--- a/platform/pc/src/pc_vitagfx.cpp
++++ b/platform/pc/src/pc_vitagfx.cpp
+@@ -15,9 +15,9 @@ void Read()
+     static const int sizes[3][2] = { { 512, 240 }, { 720, 408 }, { 960, 544 } };
+     const char *e;
+     int w, h;
+-    /* t24: 720x408 by default (t23: the GPU took ~50 ms a frame at 960x544, ~25 at 720x408;
+-     * THPS_VITA_RES=960x544 for the full screen) */
+-    s_gfx = PC_VitaGfx{ 720, 408, 1, 1, 60, 1 };
++    /* t26: the screen's 960x544 again (t25: the GPU ~7 ms a frame at 720x408, t24-t25's
++     * drawing; t23 had ~50 ms at 960x544); THPS_VITA_RES=720x408 for the lighter one */
++    s_gfx = PC_VitaGfx{ 960, 544, 1, 1, 60, 1 };
+     if ((e = getenv("THPS_VITA_RES")) && sscanf(e, "%dx%d", &w, &h) == 2) {
+         for (int i = 0; i < 3; i++)
+             if (w == sizes[i][0] && h == sizes[i][1]) {
+-- 
+2.53.0
+

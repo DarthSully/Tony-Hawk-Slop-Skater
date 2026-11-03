@@ -1,0 +1,853 @@
+From f3b27261d648c934360372e94318ccaff9d982f9 Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Mon, 26 Oct 2026 20:59:53 +0300
+Subject: [PATCH] Vita: the texture cache drawn from the texels it wrote
+ (in-place textures in graphics memory of our own), a check of the cache each
+ frame, dumps written in the background
+
+The menus' broken letters, stray marks and stripes with the texture cache on (t11, t12): every
+cached texel was drawn from the texel 6 to its left. Comparing the same menu's cache-on and
+cache-off frames with the VRAM dump, each restored background piece, glyph and arrow showed the
+texels 6 to the left on every page and both page rows (VRAM x 775 for 781). So letters lost their
+right edge and showed a sliver of the glyph beside them in VRAM, and a page's first 6 columns
+came from the slot beside it in the atlas (the green and red bars). The slots were written where
+vitaGL's pointer to the 4096x2048 texture's texels said; the GPU read them 24 bytes before.
+
+The atlas, the texture store's copies and the blit and movie-picture pools are now textures whose
+texels are a 4 KB-aligned block of vitaGL's graphics memory (vglAlloc, CDRAM). vitaGL's
+descriptor of an 8x8 placeholder is pointed at that block (sceGxmTextureSetData, SetWidth,
+SetHeight), so the address written is the address read. Each frame the descriptors are checked:
+one vitaGL rewrote is pointed back and logged. Four rows of the decoded slots are compared with a
+fresh decode: a slot that missed a write is freed and counted as stale. When every store copy was
+drawn in the last 4 frames, a write now waits for the GPU (glFinish) instead of vitaGL's copy.
+
+The decode expands 5-bit channels as n * 255 / 31, rounded. The old n << 3 | n >> 2 is up to 0.6
+less, so cached pixels read back a step darker than the emulated lookup's.
+
+THPS_SHOT: a dump is made in memory and written by its own thread in 256 KB pieces. The game
+thread's small writes of a 1.5 MB dump froze the game at frame 1500. While 4 dumps are still being
+written, a new one is skipped. The [gl] line counts stale slots, descriptors pointed back and
+waits for the GPU. Start-up logs where the atlas's and the base target's texels are, and why
+in-place writes are off when they are.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ platform/pc/include/pc/gl_gpu.h   |  41 ++++-
+ platform/pc/include/pc/platform.h |   4 +
+ platform/pc/src/pc_gpu_gl.cpp     | 293 ++++++++++++++++++++----------
+ platform/pc/src/pc_video.cpp      | 119 ++++++------
+ platform/pc/src/pc_vita.cpp       |  69 +++++++
+ 5 files changed, 375 insertions(+), 151 deletions(-)
+
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index 677a3be..d1a0038 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -17,6 +17,7 @@
+ /* OpenGL ES 2 (the PS Vita's vitaGL; THPS_GLES=1 on Linux): pc/gl_shaders_gles.h */
+ #ifdef PC_VITA
+ #include <vitaGL.h> /* VitaSDK's vitaGL declares the GLES2 API itself */
++#include <psp2/gxm.h>
+ #ifndef GL_DEPTH24_STENCIL8_OES
+ #define GL_DEPTH24_STENCIL8_OES GL_DEPTH24_STENCIL8
+ #endif
+@@ -223,6 +224,7 @@ class GlGpu {
+         int cache_hits, cache_misses, cache_inval, cache_full, cache_deferred;
+         int fast_batches, slow_batches, fast_tris, slow_tris, uncached_tris;
+         int store_cells, store_switches, store_copies, blit_pool, blit_copies;
++        int cache_stale, own_fixed;
+     };
+ 
+     /* targets */
+@@ -319,7 +321,7 @@ class GlGpu {
+     int m_decodesLeft = 0;
+     int m_cacheOn = 0;
+     GLuint m_atlas = 0;
+-    uint8_t *m_atlasPtr = nullptr;   /* the atlas's texels (vglGetTexDataPointer), written in place */
++    uint8_t *m_atlasPtr = nullptr;   /* the atlas's texels (m_atlasTex on the Vita), written in place */
+     /* the draw programs' uniforms; m_drawU* are the bound program's (UseDraw) */
+     struct DrawLocs {
+         GLint pass, dpass, proj, target, shift, uvfix;
+@@ -340,22 +342,39 @@ class GlGpu {
+     int CacheVerts(GlVert *v, int n);
+     void CacheInvalidate(int x, int y, int w, int h);
+     void CacheRefresh();
++    /* row y of a slot's texels, decoded from the store into out (256 RGBA texels) */
++    void DecodeRow(const CacheSlot &c, int y, uint32_t *out);
++#ifdef __vita__
++    /* rows of the decoded slots checked against a fresh decode, a few each frame (CacheCheck) */
++    int m_checkSlot = 0, m_checkRow = 0, m_warnedStale = 0;
++    uint32_t m_checkFrame = 0;
++    void CacheCheck();
++    uint32_t *AtlasRow(int s, int y)
++    {
++        return (uint32_t *)(m_atlasPtr +
++                            (((size_t)(s / 16) * 256 + y) * kAtlasW + (size_t)(s % 16) * 256) * 4);
++    }
++#endif
+ #ifdef __vita__
+     /* vitaGL copies a whole texture before writing one that a draw of the last 4 frames used
+      * (glTexSubImage2D): 1 MB for the store or a blit, from memory the CPU reads slowly. The
+      * textures written while frames are drawn are written in place instead, each time into a
+      * texture no such draw used. The store keeps up to kStoreVersions copies, each knowing which
+      * of the store's 16x16 cells it has (a write generation per cell): a write after a draw goes to
+-     * a free copy, which takes the cells it lacks. The CPU's blits and the movies' pictures each take
+-     * a free texture of a pool. With none free, it is vitaGL's copy again. */
++     * a free copy, which takes the cells it lacks (with none free, the current one once the GPU is
++     * done). The CPU's blits and the movies' pictures each take a free texture of a pool (with none
++     * free, vitaGL's copy again). Their texels, and the texture cache's atlas, are graphics memory
++     * of our own (OwnTexture). */
+     static constexpr int kStoreVersions = 8, kBlitPool = 6, kImagePool = 5;
+     struct InPlace {
+         GLuint tex;
+-        uint8_t *ptr;    /* its texels (vglGetTexDataPointer): linear rows of align(w, 8) texels */
++        uint8_t *ptr;    /* its texels: linear rows of align(w, 8) texels */
+         uint32_t used;   /* m_frameNo when last drawn with (0: never) */
+         int w, h;
++        SceGxmTexture *gxm;   /* vitaGL's descriptor of tex, pointed at ptr */
++        void *block;          /* the vglAlloc block ptr is in */
+     };
+-    InPlace m_store[kStoreVersions] = {};   /* [0] is m_texstore */
++    InPlace m_store[kStoreVersions] = {};   /* the store's copies (THPS_GL_INPLACE=0: m_texstore) */
+     uint32_t m_storeGen[kStoreVersions][CELLS_Y * CELLS_X] = {};
+     uint32_t m_cellGen[CELLS_Y * CELLS_X] = {};
+     int m_inPlace = 1;   /* THPS_GL_INPLACE=0: vitaGL's copies, as before t12 */
+@@ -363,10 +382,19 @@ class GlGpu {
+     InPlace m_blitPool[kBlitPool] = {};
+     InPlace m_imagePool[kImagePool] = {};
+     uint8_t *m_basePtr = nullptr;   /* the base target's texels: row y is VRAM row y */
++    InPlace m_atlasTex = {};        /* the texture cache's atlas */
++    int m_warnedOwn = 0;
+     /* a free texture of a pool (no draw of the last 4 frames used it), w x h of fmt, made the first
+      * time; -1 when none is */
+     int PoolTake(InPlace *pool, int n, int w, int h, GLenum fmt);
+     void StoreSync();
++    /* a texture of fmt (bpp bytes a texel), w x h, whose texels are a 4 KB-aligned block of
++     * vitaGL's graphics memory (vitaGL keeps an 8x8 placeholder); 0 without the memory */
++    int OwnTexture(InPlace *t, GLenum fmt, int bpp, int w, int h);
++    void FreeOwn(InPlace *t);
++    /* each frame: a descriptor no longer pointing at its texels is pointed back (logged) */
++    void OwnCheck();
++    void OwnFix(InPlace *t, const char *what);
+ #endif
+ #endif
+     GLuint m_dispTex = 0;                  /* RGBA8 1024x512: pictures shown instead (movies) */
+@@ -388,6 +416,9 @@ class GlGpu {
+     /* 8-bit channel -> 5 bits: exact for every value a 5-bit one was stored as (n * 255 / 31,
+      * rounded), and the PS1's truncation for the in-between values drawing produces. */
+     uint8_t m_to5[256] = {};
++    /* 5 bits -> 8, n * 255 / 31 rounded: the emulated lookup's n / 31 in an 8-bit target (the
++     * texture cache's decode) */
++    uint8_t m_to8[32] = {};
+     uint8_t m_drawn[CELLS_Y][CELLS_X] = {};   /* 16x16 cells primitives drew on */
+     Batch m_batch = {};
+     uint8_t m_readBuf[VRAM_W * VRAM_H * 4] = {};   /* ReadPixels' readback */
+diff --git a/platform/pc/include/pc/platform.h b/platform/pc/include/pc/platform.h
+index d4ccef0..c970376 100644
+--- a/platform/pc/include/pc/platform.h
++++ b/platform/pc/include/pc/platform.h
+@@ -53,6 +53,10 @@ void PC_VitaLogFlush(void);
+ /* a thread for the profile's [threads] line every 10 s: its core, priority and run time (thid 0:
+  * the calling thread) */
+ void PC_VitaWatchThread(const char *name, int thid);
++/* a file written by a thread of its own, the game never waiting for the card (THPS_SHOT's dumps):
++ * data (malloc'd) is freed once written; -1 (data freed, nothing written) while 4 are still being
++ * written */
++int PC_VitaWriteFile(const char *path, void *data, int size);
+ #ifdef __cplusplus
+ /* times the rest of the enclosing block into a slot */
+ struct PC_VitaProfScope {
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index cc5d26f..a1d647e 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -590,18 +590,24 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+     }
+     if (m_cacheOn) {
+         glActiveTexture(GL_TEXTURE0 + kAtlasUnit);
+-        glGenTextures(1, &m_atlas);
+-        glBindTexture(GL_TEXTURE_2D, m_atlas);
+-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kAtlasW, kAtlasH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+ #ifdef __vita__
+         /* vitaGL copies a whole texture the GPU may still read before a glTexSubImage2D (16 MB a
+-         * miss): the slots are written in place instead, never one drawn in the last 4 frames.
+-         * Its RGBA textures are linear, rows of width (a multiple of 8) * 4 bytes. */
+-        m_atlasPtr = (uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
+-        if (m_atlasPtr)
+-            memset(m_atlasPtr, 0, (size_t)kAtlasW * kAtlasH * 4);
+-        else
++         * miss): the slots are written in place instead, never one drawn in the last 4 frames,
++         * into texels of our own. vitaGL's pointer to the texels of the 4096x2048 texture it made
++         * was 24 bytes past where the GPU read them: every cached texel was drawn from 6 texels to
++         * its left (t12's menus: cut letters, bits of the glyph or page beside them, the background
++         * redrawn 6 pixels over) */
++        if (OwnTexture(&m_atlasTex, GL_RGBA, 4, kAtlasW, kAtlasH)) {
++            m_atlas = m_atlasTex.tex;
++            m_atlasPtr = m_atlasTex.ptr;
++        } else {
+             m_cacheOn = 0;
++            fprintf(stderr, "[gl] texture cache: no graphics memory for its atlas\n");
++        }
++#else
++        glGenTextures(1, &m_atlas);
++        glBindTexture(GL_TEXTURE_2D, m_atlas);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kAtlasW, kAtlasH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+ #endif
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+@@ -609,6 +615,8 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+         glActiveTexture(GL_TEXTURE0);
+         m_decode.resize(256 * 256);
++        for (int i = 0; i < 32; i++)
++            m_to8[i] = (uint8_t)((i * 255 + 15) / 31);
+         memset(m_slot, 0, sizeof m_slot);
+         m_lastSlot = -1;
+     }
+@@ -641,6 +649,11 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+     fprintf(stderr, "[gl] texture cache: %s%s\n",
+             m_cacheOn ? "on (128 pages of 256x256, THPS_GL_TEXCACHE=0 turns it off)" : "off",
+             m_cacheOn && !m_drawProgFast ? ", no fast program" : "");
++#ifdef __vita__
++    if (m_cacheOn)
++        fprintf(stderr, "[gl] texture cache atlas: texels at %p, the GPU reads %p\n",
++                (void *)m_atlasPtr, sceGxmTextureGetData(m_atlasTex.gxm));
++#endif
+ #endif
+     /* the shadows' textures stay bound to units 2 and 3 (ShadowSetup) */
+     glUniform1i(glGetUniformLocation(m_drawProg, "u_sh0"), 2);
+@@ -700,19 +713,20 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+     m_texstore = Texture(GL_LUMINANCE_ALPHA, VRAM_W, VRAM_H, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE,
+                          GL_NEAREST);
+ #ifdef __vita__
+-    /* the store's first copy (StoreSync): it has none of the cells yet */
+-    m_store[0] = InPlace{m_texstore, (uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D), 0, VRAM_W, VRAM_H};
+     {
+         const char *ip = getenv("THPS_GL_INPLACE");
+         m_inPlace = !(ip && ip[0] == '0');
+     }
+-    m_nstore = m_inPlace && m_store[0].ptr ? 1 : 0;
++    /* the store's first copy (StoreSync): it has none of the cells yet */
++    m_nstore = m_inPlace && OwnTexture(&m_store[0], GL_LUMINANCE_ALPHA, 2, VRAM_W, VRAM_H) ? 1 : 0;
+     m_storeCur = 0;
+     m_storeDrawn = 0;
+     for (int i = 0; i < CELLS_Y * CELLS_X; i++)
+         m_cellGen[i] = 1;
+     fprintf(stderr, "[gl] textures written in place: %s\n",
+-            m_nstore ? "on (THPS_GL_INPLACE=0 turns it off)" : "off (vitaGL copies them)");
++            m_nstore    ? "on, in graphics memory of their own (THPS_GL_INPLACE=0 turns it off)"
++            : m_inPlace ? "off: no graphics memory for the texture store (vitaGL copies them)"
++                        : "off: THPS_GL_INPLACE=0 (vitaGL copies them)");
+ #endif
+ #else
+     m_filter = f && f[0] == '1';
+@@ -731,6 +745,8 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+     glActiveTexture(GL_TEXTURE0);
+     glBindTexture(GL_TEXTURE_2D, m_base.tex);
+     m_basePtr = (uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
++    fprintf(stderr, "[gl] base target texels at %p, its descriptor's %p\n", (void *)m_basePtr,
++            sceGxmTextureGetData(vglGetGxmTexture(GL_TEXTURE_2D)));
+ #endif
+     if (glGetError() != GL_NO_ERROR) {
+         fprintf(stderr, "[gl] setup failed\n");
+@@ -771,14 +787,15 @@ void GlGpu::Shutdown()
+ #endif
+     glDeleteTextures(4, texs);
+ #ifdef __vita__
+-    for (int i = 1; i < m_nstore; i++)
+-        glDeleteTextures(1, &m_store[i].tex);
++    for (int i = 0; i < m_nstore; i++)
++        FreeOwn(&m_store[i]);
+     for (InPlace &t : m_blitPool)
+-        if (t.tex)
+-            glDeleteTextures(1, &t.tex);
++        FreeOwn(&t);
+     for (InPlace &t : m_imagePool)
+-        if (t.tex)
+-            glDeleteTextures(1, &t.tex);
++        FreeOwn(&t);
++    FreeOwn(&m_atlasTex);
++    m_atlas = 0;
++    m_atlasPtr = nullptr;
+     memset(m_store, 0, sizeof m_store);
+     memset(m_blitPool, 0, sizeof m_blitPool);
+     memset(m_imagePool, 0, sizeof m_imagePool);
+@@ -889,6 +906,12 @@ void GlGpu::Prepare()
+     if (m_cacheOn)
+         CacheRefresh();
+ #endif
++#ifdef __vita__
++    if (m_cacheOn && m_checkFrame != m_frameNo) {
++        m_checkFrame = m_frameNo;
++        CacheCheck();
++    }
++#endif
+ }
+ 
+ void GlGpu::BindStore()
+@@ -908,7 +931,7 @@ void GlGpu::BindStore()
+ #ifdef __vita__
+ /* The cells written since into a copy of the store's texture no draw in flight reads: the current
+  * one until a draw uses it, then a free one (made up to kStoreVersions), which takes every cell it
+- * lacks; with none free, the current one through glTexSubImage2D, which vitaGL copies first. */
++ * lacks; with none free, the current one once the GPU has finished (glFinish). */
+ void GlGpu::StoreSync()
+ {
+     long long prof_t0 = PC_VitaProfNow();
+@@ -920,20 +943,10 @@ void GlGpu::StoreSync()
+             if (i != m_storeCur && (!m_store[i].used || m_frameNo - m_store[i].used > 4))
+                 k = i;
+         if (k < 0 && m_nstore < kStoreVersions) {
+-            InPlace &n = m_store[m_nstore];
+             glActiveTexture(GL_TEXTURE0);
+-            n.tex = Texture(GL_LUMINANCE_ALPHA, VRAM_W, VRAM_H, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE,
+-                            GL_NEAREST);
+-            n.ptr = (uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
+-            n.w = VRAM_W;
+-            n.h = VRAM_H;
+-            n.used = 0;
+-            if (n.ptr) {
++            if (OwnTexture(&m_store[m_nstore], GL_LUMINANCE_ALPHA, 2, VRAM_W, VRAM_H)) {
+                 memset(m_storeGen[m_nstore], 0, sizeof m_storeGen[m_nstore]);
+                 k = m_nstore++;
+-            } else {
+-                glDeleteTextures(1, &n.tex);
+-                n = InPlace{};
+             }
+         }
+         if (k >= 0) {
+@@ -946,8 +959,10 @@ void GlGpu::StoreSync()
+     uint8_t *texels = m_store[cur].ptr;
+     uint32_t *gen = m_storeGen[cur];
+     if (k < 0) {
+-        glActiveTexture(GL_TEXTURE0);
+-        glBindTexture(GL_TEXTURE_2D, m_store[cur].tex);
++        /* every copy was drawn with in the last 4 frames: the current one, the GPU done with it */
++        glFinish();
++        m_storeDrawn = 0;
++        m_st.store_copies++;
+     }
+     for (int cy = 0; cy < CELLS_Y; cy++) {
+         uint32_t *g = gen + cy * CELLS_X;
+@@ -961,22 +976,13 @@ void GlGpu::StoreSync()
+             for (; run < CELLS_X && g[run] != now[run]; run++)
+                 g[run] = now[run];
+             int x = cx * CELL, y = cy * CELL, w = (run - cx) * CELL;
+-            if (k < 0)
+-                Upload16(x, y, w, CELL, tex + (size_t)y * VRAM_W + x, VRAM_W);
+-            else
+-                for (int j = y; j < y + CELL; j++)   /* L the low byte, A the high: as stored */
+-                    memcpy(texels + ((size_t)j * VRAM_W + x) * 2, tex + (size_t)j * VRAM_W + x,
+-                           (size_t)w * 2);
++            for (int j = y; j < y + CELL; j++)   /* L the low byte, A the high: as stored */
++                memcpy(texels + ((size_t)j * VRAM_W + x) * 2, tex + (size_t)j * VRAM_W + x,
++                       (size_t)w * 2);
+             m_st.store_cells += run - cx;
+             cx = run;
+         }
+     }
+-    if (k < 0) {
+-        /* vitaGL wrote a copy: the texels moved, and no draw has used the copy yet */
+-        m_store[cur].ptr = (uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
+-        m_storeDrawn = 0;
+-        m_st.store_copies++;
+-    }
+     PC_VitaProfAdd(PC_PROF_UPLOAD, PC_VitaProfNow() - prof_t0);
+ }
+ 
+@@ -986,18 +992,79 @@ int GlGpu::PoolTake(InPlace *pool, int n, int w, int h, GLenum fmt)
+         InPlace &t = pool[i];
+         if (!t.tex) {
+             glActiveTexture(GL_TEXTURE0);
+-            t.tex = Texture((GLint)fmt, w, h, fmt, GL_UNSIGNED_BYTE, GL_NEAREST);
+-            t.ptr = (uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
+-            t.w = w;
+-            t.h = h;
+-            t.used = 0;
+-            return t.ptr ? i : -1;
++            return OwnTexture(&t, fmt, fmt == GL_RGBA ? 4 : 2, w, h) ? i : -1;
+         }
+         if (t.ptr && t.w == w && t.h == h && (!t.used || m_frameNo - t.used > 4))
+             return i;
+     }
+     return -1;
+ }
++
++/* A texture the CPU writes in place: its texels are a 4 KB-aligned block of vitaGL's graphics
++ * memory (CDRAM, which the CPU doesn't cache), and vitaGL's descriptor of an 8x8 placeholder of
++ * the format (its filters and wrap too) is pointed at them, so the address written is the one the
++ * GPU reads. For the 4096x2048 texture vitaGL made for the texture cache, the pointer it gave to
++ * the texels was 24 bytes off the GPU's. Nothing may call glTexSubImage2D on these: vitaGL would
++ * write its placeholder. */
++int GlGpu::OwnTexture(InPlace *t, GLenum fmt, int bpp, int w, int h)
++{
++    size_t size = (size_t)((w + 7) & ~7) * h * bpp;
++    *t = InPlace{};
++    t->block = vglAlloc((uint32_t)size + 4096, VGL_MEM_VRAM);
++    if (!t->block)
++        return 0;
++    t->ptr = (uint8_t *)(((uintptr_t)t->block + 4095) & ~(uintptr_t)4095);
++    t->tex = Texture((GLint)fmt, 8, 8, fmt, GL_UNSIGNED_BYTE, GL_NEAREST);
++    t->gxm = vglGetGxmTexture(GL_TEXTURE_2D);
++    t->w = w;
++    t->h = h;
++    if (!t->gxm || sceGxmTextureSetData(t->gxm, t->ptr) < 0 || sceGxmTextureSetWidth(t->gxm, w) < 0 ||
++        sceGxmTextureSetHeight(t->gxm, h) < 0) {
++        FreeOwn(t);
++        return 0;
++    }
++    memset(t->ptr, 0, size);
++    return 1;
++}
++
++void GlGpu::FreeOwn(InPlace *t)
++{
++    if (t->tex)
++        glDeleteTextures(1, &t->tex);   /* vitaGL frees its placeholder */
++    if (t->block)
++        vglLazyFree(t->block);          /* once the GPU is done with it */
++    *t = InPlace{};
++}
++
++/* A descriptor vitaGL rewrote (nothing should make it) points the GPU at its placeholder again:
++ * pointed back at the texels, logged and counted */
++void GlGpu::OwnFix(InPlace *t, const char *what)
++{
++    if (!t->gxm || (sceGxmTextureGetData(t->gxm) == t->ptr && (int)sceGxmTextureGetWidth(t->gxm) == t->w &&
++                    (int)sceGxmTextureGetHeight(t->gxm) == t->h))
++        return;
++    if (m_warnedOwn < 8) {
++        m_warnedOwn++;
++        fprintf(stderr, "[gl] %s's descriptor changed (texels %p, %ux%u): pointed back at %p\n", what,
++                sceGxmTextureGetData(t->gxm), sceGxmTextureGetWidth(t->gxm),
++                sceGxmTextureGetHeight(t->gxm), (void *)t->ptr);
++    }
++    sceGxmTextureSetData(t->gxm, t->ptr);
++    sceGxmTextureSetWidth(t->gxm, t->w);
++    sceGxmTextureSetHeight(t->gxm, t->h);
++    m_st.own_fixed++;
++}
++
++void GlGpu::OwnCheck()
++{
++    OwnFix(&m_atlasTex, "the texture cache's atlas");
++    for (int i = 0; i < m_nstore; i++)
++        OwnFix(&m_store[i], "a texture store copy");
++    for (InPlace &t : m_blitPool)
++        OwnFix(&t, "a blit's texture");
++    for (InPlace &t : m_imagePool)
++        OwnFix(&t, "a movie picture's texture");
++}
+ #endif
+ 
+ void GlGpu::TexturesChanging(int x, int y, int w, int h)
+@@ -2344,19 +2411,23 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+ #endif
+ #ifdef PC_GLES
+     m_frameNo++;
++#endif
++#ifdef __vita__
++    OwnCheck();
+ #endif
+     if (m_st.on && ++m_st.frames == 60) {
+         fprintf(stderr, "[gl] last 60 frames: %d draw calls, %d readbacks, %d texture uploads, "
+                         "%d blits; texture cache %d hits, %d misses, %d invalidated, %d full, %d "
+-                        "deferred; fast program %d batches/%d tris, slow %d batches/%d tris (%d "
+-                        "textured tris without a slot); %d texture windows seen; texture store %d "
+-                        "cells written in place, %d new copies, %d copied by vitaGL; blits %d in "
+-                        "place, %d copied by vitaGL\n",
++                        "deferred, %d stale; fast program %d batches/%d tris, slow %d batches/%d "
++                        "tris (%d textured tris without a slot); %d texture windows seen; texture "
++                        "store %d cells written in place, %d new copies, %d waits for the GPU; "
++                        "blits %d in place, %d copied by vitaGL; %d descriptors pointed back\n",
+                 m_st.draws, m_st.readbacks, m_st.tex_ups, m_st.blits, m_st.cache_hits,
+                 m_st.cache_misses, m_st.cache_inval, m_st.cache_full, m_st.cache_deferred,
+-                m_st.fast_batches, m_st.fast_tris, m_st.slow_batches, m_st.slow_tris,
+-                m_st.uncached_tris, (int)m_windows.size(), m_st.store_cells, m_st.store_switches,
+-                m_st.store_copies, m_st.blit_pool, m_st.blit_copies);
++                m_st.cache_stale, m_st.fast_batches, m_st.fast_tris, m_st.slow_batches,
++                m_st.slow_tris, m_st.uncached_tris, (int)m_windows.size(), m_st.store_cells,
++                m_st.store_switches, m_st.store_copies, m_st.blit_pool, m_st.blit_copies,
++                m_st.own_fixed);
+         m_st = Stats{};
+         m_st.on = 1;
+     }
+@@ -2467,50 +2538,50 @@ int GlGpu::CacheSlotFor(uint64_t key)
+     return m_lastSlot = victim;
+ }
+ 
+-/* a slot's 256x256 texels from the texture store, as RGBA: a 0 for the PS1's transparent 0x0000,
+- * 128 for the STP bit, 255 otherwise */
+-void GlGpu::CacheDecode(int s)
++/* row y of a slot's 256x256 texels from the texture store, as RGBA: a 0 for the PS1's transparent
++ * 0x0000, 128 for the STP bit, 255 otherwise; each channel n * 255 / 31 rounded, which an 8-bit
++ * target holds as the emulated lookup's n / 31 (n << 3 | n >> 2 is up to 0.6 less: read back a
++ * step darker) */
++void GlGpu::DecodeRow(const CacheSlot &c, int y, uint32_t *out)
+ {
+-#ifdef __vita__
+-    PC_VITA_PROF_SCOPE(PC_PROF_DECODE);
+-#endif
+-    const CacheSlot &c = m_slot[s];
+     const uint16_t *tex = g_textureStore.Data();
+     int depth = (int)(c.key >> 1) & 3;
+     uint32_t win = (uint32_t)(c.key >> 32);
+     int and_x = win & 255, and_y = (win >> 8) & 255, or_x = (win >> 16) & 255, or_y = (win >> 24) & 255;
+-    uint32_t *out = m_decode.data();
+-    for (int y = 0; y < 256; y++) {
+-#ifdef __vita__
+-        /* straight into the slot's row of the atlas */
+-        out = (uint32_t *)(m_atlasPtr + ((size_t)((s / 16) * 256 + y) * kAtlasW + (s % 16) * 256) * 4);
+-#endif
+-        const uint16_t *row = tex + ((c.y + ((y & and_y) | or_y)) & (VRAM_H - 1)) * VRAM_W;
+-        const uint16_t *clut = tex + c.cy * VRAM_W;
+-        for (int xs = 0; xs < 256; xs++) {
+-            int x = (xs & and_x) | or_x;
+-            uint16_t p;
+-            if (depth == 0) {
+-                uint16_t w = row[(c.x + (x >> 2)) & (VRAM_W - 1)];
+-                p = clut[(c.cx + ((w >> ((x & 3) * 4)) & 15)) & (VRAM_W - 1)];
+-            } else if (depth == 1) {
+-                uint16_t w = row[(c.x + (x >> 1)) & (VRAM_W - 1)];
+-                p = clut[(c.cx + ((w >> ((x & 1) * 8)) & 255)) & (VRAM_W - 1)];
+-            } else {
+-                p = row[(c.x + x) & (VRAM_W - 1)];
+-            }
+-            if (!p) {
+-                *out++ = 0;
+-                continue;
+-            }
+-            uint32_t r = p & 31, g = (p >> 5) & 31, b = (p >> 10) & 31;
+-            r = r << 3 | r >> 2;
+-            g = g << 3 | g >> 2;
+-            b = b << 3 | b >> 2;
+-            *out++ = r | g << 8 | b << 16 | (p & 0x8000 ? 128u : 255u) << 24;
++    const uint16_t *row = tex + ((c.y + ((y & and_y) | or_y)) & (VRAM_H - 1)) * VRAM_W;
++    const uint16_t *clut = tex + c.cy * VRAM_W;
++    for (int xs = 0; xs < 256; xs++) {
++        int x = (xs & and_x) | or_x;
++        uint16_t p;
++        if (depth == 0) {
++            uint16_t w = row[(c.x + (x >> 2)) & (VRAM_W - 1)];
++            p = clut[(c.cx + ((w >> ((x & 3) * 4)) & 15)) & (VRAM_W - 1)];
++        } else if (depth == 1) {
++            uint16_t w = row[(c.x + (x >> 1)) & (VRAM_W - 1)];
++            p = clut[(c.cx + ((w >> ((x & 1) * 8)) & 255)) & (VRAM_W - 1)];
++        } else {
++            p = row[(c.x + x) & (VRAM_W - 1)];
+         }
++        out[xs] = p ? (uint32_t)m_to8[p & 31] | (uint32_t)m_to8[(p >> 5) & 31] << 8 |
++                          (uint32_t)m_to8[(p >> 10) & 31] << 16 | (p & 0x8000 ? 128u : 255u) << 24
++                    : 0;
+     }
+-#ifndef __vita__
++}
++
++/* a slot's 256x256 texels from the texture store (DecodeRow) */
++void GlGpu::CacheDecode(int s)
++{
++#ifdef __vita__
++    PC_VITA_PROF_SCOPE(PC_PROF_DECODE);
++    /* a row at a time into the slot's rows of the atlas */
++    uint32_t row[256];
++    for (int y = 0; y < 256; y++) {
++        DecodeRow(m_slot[s], y, row);
++        memcpy(AtlasRow(s, y), row, sizeof row);
++    }
++#else
++    for (int y = 0; y < 256; y++)
++        DecodeRow(m_slot[s], y, m_decode.data() + (size_t)y * 256);
+     glActiveTexture(GL_TEXTURE0 + kAtlasUnit);
+     glBindTexture(GL_TEXTURE_2D, m_atlas);
+     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+@@ -2579,6 +2650,38 @@ void GlGpu::CacheInvalidate(int x, int y, int w, int h)
+     m_lastSlot = -1;
+ }
+ 
++#ifdef __vita__
++/* Four rows of the decoded slots against a fresh decode each frame, round robin, at the frame's
++ * first Prepare (every write so far has freed the slots it reaches): a slot that differs missed
++ * a write and is freed (decoded again when next drawn). Counted as stale in the [gl] line and
++ * logged the first time; it should stay 0. */
++void GlGpu::CacheCheck()
++{
++    uint32_t fresh[256];
++    for (int n = 0, tries = 0; n < 4 && tries < kCacheSlots; tries++) {
++        int s = m_checkSlot;
++        m_checkSlot = (m_checkSlot + 1) % kCacheSlots;
++        if (!m_slot[s].key)
++            continue;
++        int y = m_checkRow = (m_checkRow + 97) & 255;
++        DecodeRow(m_slot[s], y, fresh);
++        n++;
++        if (!memcmp(fresh, AtlasRow(s, y), sizeof fresh))
++            continue;
++        if (!m_warnedStale) {
++            m_warnedStale = 1;
++            fprintf(stderr, "[gl] texture cache: slot %d (page %d,%d, depth %d, CLUT %d,%d) row %d "
++                            "differs from the store: freed\n",
++                    s, m_slot[s].x, m_slot[s].y, (int)(m_slot[s].key >> 1) & 3, m_slot[s].cx,
++                    m_slot[s].cy, y);
++        }
++        m_st.cache_stale++;
++        m_slot[s].key = 0;
++        m_lastSlot = -1;
++    }
++}
++#endif
++
+ /* before drawing: the slots written to since they were decoded */
+ void GlGpu::CacheRefresh()
+ {
+diff --git a/platform/pc/src/pc_video.cpp b/platform/pc/src/pc_video.cpp
+index ab10965..ed852e6 100644
+--- a/platform/pc/src/pc_video.cpp
++++ b/platform/pc/src/pc_video.cpp
+@@ -25,6 +25,7 @@
+ #include "pc/screen.h"
+ #include "pc/settings.h"
+ #include "pc/texture_store.h"
++#include "pc/platform.h"
+ 
+ extern volatile uint32_t pc_heartbeat;
+ 
+@@ -83,43 +84,69 @@ void PutLe(uint8_t *p, uint32_t v, int n)
+         p[i] = (uint8_t)(v >> (8 * i));
+ }
+ 
+-int WriteBmp(const char *path, const uint32_t *argb, int pitch, int w, int h)
++/* A BMP of w x h pixels, px(x, y) giving each as 0x..RRGGBB, made in memory (malloc), its size in
++ * *size; NULL without the memory */
++template <class Px> uint8_t *MakeBmp(int w, int h, Px px, int *size)
+ {
+-    FILE *f = fopen(path, "wb");
+-    if (!f) {
+-        fprintf(stderr, "[video] cannot write %s\n", path);
+-        return -1;
+-    }
+     int stride = (w * 3 + 3) & ~3;
+-    uint8_t hdr[54];
+-    memset(hdr, 0, sizeof hdr);
+-    hdr[0] = 'B';
+-    hdr[1] = 'M';
+-    PutLe(hdr + 2, (uint32_t)(54 + stride * h), 4);
+-    PutLe(hdr + 10, 54, 4);
+-    PutLe(hdr + 14, 40, 4);
+-    PutLe(hdr + 18, (uint32_t)w, 4);
+-    PutLe(hdr + 22, (uint32_t)h, 4);
+-    PutLe(hdr + 26, 1, 2);
+-    PutLe(hdr + 28, 24, 2);
+-    PutLe(hdr + 34, (uint32_t)(stride * h), 4);
+-    PutLe(hdr + 38, 2835, 4);
+-    PutLe(hdr + 42, 2835, 4);
+-    fwrite(hdr, 1, sizeof hdr, f);
+-
+-    uint8_t *row = (uint8_t *)calloc((size_t)stride, 1);
++    uint8_t *b = (uint8_t *)calloc((size_t)(54 + stride * h), 1);
++    if (!b)
++        return nullptr;
++    *size = 54 + stride * h;
++    b[0] = 'B';
++    b[1] = 'M';
++    PutLe(b + 2, (uint32_t)*size, 4);
++    PutLe(b + 10, 54, 4);
++    PutLe(b + 14, 40, 4);
++    PutLe(b + 18, (uint32_t)w, 4);
++    PutLe(b + 22, (uint32_t)h, 4);
++    PutLe(b + 26, 1, 2);
++    PutLe(b + 28, 24, 2);
++    PutLe(b + 34, (uint32_t)(stride * h), 4);
++    PutLe(b + 38, 2835, 4);
++    PutLe(b + 42, 2835, 4);
+     for (int y = h - 1; y >= 0; y--) {
+-        const uint32_t *s = argb + (size_t)y * pitch;
++        uint8_t *row = b + 54 + (size_t)(h - 1 - y) * stride;
+         for (int x = 0; x < w; x++) {
+-            row[x * 3 + 0] = (uint8_t)s[x];
+-            row[x * 3 + 1] = (uint8_t)(s[x] >> 8);
+-            row[x * 3 + 2] = (uint8_t)(s[x] >> 16);
++            uint32_t c = px(x, y);
++            row[x * 3 + 0] = (uint8_t)c;
++            row[x * 3 + 1] = (uint8_t)(c >> 8);
++            row[x * 3 + 2] = (uint8_t)(c >> 16);
+         }
+-        fwrite(row, 1, (size_t)stride, f);
+     }
+-    free(row);
+-    fclose(f);
++    return b;
++}
++
++/* A file made in memory (malloc'd; taken): on the Vita written by a thread of its own while the
++ * game goes on (a dump written by the game thread in small writes froze t12 for minutes);
++ * elsewhere now. */
++int SaveFile(const char *path, uint8_t *data, int size)
++{
++#ifdef __vita__
++    if (PC_VitaWriteFile(path, data, size) < 0) {
++        fprintf(stderr, "[video] %s skipped: the last dumps are still being written\n", path);
++        return -1;
++    }
++    return 0;
++#else
++    FILE *f = fopen(path, "wb");
++    int ok = f && fwrite(data, 1, (size_t)size, f) == (size_t)size;
++    if (f)
++        fclose(f);
++    free(data);
++    if (!ok) {
++        fprintf(stderr, "[video] cannot write %s\n", path);
++        return -1;
++    }
+     return 0;
++#endif
++}
++
++int WriteBmp(const char *path, const uint32_t *argb, int pitch, int w, int h)
++{
++    int size = 0;
++    uint8_t *b = MakeBmp(w, h, [&](int x, int y) { return argb[(size_t)y * pitch + x]; }, &size);
++    return b ? SaveFile(path, b, size) : -1;
+ }
+ 
+ inline uint32_t C15ToArgb(uint32_t c)
+@@ -669,25 +696,20 @@ void Video::Present()
+ int Video::DumpSpace(const char *path)
+ {
+     uint16_t *v = (uint16_t *)malloc((size_t)kTexW * kTexH * 2);
+-    uint32_t *buf = (uint32_t *)malloc((size_t)kTexW * kTexH * sizeof(uint32_t));
+-    if (!buf || !v) {
+-        free(v);
+-        free(buf);
++    if (!v)
+         return -1;
+-    }
+     PC_ScreenRead(0, 0, kTexW, kTexH, v);
+     /* the screens, and the textures where the texture store holds some (pc_texstore.h) */
+     const uint16_t *tex = g_textureStore.Data();
+     const uint8_t *cell = g_textureStore.Cells();
+-    for (int i = 0; i < kTexW * kTexH; i++) {
+-        int x = i % kTexW, y = i / kTexW;
++    int size = 0;
++    uint8_t *b = MakeBmp(kTexW, kTexH, [&](int x, int y) {
++        int i = y * kTexW + x;
+         int used = cell[(y / kTexCell) * (kTexW / kTexCell) + x / kTexCell] & kTexUsed;
+-        buf[i] = C15ToArgb(used ? tex[i] : v[i]);
+-    }
+-    int rc = WriteBmp(path, buf, kTexW, kTexW, kTexH);
+-    free(buf);
++        return C15ToArgb(used ? tex[i] : v[i]);
++    }, &size);
+     free(v);
+-    return rc;
++    return b ? SaveFile(path, b, size) : -1;
+ }
+ 
+ int Video::DumpDisplay(const char *path)
+@@ -700,19 +722,14 @@ int Video::DumpDisplay(const char *path)
+     d = g_screens.Display();
+     int w = d.w < kTexW ? d.w : kTexW, h = d.h < kTexH ? d.h : kTexH;
+     uint16_t *px = (uint16_t *)malloc((size_t)w * h * 2);
+-    uint32_t *buf = (uint32_t *)malloc((size_t)w * h * sizeof(uint32_t));
+-    if (!buf || !px) {
+-        free(px);
+-        free(buf);
++    if (!px)
+         return -1;
+-    }
+     /* the display area at the PS1's resolution */
+     PC_ScreenRead(d.x, d.y, w, h, px);
+-    for (int i = 0; i < w * h; i++)
+-        buf[i] = C15ToArgb(px[i]);
+-    int rc = WriteBmp(path, buf, w, w, h);
+-    free(buf);
++    int size = 0;
++    uint8_t *b = MakeBmp(w, h, [&](int x, int y) { return C15ToArgb(px[(size_t)y * w + x]); }, &size);
+     free(px);
++    int rc = b ? SaveFile(path, b, size) : -1;
+ 
+     /* and what OpenGL drew, at its internal resolution: <path without .bmp>_gl.bmp */
+     int hw = 0, hh = 0;
+diff --git a/platform/pc/src/pc_vita.cpp b/platform/pc/src/pc_vita.cpp
+index 4781b66..606e637 100644
+--- a/platform/pc/src/pc_vita.cpp
++++ b/platform/pc/src/pc_vita.cpp
+@@ -179,6 +179,75 @@ void PC_VitaLogOpen(void) {
+ 
+ /* ---- the profile switch -------------------------------------------------------------------- */
+ 
++/* ---- files written by a thread of their own (PC_VitaWriteFile) ---- */
++
++namespace {
++struct WriteJob {
++    char path[256];
++    void *data;
++    int size;
++};
++constexpr int kWriteJobs = 4;
++WriteJob g_writeJobs[kWriteJobs];
++int g_writePut, g_writeOut; /* jobs queued (the caller), written (the thread) */
++SceUID g_writeSema = -1;
++
++/* below the log's priority, in pieces of 256 KB: a dump written by the game thread in its rows'
++ * small writes froze t12 at frame 1500 */
++int WriteThread(SceSize, void *) {
++    for (;;) {
++        sceKernelWaitSema(g_writeSema, 1, NULL);
++        WriteJob &j = g_writeJobs[g_writeOut % kWriteJobs];
++        long long t0 = sceKernelGetProcessTimeWide();
++        int done = 0;
++        SceUID fd = sceIoOpen(j.path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
++        if (fd >= 0) {
++            while (done < j.size) {
++                int n = j.size - done < (256 << 10) ? j.size - done : 256 << 10;
++                int w = sceIoWrite(fd, (char *)j.data + done, n);
++                if (w <= 0)
++                    break;
++                done += w;
++            }
++            sceIoClose(fd);
++        }
++        fprintf(stderr, "[shot] %s: %s, %d KB in %lld ms\n", j.path,
++                done == j.size ? "written" : "write failed", done >> 10,
++                (sceKernelGetProcessTimeWide() - t0) / 1000);
++        free(j.data);
++        __atomic_store_n(&g_writeOut, g_writeOut + 1, __ATOMIC_RELEASE);
++    }
++    return 0;
++}
++} // namespace
++
++int PC_VitaWriteFile(const char *path, void *data, int size) {
++    if (g_writeSema < 0) {
++        SceUID sema = sceKernelCreateSema("thps-write", 0, 0, kWriteJobs, NULL);
++        SceUID th = sceKernelCreateThread("thps-write", WriteThread, 0x10000100 + 20, 0x4000, 0,
++                                          SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2,
++                                          NULL);
++        if (sema < 0 || th < 0) {
++            free(data);
++            return -1;
++        }
++        g_writeSema = sema;
++        sceKernelStartThread(th, 0, NULL);
++        PC_VitaWatchThread("write", th);
++    }
++    if (g_writePut - __atomic_load_n(&g_writeOut, __ATOMIC_ACQUIRE) >= kWriteJobs) {
++        free(data);
++        return -1;
++    }
++    WriteJob &j = g_writeJobs[g_writePut % kWriteJobs];
++    snprintf(j.path, sizeof j.path, "%s", path);
++    j.data = data;
++    j.size = size;
++    g_writePut++;
++    sceKernelSignalSema(g_writeSema, 1);
++    return 0;
++}
++
+ int pc_vita_profile;
+ 
+ namespace {
+-- 
+2.53.0
+

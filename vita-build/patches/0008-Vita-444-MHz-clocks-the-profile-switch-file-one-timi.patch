@@ -1,0 +1,269 @@
+From a1775efdcb9295043a1eaa540893c61a1f49f807 Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Sat, 24 Oct 2026 11:57:33 +0300
+Subject: [PATCH] Vita: 444 MHz clocks; the profile switch file (one timing
+ line a second)
+
+---
+ platform/pc/include/pc/movie.h    |  2 +
+ platform/pc/include/pc/platform.h |  7 ++++
+ platform/pc/src/pc_gpu_gl.cpp     | 29 ++++++++++++++
+ platform/pc/src/pc_movie.cpp      | 34 ++++++++++++++--
+ platform/pc/src/pc_vita.cpp       | 66 +++++++++++++++++++++++++++++++
+ 5 files changed, 134 insertions(+), 4 deletions(-)
+
+diff --git a/platform/pc/include/pc/movie.h b/platform/pc/include/pc/movie.h
+index ae3a4c1..73d75d8 100644
+--- a/platform/pc/include/pc/movie.h
++++ b/platform/pc/include/pc/movie.h
+@@ -46,6 +46,8 @@ private:
+     static void LoadVideo(plm_buffer_t *b, void *user);
+     void ScreenShow();
+     void ShowPicture(plm_frame_t *f);
++    bool FrameDecode();
++    void FrameClock();
+ 
+     /* the screen: rows of kScreenW * 3 bytes, 24-bit pixels or (m_rgb24 false) 15-bit halfwords */
+     uint8_t m_screen[kScreenH][kScreenW * 3] = {};
+diff --git a/platform/pc/include/pc/platform.h b/platform/pc/include/pc/platform.h
+index 2546741..8360329 100644
+--- a/platform/pc/include/pc/platform.h
++++ b/platform/pc/include/pc/platform.h
+@@ -31,6 +31,13 @@
+ #define PC_VITA_DIR "ux0:data/THPS"
+ /* src/pc_vita.cpp: the settings (env.txt) and the log (thps.log), before the first log line */
+ void PC_VitaLogOpen(void);
++/* the `profile` switch (an empty PC_VITA_DIR/profile file): time spent per slot, logged once a
++ * second at the frame boundary (PC_VitaProfFrame) */
++enum { PC_PROF_PRESENT, PC_PROF_SWAP, PC_PROF_READBACK, PC_PROF_MOVIE, PC_PROF_SLOTS };
++extern int pc_vita_profile;
++long long PC_VitaProfNow(void);
++void PC_VitaProfAdd(int slot, long long us);
++void PC_VitaProfFrame(void);
+ #endif
+ #define PC_FSEEK fseeko
+ #define PC_FTELL ftello
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index c4652ca..2a94c9a 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -34,6 +34,9 @@
+ #include "pc/dc_textures.h"
+ #include "pc/precise.h"
+ #include "pc/render3d.h"
++#ifdef __vita__
++#include "pc/platform.h"
++#endif
+ 
+ int pc_wide_pad;   /* GlGpu::m_pad, for the game's view frustum (pc/gl_gpu.h) */
+ 
+@@ -1551,7 +1554,13 @@ void GlGpu::ReadPixels(int x0, int y0, int x1, int y1, uint16_t *out)
+     glBindFramebuffer(GL_READ_FRAMEBUFFER, m_rbFbo);
+ #endif
+     glPixelStorei(GL_PACK_ALIGNMENT, 4);
++#ifdef __vita__
++    long long prof_t0 = PC_VitaProfNow();
++    glReadPixels(px, py, pw, ph, GL_RGBA, GL_UNSIGNED_BYTE, buf);
++    PC_VitaProfAdd(PC_PROF_READBACK, PC_VitaProfNow() - prof_t0);
++#else
+     glReadPixels(px, py, pw, ph, GL_RGBA, GL_UNSIGNED_BYTE, buf);
++#endif
+     m_st.readbacks++;
+     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+     int w = x1 - x0 + 1;
+@@ -1673,7 +1682,13 @@ uint32_t *GlGpu::ReadArea(int x, int y, int w, int h, int *out_w, int *out_h)
+     /* (ES 2 reads RGBA only: to the BGRA the callers take) */
+     glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
+     glPixelStorei(GL_PACK_ALIGNMENT, 4);
++#ifdef __vita__
++    long long prof_t0 = PC_VitaProfNow();
++    glReadPixels(px0, py0, sw, sh, GL_RGBA, GL_UNSIGNED_BYTE, out);
++    PC_VitaProfAdd(PC_PROF_READBACK, PC_VitaProfNow() - prof_t0);
++#else
+     glReadPixels(px0, py0, sw, sh, GL_RGBA, GL_UNSIGNED_BYTE, out);
++#endif
+     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+     for (int i = 0; i < sw * sh; i++) {
+         uint32_t p = out[i];
+@@ -1848,6 +1863,9 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+     SDL_Window *win = (SDL_Window *)sdl_window;
+     if (!m_active || !win)
+         return;
++#ifdef __vita__
++    long long prof_t0 = PC_VitaProfNow();
++#endif
+     Flush();
+ 
+     int ww, wh, pic[4];
+@@ -1926,7 +1944,18 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+ #endif
+         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+     }
++#ifdef __vita__
++    long long prof_t1 = PC_VitaProfNow();
++    SDL_GL_SwapWindow(win);
++    if (pc_vita_profile) {
++        long long t2 = PC_VitaProfNow();
++        PC_VitaProfAdd(PC_PROF_SWAP, t2 - prof_t1);
++        PC_VitaProfAdd(PC_PROF_PRESENT, t2 - prof_t0);
++        PC_VitaProfFrame();
++    }
++#else
+     SDL_GL_SwapWindow(win);
++#endif
+     if (m_st.on && ++m_st.frames == 60) {
+         fprintf(stderr, "[gl] last 60 frames: %d draw calls, %d readbacks, %d texture uploads, "
+                         "%d blits\n",
+diff --git a/platform/pc/src/pc_movie.cpp b/platform/pc/src/pc_movie.cpp
+index a337079..04e0bf3 100644
+--- a/platform/pc/src/pc_movie.cpp
++++ b/platform/pc/src/pc_movie.cpp
+@@ -9,6 +9,9 @@
+  *
+  * An STR movie's pictures are decoded (pc_vdec.h) into the same screen, where the PS1 put them in
+  * its screen buffer. */
++#ifdef __vita__
++#include "pc/platform.h"
++#endif
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -154,7 +157,27 @@ void MoviePlayer::ShowPicture(plm_frame_t *f) {
+ }
+ 
+ bool MoviePlayer::Frame() {
+-    double a, step = 1.0 / plm_video_get_framerate(m_vid);
++#ifdef __vita__
++    long long prof_t0 = PC_VitaProfNow();
++    bool r = FrameDecode();
++    PC_VitaProfAdd(PC_PROF_MOVIE, PC_VitaProfNow() - prof_t0);
++    if (!r)
++        return false;
++    PC_FrameWait(1);
++    FrameClock();
++    return true;
++#else
++    if (!FrameDecode())
++        return false;
++    PC_FrameWait(1);
++    FrameClock();
++    return true;
++#endif
++}
++
++/* the next picture, if it is due (false: the film has ended) */
++bool MoviePlayer::FrameDecode() {
++    double step = 1.0 / plm_video_get_framerate(m_vid);
+     if (!m_sfd)
+         return false;
+     if (!m_next)
+@@ -172,8 +195,12 @@ bool MoviePlayer::Frame() {
+         ShowPicture(m_next);
+         m_next = nullptr;
+     }
+-    PC_FrameWait(1);
+-    a = g_streamer.FilmTime();
++    return true;
++}
++
++/* the film's clock: the audio's time, or frames when there is none */
++void MoviePlayer::FrameClock() {
++    double a = g_streamer.FilmTime();
+     if (a > m_audio) {
+         m_audio = m_clock = a;
+         m_stall = 0;
+@@ -181,7 +208,6 @@ bool MoviePlayer::Frame() {
+         /* no audio, or it has ended: frames keep the time */
+         m_clock += 1.0 / 60.0;
+     }
+-    return true;
+ }
+ 
+ void MoviePlayer::Close() {
+diff --git a/platform/pc/src/pc_vita.cpp b/platform/pc/src/pc_vita.cpp
+index 909961a..4a7d51f 100644
+--- a/platform/pc/src/pc_vita.cpp
++++ b/platform/pc/src/pc_vita.cpp
+@@ -10,6 +10,8 @@
+ #include <psp2/io/fcntl.h>
+ #include <psp2/io/stat.h>
+ #include <psp2/kernel/clib.h>
++#include <psp2/kernel/processmgr.h>
++#include <psp2/power.h>
+ 
+ #include "pc/platform.h"
+ #include "pc_runtime.h"
+@@ -73,6 +75,70 @@ void PC_VitaLogOpen(void) {
+         stderr = f;
+         stdout = f;
+     }
++    /* the highest clocks a user app may set (the default is 333 MHz) */
++    scePowerSetArmClockFrequency(444);
++    scePowerSetBusClockFrequency(222);
++    scePowerSetGpuClockFrequency(222);
++    scePowerSetGpuXbarClockFrequency(166);
++    fprintf(stderr, "clocks: cpu %d MHz, bus %d, gpu %d, xbar %d\n", scePowerGetArmClockFrequency(),
++            scePowerGetBusClockFrequency(), scePowerGetGpuClockFrequency(),
++            scePowerGetGpuXbarClockFrequency());
++    SceIoStat st;
++    pc_vita_profile = sceIoGetstat(PC_VITA_DIR "/profile", &st) >= 0;
++    if (pc_vita_profile)
++        fprintf(stderr, "profile: on (one line a second)\n");
++}
++
++/* ---- the profile switch -------------------------------------------------------------------- */
++
++int pc_vita_profile;
++
++namespace {
++long long g_profUs[PC_PROF_SLOTS];
++int g_profCount[PC_PROF_SLOTS];
++long long g_profStart, g_profFrameStart, g_profFrameMax;
++int g_profFrames;
++} // namespace
++
++long long PC_VitaProfNow(void) { return pc_vita_profile ? (long long)sceKernelGetProcessTimeWide() : 0; }
++
++void PC_VitaProfAdd(int slot, long long us) {
++    if (pc_vita_profile && slot >= 0 && slot < PC_PROF_SLOTS) {
++        g_profUs[slot] += us;
++        g_profCount[slot]++;
++    }
++}
++
++/* At each present: the longest frame, and once a second the frames shown and each slot's share
++ * (per frame, in ms). "other" is everything else on the game thread: game logic, the CPU side of
++ * drawing, sound and file reads. */
++void PC_VitaProfFrame(void) {
++    if (!pc_vita_profile)
++        return;
++    long long now = (long long)sceKernelGetProcessTimeWide();
++    if (g_profFrameStart && now - g_profFrameStart > g_profFrameMax)
++        g_profFrameMax = now - g_profFrameStart;
++    g_profFrameStart = now;
++    if (!g_profStart)
++        g_profStart = now;
++    g_profFrames++;
++    if (now - g_profStart < 1000000)
++        return;
++    double n = g_profFrames, span = (double)(now - g_profStart) / 1000.0;
++    double present = g_profUs[PC_PROF_PRESENT] / 1000.0 / n, swap = g_profUs[PC_PROF_SWAP] / 1000.0 / n,
++           rb = g_profUs[PC_PROF_READBACK] / 1000.0 / n, movie = g_profUs[PC_PROF_MOVIE] / 1000.0 / n;
++    double other = span / n - present - rb - movie;
++    fprintf(stderr,
++            "[prof] %.1f fps, frame %.1f ms (max %.1f): present %.1f (swap %.1f), readback %.1f "
++            "(%d), movie %.1f (%d), other %.1f\n",
++            n * 1000.0 / span, span / n, g_profFrameMax / 1000.0, present,
++            swap, rb, g_profCount[PC_PROF_READBACK], movie, g_profCount[PC_PROF_MOVIE],
++            other > 0 ? other : 0.0);
++    memset(g_profUs, 0, sizeof g_profUs);
++    memset(g_profCount, 0, sizeof g_profCount);
++    g_profFrames = 0;
++    g_profFrameMax = 0;
++    g_profStart = now;
+ }
+ 
+ /* ---- the R3000's division --------------------------------------------------------------------
+-- 
+2.53.0
+

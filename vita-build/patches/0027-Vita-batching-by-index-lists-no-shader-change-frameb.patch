@@ -1,0 +1,747 @@
+From 0b8a462d3bd14371dc536ceb993d2cf3db29f07c Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Wed, 28 Oct 2026 09:10:45 +0300
+Subject: [PATCH] Vita: batching by index lists (no shader change), framebuffer
+ binds only when they change, texture decoding by time
+
+- vitaGL's compiler took no change to the draw vertex shader (t20, t21: even plain ifs), so t21's
+  batch programs are gone. GlGpu::LayerBatch draws the classes from index lists (unsigned short,
+  per window of up to 65532 vertices with the attributes starting at the window's first): the
+  opaque faces' true depth, their colour, then semi-transparent, then subtractive, with the
+  draw programs t17 had (u_dpass 0/1 as before).
+- BindFb/SetViewport: glBindFramebuffer and glViewport only when the framebuffer or viewport
+  changes (forgotten at each swap). Every draw used to bind its target again; if vitaGL starts a
+  scene on each bind the whole target is loaded and stored per draw, which would grow with the
+  resolution and the draw count (t21: GPU swap 40-80 ms at 960x544, CPU draw up to 180 us a GL
+  draw). THPS_GL_FBCACHE=0: as before. [gl] counts framebuffer binds a frame.
+- Texture cache: 8 decodes a frame, then more while the frame's decoding took under
+  THPS_GL_DECODEMS (default 25 ms). A triangle without a slot takes the per-pixel lookup, which
+  at 960x544 made loading screens and menus 300-500 ms frames.
+---
+ platform/pc/README.md           |   2 +
+ platform/pc/include/pc/gl_gpu.h |  28 ++-
+ platform/pc/src/pc_gpu_gl.cpp   | 339 ++++++++++++++++----------------
+ 3 files changed, 178 insertions(+), 191 deletions(-)
+
+diff --git a/platform/pc/README.md b/platform/pc/README.md
+index cf848c9..583410f 100644
+--- a/platform/pc/README.md
++++ b/platform/pc/README.md
+@@ -562,6 +562,8 @@ window, `THPS_FAST`, `THPS_DETERMINISTIC`) never wait for a display.
+ | `THPS_R3D_BATCH=0` | OpenGL ES (Vita): a native 3D layer's faces drawn in the PS1's order, split where they overlap (before t20); default: each run of faces between 2D primitives in one depth pass and one colour pass for the opaque faces, then the semi-transparent ones in order |
+ | `THPS_VITA_RES=WxH` | Vita: screens drawn at most 512x240, 720x408 or 960x544 (default), scaled up to the screen |
+ | `THPS_VITA_FPS=30` | Vita: every other frame shown (the game still runs at 60) |
++| `THPS_GL_FBCACHE=0` | OpenGL: bind the target framebuffer and set the viewport at every draw again (before t22); default: only when they change |
++| `THPS_GL_DECODEMS=n` | OpenGL ES: texture cache pages decoded a frame: 8, then more while the frame's decoding took under n ms (default 25; before t22: 8 only) |
+ | `THPS_R3DSTATS=1` | once a second: native 3D faces, culled faces, draws, and calls left to the retail code |
+ | `THPS_R3D_VERIFY=1` | check the native renderer's float vertices and back-face tests against retail's integers |
+ | `THPS_R3D_NEARDROP=1` | drop faces crossing the near plane that the PS1 dropped (default: OpenGL clips them) |
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index 57735b5..d06dd69 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -192,8 +192,8 @@ class GlGpu {
+      * the classes present, bit 1 << cls (0 opaque, 1 semi-transparent, 2 subtractive). No HD
+      * textures (those faces keep LayerDraw). */
+     void LayerBatch(int first, int count, int cls, int why);
+-    /* LayerBatch can draw (its programs compiled) */
+-    bool BatchOk() const { return m_drawProgBatch != 0; }
++    /* LayerBatch can draw (t21: its programs compiled; t22: always) */
++    bool BatchOk() const { return true; }
+     void LayerEnd();
+     void HdForget(uint16_t h);
+     void TexturesChanging(int x, int y, int w, int h);
+@@ -267,9 +267,7 @@ class GlGpu {
+     /* the draw program's u_dpass (a float in ES 2) */
+ #ifdef PC_GLES
+     void DPass(int d) { glUniform1f(m_drawUDpass, (float)d); }
+-    /* the batch programs' u_sel (LayerBatch): 0 all faces, 1 opaque, 2 semi-transparent,
+-     * 3 subtractive */
+-    void Sel(int sel) { glUniform1f(m_drawUSel, (float)sel); }
++
+ #else
+     void DPass(int d) { glUniform1i(m_drawUDpass, d); }
+ #endif
+@@ -323,7 +321,7 @@ class GlGpu {
+      * (vitaGL copies those into its frame's memory) */
+     void DrawAttribs(const GlVert *v);
+     /* the draw program's attributes from buffer buf (0: client memory at v) */
+-    void DrawAttribsFrom(GLuint buf, const GlVert *v);
++    void DrawAttribsFrom(GLuint buf, const GlVert *v, int first = 0);
+     /* THPS_GL_LAYERVBO (default on): a native 3D layer's vertices are written once, at
+      * LayerBegin, into a buffer of graphics memory its draws read (glBufferData; vitaGL frees
+      * the old memory once the GPU is done with it), instead of vitaGL copying them at every
+@@ -364,21 +362,17 @@ class GlGpu {
+     uint8_t *m_atlasPtr = nullptr;   /* the atlas's texels (m_atlasTex on the Vita), written in place */
+     /* the draw programs' uniforms; m_drawU* are the bound program's (UseDraw) */
+     struct DrawLocs {
+-        GLint pass, dpass, proj, target, shift, uvfix, sel;
++        GLint pass, dpass, proj, target, shift, uvfix;
+     };
+     GLuint m_drawProgFast = 0;
+     DrawLocs m_locSlow = {}, m_locFast = {};
+-    /* t21: LayerBatch's programs, the draw program's with u_sel (compiled last, after every
+-     * program t17 had: when vitaGL's compiler rejects them, batching is off and the rest works) */
+-    GLuint m_drawProgBatch = 0, m_drawProgBatchFast = 0;
+-    DrawLocs m_locBatch = {}, m_locBatchFast = {};
+-    GLint m_drawUSel = -1;
+-    std::string m_batchVs;
+-    const char *m_fastFs = nullptr;
+-    void BatchPrograms(const char *draw_fs, const char *fast_fs);
++    /* t22: LayerBatch's index lists (opaque, semi-transparent, subtractive) for one window */
++    static constexpr int kBatchWindow = 65532;
++    std::vector<uint16_t> m_batchIdx[3];
++    long long m_decodeUs = 0, m_decodeBudgetUs = 25000;   /* this frame's decoding; THPS_GL_DECODEMS */
+     float m_proj[4] = {};
+-    int m_projSet = 0, m_projApplied[4] = {};
+-    void UseDraw(int fast, int batch = 0);
++    int m_projSet = 0, m_projApplied[2] = {};
++    void UseDraw(int fast);
+     CacheSlot m_slot[kCacheSlots] = {};
+     uint32_t m_frameNo = 1;
+     int m_lastSlot = -1;
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index b93768c..1f77be9 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -128,6 +128,45 @@ GLuint Compile(GLenum type, const char *src)
+     return s;
+ }
+ 
++
++/* t22: the framebuffer and viewport as last set, so that a draw rebinding the target it is already
++ * on costs nothing (every draw used to: vitaGL may start a new scene for each bind, loading and
++ * storing the whole target, which grows with the resolution). Forgotten at each swap. */
++static GLuint s_fb = ~0u;
++static GLint s_vp[4] = { -1, -1, -1, -1 };
++static int s_fbBinds, s_fbSkip = -1;
++
++static void BindFb(GLenum target, GLuint f)
++{
++    if (s_fbSkip < 0) {
++        const char *e = getenv("THPS_GL_FBCACHE");
++        s_fbSkip = !(e && e[0] == '0');
++    }
++    if (target == GL_FRAMEBUFFER && s_fbSkip && f == s_fb)
++        return;
++    glBindFramebuffer(target, f);
++    s_fb = target == GL_FRAMEBUFFER ? f : ~0u;
++    s_vp[0] = -1;
++    s_fbBinds++;
++}
++
++static void SetViewport(GLint x, GLint y, GLsizei w, GLsizei h)
++{
++    if (s_fbSkip > 0 && s_vp[0] == x && s_vp[1] == y && s_vp[2] == w && s_vp[3] == h)
++        return;
++    glViewport(x, y, w, h);
++    s_vp[0] = x;
++    s_vp[1] = y;
++    s_vp[2] = w;
++    s_vp[3] = h;
++}
++
++static void ForgetFb()
++{
++    s_fb = ~0u;
++    s_vp[0] = -1;
++}
++
+ #ifdef __vita__
+ /* ---- programs kept on the card ----
+  * vitaGL compiles GLSL with the console's shader compiler at every start, seconds a program. A
+@@ -332,11 +371,11 @@ GLuint Framebuffer(GLuint tex)
+ {
+     GLuint f;
+     glGenFramebuffers(1, &f);
+-    glBindFramebuffer(GL_FRAMEBUFFER, f);
++    BindFb(GL_FRAMEBUFFER, f);
+     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+         f = 0;
+-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    BindFb(GL_FRAMEBUFFER, 0);
+     return f;
+ }
+ 
+@@ -494,11 +533,11 @@ void CopyArea(GlGpu *gpu, const Target *from, const Target *to, int x, int y, in
+     gpu->BlitPixels(from, fx0, fy0, fx1, fy1, to->fbo, to->pw, to->ph, tx0, ty0, tx1, ty1);
+ #else
+     (void)gpu;
+-    glBindFramebuffer(GL_READ_FRAMEBUFFER, from->fbo);
+-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, to->fbo);
++    BindFb(GL_READ_FRAMEBUFFER, from->fbo);
++    BindFb(GL_DRAW_FRAMEBUFFER, to->fbo);
+     glBlitFramebuffer(fx0, fy0, fx1, fy1, tx0, ty0, tx1, ty1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+ #endif
+-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    BindFb(GL_FRAMEBUFFER, 0);
+     to->Written(tx0, ty0, tx1, ty1);
+ }
+ 
+@@ -553,19 +592,19 @@ bool RenderTarget::Create(int x_, int y_, int w_, int h_, int pad, int pw_, int
+         glBindRenderbuffer(GL_RENDERBUFFER, ms_color);
+         glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_RGBA8, pw_, ph_);
+         glGenFramebuffers(1, &ms_fbo);
+-        glBindFramebuffer(GL_FRAMEBUFFER, ms_fbo);
++        BindFb(GL_FRAMEBUFFER, ms_fbo);
+         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, ms_color);
+     }
+ #endif
+     if (fbo) {
+-        glBindFramebuffer(GL_FRAMEBUFFER, samples ? ms_fbo : fbo);
++        BindFb(GL_FRAMEBUFFER, samples ? ms_fbo : fbo);
+         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth);
+         if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
++            BindFb(GL_FRAMEBUFFER, 0);
+             Destroy();
+             return false;
+         }
+-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
++        BindFb(GL_FRAMEBUFFER, 0);
+     }
+     if (!fbo || glGetError() != GL_NO_ERROR) {
+         Destroy();
+@@ -581,8 +620,8 @@ bool RenderTarget::Create(int x_, int y_, int w_, int h_, int pad, int pw_, int
+ 
+ void RenderTarget::Use() const
+ {
+-    glBindFramebuffer(GL_FRAMEBUFFER, samples ? ms_fbo : fbo);
+-    glViewport(0, 0, pw, ph);
++    BindFb(GL_FRAMEBUFFER, samples ? ms_fbo : fbo);
++    SetViewport(0, 0, pw, ph);
+     stale = samples != 0;
+ }
+ 
+@@ -592,10 +631,10 @@ void RenderTarget::Resolve() const
+     if (!stale)
+         return;
+ #ifndef PC_GLES
+-    glBindFramebuffer(GL_READ_FRAMEBUFFER, ms_fbo);
+-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
++    BindFb(GL_READ_FRAMEBUFFER, ms_fbo);
++    BindFb(GL_DRAW_FRAMEBUFFER, fbo);
+     glBlitFramebuffer(0, 0, pw, ph, 0, 0, pw, ph, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    BindFb(GL_FRAMEBUFFER, 0);
+ #endif
+     stale = false;
+ }
+@@ -607,10 +646,10 @@ void RenderTarget::Written(int px0, int py0, int px1, int py1) const
+ #ifndef PC_GLES
+     /* (each sample gets the pixel's value) */
+     glDisable(GL_SCISSOR_TEST);
+-    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ms_fbo);
++    BindFb(GL_READ_FRAMEBUFFER, fbo);
++    BindFb(GL_DRAW_FRAMEBUFFER, ms_fbo);
+     glBlitFramebuffer(px0, py0, px1, py1, px0, py0, px1, py1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    BindFb(GL_FRAMEBUFFER, 0);
+ #else
+     (void)px0, (void)py0, (void)px1, (void)py1;
+ #endif
+@@ -778,6 +817,8 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+     {
+         const char *tc = getenv("THPS_GL_TEXCACHE");
+         m_cacheOn = !(tc && tc[0] == '0');
++        const char *dm = getenv("THPS_GL_DECODEMS");
++        m_decodeBudgetUs = (dm ? atoi(dm) : 25) * 1000LL;
+         const char *lv = getenv("THPS_GL_LAYERVBO");
+         m_layerVbo = !(lv && lv[0] == '0');
+         fprintf(stderr, "[gl] 3D layers' vertices: %s\n",
+@@ -818,7 +859,7 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+         m_lastSlot = -1;
+     }
+     m_locSlow = DrawLocs{m_drawUPass, m_drawUDpass, m_drawUProj, m_drawUTarget, m_drawUShift,
+-                         m_drawUUvfix, -1};
++                         m_drawUUvfix};
+     if (m_cacheOn && draw_fs == gl_draw_fs) {
+         static const char *const fast_fs[5] = { gl_draw_fast_fs, gl_draw_fast_fs1, gl_draw_fast_fs2,
+                                                 gl_draw_fast_fs3, gl_draw_fast_fs4 };
+@@ -829,7 +870,6 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+         if (var)
+             fprintf(stderr, "[gl] THPS_GL_FASTVAR=%d: fast program variant (a measurement)\n", var);
+         m_drawProgFast = Program(gl_draw_vs, fast_fs[var]);
+-        m_fastFs = fast_fs[var];
+         if (m_drawProgFast) {
+             glUseProgram(m_drawProgFast);
+             glUniform1i(glGetUniformLocation(m_drawProgFast, "u_vram"), 0);
+@@ -840,11 +880,10 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+                                  glGetUniformLocation(m_drawProgFast, "u_proj"),
+                                  glGetUniformLocation(m_drawProgFast, "u_target"),
+                                  glGetUniformLocation(m_drawProgFast, "u_shift"),
+-                                 glGetUniformLocation(m_drawProgFast, "u_uvfix"), -1};
++                                 glGetUniformLocation(m_drawProgFast, "u_uvfix")};
+             glUseProgram(m_drawProg);
+         }
+     }
+-    BatchPrograms(draw_fs, m_drawProgFast && draw_fs == gl_draw_fs ? m_fastFs : nullptr);
+     AtlasUniforms();
+     fprintf(stderr, "[gl] texture cache: %s%s\n",
+             m_cacheOn ? "on (128 pages of 256x256, THPS_GL_TEXCACHE=0 turns it off)" : "off",
+@@ -2308,7 +2347,7 @@ void GlGpu::LayerShadows(const GlShadow *s, int n)
+     glEnable(GL_BLEND);
+     glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+     glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+-    glViewport(0, 0, kShadowSize, kShadowSize);
++    SetViewport(0, 0, kShadowSize, kShadowSize);
+     glClearColor(0, 0, 0, 0);
+     float S[kShadows][4], T[kShadows][4], H[kShadows][4], P[kShadows][4];
+     for (int i = 0; i < n; i++) {
+@@ -2322,7 +2361,7 @@ void GlGpu::LayerShadows(const GlShadow *s, int n)
+                 *o++ = uv[order[k]][0];
+                 *o++ = uv[order[k]][1];
+             }
+-        glBindFramebuffer(GL_FRAMEBUFFER, m_shadowFbo[i]);
++        BindFb(GL_FRAMEBUFFER, m_shadowFbo[i]);
+         glClear(GL_COLOR_BUFFER_BIT);
+         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((o - vb) * sizeof(float)), vb, GL_STREAM_DRAW);
+         glDrawArrays(GL_TRIANGLES, 0, nq * 6);
+@@ -2334,7 +2373,7 @@ void GlGpu::LayerShadows(const GlShadow *s, int n)
+         P[i][2] = sh.strength;
+         P[i][3] = 0;
+     }
+-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    BindFb(GL_FRAMEBUFFER, 0);
+     glDisable(GL_BLEND);
+     glBindVertexArray(0);
+     ShadowUniforms(n);
+@@ -2436,7 +2475,7 @@ void GlGpu::LayerDraw(int first, int count, int cls, uint16_t hd, int depth, int
+     if (!m_projSet || memcmp(proj, m_proj, sizeof proj)) {
+         memcpy(m_proj, proj, sizeof proj);
+         m_projSet = 1;
+-        m_projApplied[0] = m_projApplied[1] = m_projApplied[2] = m_projApplied[3] = 0;
++        m_projApplied[0] = m_projApplied[1] = 0;
+     }
+     UseDraw(slow_tris == 0);
+     if (slow_tris == 0 && m_drawProgFast) {
+@@ -2511,7 +2550,6 @@ void GlGpu::LayerDraw(int first, int count, int cls, uint16_t hd, int depth, int
+ void GlGpu::LayerBatch(int first, int count, int cls, int why)
+ {
+ #ifndef PC_GLES
+-    /* desktop GL: the draws as before, one class at a time is not what this is for */
+     (void)first, (void)count, (void)cls, (void)why;
+ #else
+ #ifdef __vita__
+@@ -2544,10 +2582,10 @@ void GlGpu::LayerBatch(int first, int count, int cls, int why)
+     if (!m_projSet || memcmp(proj, m_proj, sizeof proj)) {
+         memcpy(m_proj, proj, sizeof proj);
+         m_projSet = 1;
+-        m_projApplied[0] = m_projApplied[1] = m_projApplied[2] = m_projApplied[3] = 0;
++        m_projApplied[0] = m_projApplied[1] = 0;
+     }
+-    UseDraw(slow_tris == 0, 1);
+-    if (slow_tris == 0 && m_drawProgBatchFast) {
++    UseDraw(slow_tris == 0);
++    if (slow_tris == 0 && m_drawProgFast) {
+         m_st.fast_batches++;
+         m_st.fast_tris += count / 3;
+     } else {
+@@ -2556,57 +2594,69 @@ void GlGpu::LayerBatch(int first, int count, int cls, int why)
+         m_st.uncached_tris += m_cacheOn ? slow_tris : 0;
+     }
+     BindStore();
+-    if (!buf)
+-        DrawAttribs(l.verts);
+-    else if (m_attrBuf != buf)
+-        DrawAttribsFrom(buf, nullptr);
+     glEnable(GL_DEPTH_TEST);
+     glDepthFunc(GL_LEQUAL);
+     Target *ts[MAX_SURFACES + 1];
+     int nt = LayerTargets(ts);
+-    for (int i = 0; i < nt; i++) {
+-        ts[i]->Use();
+-        if (!ts[i]->Scissor(l.clip[0], l.clip[1], l.clip[2], l.clip[3], l.wide))
+-            continue;
+-        DrawUniforms(ts[i]);
+-        int n = 0;
+-        if (cls & 1) {
+-            /* the opaque faces' true depth (texels the shader discards write none), then their
+-             * colour where it is within the tolerance of the nearest: a decal over its floor
+-             * passes, and the later of the two (the PS1's order) is the one left */
+-            SetBlend(0);
+-            Sel(1);
+-            DPass(1);
+-            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+-            glDepthMask(GL_TRUE);
+-            glDrawArrays(GL_TRIANGLES, first, count);
+-            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+-            glDepthMask(GL_FALSE);
+-            DPass(0);
+-            glDrawArrays(GL_TRIANGLES, first, count);
+-            n += 2;
+-        }
+-        glDepthMask(GL_FALSE);
+-        if (cls & 2) {
+-            /* semi-transparent faces after every opaque one, in their own order */
+-            SetBlend(0);
+-            Sel(2);
+-            glDrawArrays(GL_TRIANGLES, first, count);
+-            n++;
++    /* t22: no shader of our own (vitaGL's compiler took no change to the draw vertex shader,
++     * t20/t21): the classes are index lists into the layer's vertices, each window of up to
++     * 65532 vertices drawn from attributes that start at its first */
++    for (int w0 = first; w0 < first + count; w0 += kBatchWindow) {
++        int wn = first + count - w0 < kBatchWindow ? first + count - w0 : kBatchWindow;
++        for (int c = 0; c < 3; c++)
++            m_batchIdx[c].clear();
++        for (int t = 0; t < wn; t += 3) {
++            uint16_t info = l.verts[w0 + t].info;
++            int c = !(info & PC_GL_I_SEMI) ? 0 : ((info >> 5) & 3) == 2 ? 2 : 1;
++            if (!(cls & 1 << c))
++                c = 0;   /* (never: DrawUpto gave the classes present) */
++            m_batchIdx[c].push_back((uint16_t)t);
++            m_batchIdx[c].push_back((uint16_t)(t + 1));
++            m_batchIdx[c].push_back((uint16_t)(t + 2));
+         }
+-        if (cls & 4) {
+-            /* subtractive (B-F): after the other semi-transparent ones */
+-            Sel(3);
+-            SetBlend(1);
+-            glDrawArrays(GL_TRIANGLES, first, count);
+-            SetBlend(2);
+-            glDrawArrays(GL_TRIANGLES, first, count);
+-            n += 2;
++        DrawAttribsFrom(buf, buf ? nullptr : l.verts, w0);
++        for (int i = 0; i < nt; i++) {
++            ts[i]->Use();
++            if (!ts[i]->Scissor(l.clip[0], l.clip[1], l.clip[2], l.clip[3], l.wide))
++                continue;
++            DrawUniforms(ts[i]);
++            int n = 0;
++            const std::vector<uint16_t> &op = m_batchIdx[0], &se = m_batchIdx[1], &sb = m_batchIdx[2];
++            if (!op.empty()) {
++                /* the opaque faces' true depth (texels the shader discards write none), then
++                 * their colour where it is within the tolerance of the nearest: a decal over its
++                 * floor passes, and the later of the two (the PS1's order) is the one left */
++                SetBlend(0);
++                DPass(1);
++                glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
++                glDepthMask(GL_TRUE);
++                glDrawElements(GL_TRIANGLES, (GLsizei)op.size(), GL_UNSIGNED_SHORT, op.data());
++                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++                glDepthMask(GL_FALSE);
++                DPass(0);
++                glDrawElements(GL_TRIANGLES, (GLsizei)op.size(), GL_UNSIGNED_SHORT, op.data());
++                n += 2;
++            }
++            glDepthMask(GL_FALSE);
++            if (!se.empty()) {
++                /* semi-transparent faces after every opaque one, in their own order */
++                SetBlend(0);
++                glDrawElements(GL_TRIANGLES, (GLsizei)se.size(), GL_UNSIGNED_SHORT, se.data());
++                n++;
++            }
++            if (!sb.empty()) {
++                /* subtractive (B-F): after the other semi-transparent ones */
++                SetBlend(1);
++                glDrawElements(GL_TRIANGLES, (GLsizei)sb.size(), GL_UNSIGNED_SHORT, sb.data());
++                SetBlend(2);
++                glDrawElements(GL_TRIANGLES, (GLsizei)sb.size(), GL_UNSIGNED_SHORT, sb.data());
++                n += 2;
++            }
++            m_st.draws++;
++            m_st.gl_draws += n;
+         }
+-        Sel(0);
+-        m_st.draws++;
+-        m_st.gl_draws += n;
+     }
++    m_attrBuf = 0;   /* (the attributes start elsewhere now: bound again at the next draw) */
+     glDisable(GL_DEPTH_TEST);
+     glDepthMask(GL_TRUE);
+     glDisable(GL_SCISSOR_TEST);
+@@ -2671,11 +2721,11 @@ void GlGpu::ReadPixels(int x0, int y0, int x1, int y1, uint16_t *out)
+ #ifdef PC_GLES
+     if (nt == 1 && ts[0] == &m_base) {
+         /* only the base, which is at the PS1's resolution already: read it as it is */
+-        glBindFramebuffer(GL_FRAMEBUFFER, m_base.fbo);
++        BindFb(GL_FRAMEBUFFER, m_base.fbo);
+         nt = 0;
+     }
+ #else
+-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_rbFbo);
++    BindFb(GL_DRAW_FRAMEBUFFER, m_rbFbo);
+ #endif
+     for (int i = nt - 1; i >= 0; i--) {
+         const Target *t = ts[i];
+@@ -2691,15 +2741,15 @@ void GlGpu::ReadPixels(int x0, int y0, int x1, int y1, uint16_t *out)
+ #ifdef PC_GLES
+         BlitPixels(t, sx0, sy0, sx1, sy1, m_rbFbo, VRAM_W, VRAM_H, ax0, ay0, ax1, ay1);
+         if (i == 0)
+-            glBindFramebuffer(GL_FRAMEBUFFER, m_rbFbo);
++            BindFb(GL_FRAMEBUFFER, m_rbFbo);
+ #else
+-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_rbFbo);
+-        glBindFramebuffer(GL_READ_FRAMEBUFFER, t->fbo);
++        BindFb(GL_DRAW_FRAMEBUFFER, m_rbFbo);
++        BindFb(GL_READ_FRAMEBUFFER, t->fbo);
+         glBlitFramebuffer(sx0, sy0, sx1, sy1, ax0, ay0, ax1, ay1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+ #endif
+     }
+ #ifndef PC_GLES
+-    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_rbFbo);
++    BindFb(GL_READ_FRAMEBUFFER, m_rbFbo);
+ #endif
+     glPixelStorei(GL_PACK_ALIGNMENT, 4);
+ #ifdef __vita__
+@@ -2708,7 +2758,7 @@ void GlGpu::ReadPixels(int x0, int y0, int x1, int y1, uint16_t *out)
+         /* the screens' pixels, scaled down into m_rbTex: read where they are, as the base's
+          * above (vitaGL's glReadPixels takes the rows from the far end) */
+         glFinish();
+-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
++        BindFb(GL_FRAMEBUFFER, 0);
+         int w = x1 - x0 + 1;
+         for (int y = y0; y <= y1; y++) {
+             memcpy(buf, m_rbPtr + ((size_t)y * VRAM_W + x0) * 4, (size_t)w * 4);
+@@ -2729,7 +2779,7 @@ void GlGpu::ReadPixels(int x0, int y0, int x1, int y1, uint16_t *out)
+     glReadPixels(px, py, pw, ph, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+ #endif
+     m_st.readbacks++;
+-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    BindFb(GL_FRAMEBUFFER, 0);
+     int w = x1 - x0 + 1;
+     for (int y = y0; y <= y1; y++) {
+         const uint8_t *s = buf + ((size_t)(y - py) * pw + (x0 - px)) * 4;
+@@ -2872,7 +2922,7 @@ uint32_t *GlGpu::ReadArea(int x, int y, int w, int h, int *out_w, int *out_h)
+     t->Resolve();
+ #ifdef PC_GLES
+     /* (ES 2 reads RGBA only: to the BGRA the callers take) */
+-    glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
++    BindFb(GL_FRAMEBUFFER, t->fbo);
+     glPixelStorei(GL_PACK_ALIGNMENT, 4);
+ #ifdef __vita__
+     long long prof_t0 = PC_VitaProfNow();
+@@ -2889,16 +2939,16 @@ uint32_t *GlGpu::ReadArea(int x, int y, int w, int h, int *out_w, int *out_h)
+ #else
+     glReadPixels(px0, py0, sw, sh, GL_RGBA, GL_UNSIGNED_BYTE, out);
+ #endif
+-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    BindFb(GL_FRAMEBUFFER, 0);
+     for (int i = 0; i < sw * sh; i++) {
+         uint32_t p = out[i];
+         out[i] = 0xff000000u | (p & 0xff) << 16 | (p & 0xff00) | (p >> 16 & 0xff);
+     }
+ #else
+-    glBindFramebuffer(GL_READ_FRAMEBUFFER, t->fbo);
++    BindFb(GL_READ_FRAMEBUFFER, t->fbo);
+     glPixelStorei(GL_PACK_ALIGNMENT, 4);
+     glReadPixels(px0, py0, sw, sh, GL_BGRA, GL_UNSIGNED_BYTE, out);
+-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    BindFb(GL_FRAMEBUFFER, 0);
+     for (int i = 0; i < sw * sh; i++)
+         out[i] |= 0xff000000u;
+ #endif
+@@ -3097,8 +3147,8 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+ #endif
+     for (int i = 0; i < m_nsurf; i++)
+         m_surf[i].Resolve();
+-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+-    glViewport(0, 0, ww, wh);
++    BindFb(GL_FRAMEBUFFER, 0);
++    SetViewport(0, 0, ww, wh);
+     glDisable(GL_SCISSOR_TEST);
+     glDisable(GL_BLEND);
+     glClearColor(0, 0, 0, 1);
+@@ -3188,7 +3238,7 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+             v1 = (float)py1 / (float)t->ph;
+         }
+         /* 4:3, letterboxed; VRAM row 0 is the top of the picture */
+-        glViewport(pic[0], wh - pic[1] - pic[3], pic[2], pic[3]);
++        SetViewport(pic[0], wh - pic[1] - pic[3], pic[2], pic[3]);
+         float q[16] = { -1, 1, u0, v0, 1, 1, u1, v0, -1, -1, u0, v1, 1, -1, u1, v1 };
+         glUseProgram(m_presentProg);
+ #ifdef PC_GLES
+@@ -3204,6 +3254,7 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+ #ifdef __vita__
+     long long prof_t1 = PC_VitaProfNow();
+     SDL_GL_SwapWindow(win);
++    ForgetFb();
+     if (pc_vita_profile) {
+         long long t2 = PC_VitaProfNow();
+         PC_VitaProfAdd(PC_PROF_SWAP, t2 - prof_t1);
+@@ -3212,6 +3263,7 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+     }
+ #else
+     SDL_GL_SwapWindow(win);
++    ForgetFb();
+ #endif
+ #ifdef PC_GLES
+     m_frameNo++;
+@@ -3228,7 +3280,7 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                         "blits %d in place, %d copied by vitaGL; %d descriptors pointed back; "
+                         "GL draws %.0f a frame; 3D %.0f draws a frame (new draw for depth %d, "
+                         "class %d, texture %d, 2D between %d, layer end %d); 3D layers in a "
+-                        "buffer %d, 3D draws not %d, batched %d\n",
++                        "buffer %d, 3D draws not %d, batched %d; framebuffer binds %.0f a frame\n",
+                 m_st.draws, m_st.readbacks, m_st.tex_ups, m_st.blits, m_st.cache_hits,
+                 m_st.cache_misses, m_st.cache_inval, m_st.cache_full, m_st.cache_deferred,
+                 m_st.cache_stale, m_st.fast_batches, m_st.fast_tris, m_st.slow_batches,
+@@ -3238,7 +3290,8 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                 m_st.split[PC_GL_SPLIT_DEPTH], m_st.split[PC_GL_SPLIT_CLASS],
+                 m_st.split[PC_GL_SPLIT_TEXTURE], m_st.split[PC_GL_SPLIT_2D],
+                 m_st.split[PC_GL_SPLIT_END], m_st.layer_bufs, m_st.layer_client,
+-                m_st.layer_batches);
++                m_st.layer_batches, s_fbBinds / 60.0);
++        s_fbBinds = 0;
+         m_st = Stats{};
+         m_st.on = 1;
+     }
+@@ -3253,10 +3306,10 @@ void GlGpu::DrawAttribs(const GlVert *v)
+     DrawAttribsFrom(0, v);
+ }
+ 
+-void GlGpu::DrawAttribsFrom(GLuint buf, const GlVert *v)
++void GlGpu::DrawAttribsFrom(GLuint buf, const GlVert *v, int first)
+ {
+-    /* in a buffer, the attributes are offsets into it */
+-    uintptr_t b = buf ? 0 : (uintptr_t)v;
++    /* in a buffer, the attributes are offsets into it; first: the vertex they start at */
++    uintptr_t b = (buf ? 0 : (uintptr_t)v) + (uintptr_t)first * sizeof(GVert);
+     m_attrBuf = buf;
+     glBindBuffer(GL_ARRAY_BUFFER, buf);
+     for (GLuint i = 0; i < 6; i++)
+@@ -3290,18 +3343,11 @@ void GlGpu::QuadAttribs(const float *v, int stride_floats, int uv)
+ 
+ /* the draw program for a batch (fast: every textured triangle has a slot), its uniforms in
+  * m_drawU*, and the layer projection it hasn't had yet */
+-void GlGpu::UseDraw(int fast, int batch)
++void GlGpu::UseDraw(int fast)
+ {
+     int f = fast && m_drawProgFast ? 1 : 0;
+-    if (batch && m_drawProgBatch)
+-        f = fast && m_drawProgBatchFast ? 3 : 2;
+-    static const GLuint GlGpu::*const progs[4] = { &GlGpu::m_drawProg, &GlGpu::m_drawProgFast,
+-                                                   &GlGpu::m_drawProgBatch,
+-                                                   &GlGpu::m_drawProgBatchFast };
+-    const DrawLocs *locs[4] = { &m_locSlow, &m_locFast, &m_locBatch, &m_locBatchFast };
+-    glUseProgram(this->*progs[f]);
+-    const DrawLocs &l = *locs[f];
+-    m_drawUSel = l.sel;
++    glUseProgram(f ? m_drawProgFast : m_drawProg);
++    const DrawLocs &l = f ? m_locFast : m_locSlow;
+     m_drawUPass = l.pass;
+     m_drawUDpass = l.dpass;
+     m_drawUProj = l.proj;
+@@ -3343,14 +3389,26 @@ int GlGpu::CacheSlotFor(uint64_t key)
+     if (m_decodeFrame != m_frameNo) {
+         m_decodeFrame = m_frameNo;
+         m_decodesLeft = kDecodesPerFrame;
++        m_decodeUs = 0;
+     }
+-    if (m_decodesLeft <= 0) {
++    /* t22: past the first 8, more while the frame's decoding took under THPS_GL_DECODEMS (default
++     * 25): a triangle without a slot takes the per-pixel lookup, which at 960x544 cost loading
++     * screens and menus 300-500 ms a frame (t21) */
++    if (m_decodesLeft <= 0 && m_decodeUs >= m_decodeBudgetUs) {
+         m_st.cache_deferred++;
+         return -1;
+     }
+     m_decodesLeft--;
++#ifdef __vita__
++    long long dt0 = sceKernelGetProcessTimeWide();
++#endif
+     SlotFill(m_slot[victim], key);
+     CacheDecode(victim);
++#ifdef __vita__
++    m_decodeUs += sceKernelGetProcessTimeWide() - dt0;
++#else
++    m_decodeUs += 2500;
++#endif
+     m_st.cache_misses++;
+     return m_lastSlot = victim;
+ }
+@@ -3370,76 +3428,9 @@ void GlGpu::SlotFill(CacheSlot &c, uint64_t key)
+     c.cw = depth == 0 ? 16 : depth == 1 ? 256 : 0;
+ }
+ 
+-/* t21: the batch programs. Their vertex shader is the draw program's (t17's, which vitaGL's
+- * compiler takes) with a uniform u_sel and, at the end of main, a block in the plainest GLSL that
+- * moves the triangles of the other classes outside the clip volume. Compiled after every other
+- * program (t20's single changed shader failed on the Vita, with no log, and every compile after it
+- * failed too): if they fail, LayerBatch is off and the rest is as in t17. */
+-void GlGpu::BatchPrograms(const char *draw_fs, const char *fast_fs)
+-{
+-    static const char decl[] = "uniform float u_dpass;\n";
+-    static const char tail[] = "    v_uvr = a_uvr;\n}\n";
+-    static const char sel[] =
+-        "    v_uvr = a_uvr;\n"
+-        "    if (u_sel > 0.5) {\n"
+-        "        float fsemi = bits(info, 11.0, 1.0);\n"
+-        "        float fabr = bits(info, 5.0, 2.0);\n"
+-        "        float fcls = 1.0;\n"
+-        "        if (fsemi > 0.5) {\n"
+-        "            fcls = 2.0;\n"
+-        "            if (fabr > 1.5) {\n"
+-        "                if (fabr < 2.5) {\n"
+-        "                    fcls = 3.0;\n"
+-        "                }\n"
+-        "            }\n"
+-        "        }\n"
+-        "        if (abs(fcls - u_sel) > 0.5) {\n"
+-        "            gl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n"
+-        "        }\n"
+-        "    }\n"
+-        "}\n";
+-    const char *bt = getenv("THPS_R3D_BATCH");
+-    if (bt && atoi(bt) == 0)
+-        return;   /* (not even compiled) */
+-    std::string vs = gl_draw_vs;
+-    size_t d = vs.find(decl), t = vs.rfind(tail);
+-    if (d == std::string::npos || t == std::string::npos || t + sizeof tail - 1 != vs.size()) {
+-        fprintf(stderr, "[gl] batch shader: the draw shader has changed, batching off\n");
+-        return;
+-    }
+-    vs.replace(t, sizeof tail - 1, sel);
+-    vs.insert(d + sizeof decl - 1, "uniform float u_sel;\n");
+-    m_batchVs = vs;
+-    auto locs = [](GLuint p) {
+-        return DrawLocs{glGetUniformLocation(p, "u_pass"), glGetUniformLocation(p, "u_dpass"),
+-                        glGetUniformLocation(p, "u_proj"), glGetUniformLocation(p, "u_target"),
+-                        glGetUniformLocation(p, "u_shift"), glGetUniformLocation(p, "u_uvfix"),
+-                        glGetUniformLocation(p, "u_sel")};
+-    };
+-    m_drawProgBatch = Program(m_batchVs.c_str(), draw_fs);
+-    if (m_drawProgBatch && fast_fs)
+-        m_drawProgBatchFast = Program(m_batchVs.c_str(), fast_fs);
+-    GLuint progs[2] = { m_drawProgBatch, m_drawProgBatchFast };
+-    for (int i = 0; i < 2; i++) {
+-        GLuint p = progs[i];
+-        if (!p)
+-            continue;
+-        glUseProgram(p);
+-        glUniform1i(glGetUniformLocation(p, "u_vram"), 0);
+-        glUniform1i(glGetUniformLocation(p, "u_hd"), 1);
+-        glUniform1i(glGetUniformLocation(p, "u_atlas"), kAtlasUnit);
+-        (i ? m_locBatchFast : m_locBatch) = locs(p);
+-        glUniform1f((i ? m_locBatchFast : m_locBatch).sel, 0.0f);
+-    }
+-    glUseProgram(m_drawProg);
+-    fprintf(stderr, "[gl] batch shader: %s%s\n",
+-            m_drawProgBatch ? "ok" : "REJECTED by the compiler, batching off (t17's draws)",
+-            m_drawProgBatch && fast_fs && !m_drawProgBatchFast ? " (no fast variant)" : "");
+-}
+-
+ void GlGpu::AtlasUniforms()
+ {
+-    GLuint progs[4] = { m_drawProg, m_drawProgFast, m_drawProgBatch, m_drawProgBatchFast };
++    GLuint progs[2] = { m_drawProg, m_drawProgFast };
+     for (GLuint p : progs) {
+         if (!p)
+             continue;
+@@ -3627,8 +3618,8 @@ void GlGpu::BlitPixels(const Target *from, int fx0, int fy0, int fx1, int fy1, G
+     float x0 = 2.0f * tx0 / to_w - 1, x1 = 2.0f * tx1 / to_w - 1;
+     float y0 = 2.0f * ty0 / to_h - 1, y1 = 2.0f * ty1 / to_h - 1;
+     float q[16] = { x0, y0, u0, v0, x1, y0, u1, v0, x0, y1, u0, v1, x1, y1, u1, v1 };
+-    glBindFramebuffer(GL_FRAMEBUFFER, to_fbo);
+-    glViewport(0, 0, to_w, to_h);
++    BindFb(GL_FRAMEBUFFER, to_fbo);
++    SetViewport(0, 0, to_w, to_h);
+     glDisable(GL_SCISSOR_TEST);
+     glDisable(GL_BLEND);
+     glDisable(GL_DEPTH_TEST);
+-- 
+2.53.0
+

@@ -1,0 +1,205 @@
+From c1683db8ad7cc2e9b5ac07c7d76c6b8b83a560f3 Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Sat, 24 Oct 2026 17:03:33 +0300
+Subject: [PATCH] Vita: a stall sampler (instrumented game functions, a thread
+ on core 1) for the profile switch
+
+---
+ platform/pc/include/pc/platform.h |   2 +
+ platform/pc/src/pc_vita.cpp       | 120 +++++++++++++++++++++++++++++-
+ platform/pc/tools/build.py        |   4 +
+ 3 files changed, 125 insertions(+), 1 deletion(-)
+
+diff --git a/platform/pc/include/pc/platform.h b/platform/pc/include/pc/platform.h
+index 9422b98..9aa9730 100644
+--- a/platform/pc/include/pc/platform.h
++++ b/platform/pc/include/pc/platform.h
+@@ -43,6 +43,8 @@ void PC_VitaProfFrame(void);
+ void PC_VitaProfCaller(void *ret, int n);
+ /* one mix on the mixer thread (the device callback or the pacer) */
+ void PC_VitaProfMix(long long us);
++/* the stall sampler's thread (src/pc_vita.cpp), started with the profile */
++void PC_VitaStartSampler(void);
+ #ifdef __cplusplus
+ /* times the rest of the enclosing block into a slot */
+ struct PC_VitaProfScope {
+diff --git a/platform/pc/src/pc_vita.cpp b/platform/pc/src/pc_vita.cpp
+index 211dd19..5fbf857 100644
+--- a/platform/pc/src/pc_vita.cpp
++++ b/platform/pc/src/pc_vita.cpp
+@@ -12,6 +12,7 @@
+ #include <psp2/kernel/clib.h>
+ #include <psp2/kernel/processmgr.h>
+ #include <psp2/power.h>
++#include <psp2/kernel/threadmgr.h>
+ #include <malloc.h>
+ #include <vitaGL.h>
+ 
+@@ -87,9 +88,11 @@ void PC_VitaLogOpen(void) {
+             scePowerGetGpuXbarClockFrequency());
+     SceIoStat st;
+     pc_vita_profile = sceIoGetstat(PC_VITA_DIR "/profile", &st) >= 0;
+-    if (pc_vita_profile)
++    if (pc_vita_profile) {
+         fprintf(stderr, "profile: on (one line a second); PC_VitaLogOpen at %p\n",
+                 (void *)&PC_VitaLogOpen);
++        PC_VitaStartSampler();
++    }
+ }
+ 
+ /* ---- the profile switch -------------------------------------------------------------------- */
+@@ -115,6 +118,94 @@ volatile long long g_mixSum, g_mixMax;
+ volatile int g_mixCount;
+ } // namespace
+ 
++/* ---- the stall sampler ------------------------------------------------------------------------
++ * The game's code is built with -finstrument-functions (tools/build.py): every game function's
++ * entry and exit push and pop its address here. Only the game thread runs game code. A thread on
++ * core 1 looks every millisecond; while a frame has run over 200 ms it counts the innermost three
++ * functions, which the stall lines print (thps.elf turns them into names, with PC_VitaLogOpen's
++ * address for the offset). */
++namespace {
++constexpr int kShadow = 64, kHist = 24;
++void *volatile g_shadow[kShadow];
++volatile int g_depth;
++
++struct Hist {
++    void *fn[kHist];
++    int n[kHist];
++};
++/* [0..2]: leaf, caller, caller's caller; per stalled frame and per episode */
++Hist g_frameHist[3], g_episodeHist[3];
++volatile int g_frameSamples, g_episodeSamples, g_episodeFrames;
++
++void HistAdd(Hist &h, void *fn) {
++    int i;
++    for (i = 0; i < kHist && h.fn[i]; i++)
++        if (h.fn[i] == fn) {
++            h.n[i]++;
++            return;
++        }
++    if (i < kHist) {
++        h.fn[i] = fn;
++        h.n[i] = 1;
++    }
++}
++
++/* the five most sampled entries as " addr:count ..." */
++void HistTop(const Hist &h, char *out, int size) {
++    int used[kHist] = {0}, k = 0;
++    out[0] = 0;
++    for (int r = 0; r < 5; r++) {
++        int best = -1;
++        for (int i = 0; i < kHist && h.fn[i]; i++)
++            if (!used[i] && (best < 0 || h.n[i] > h.n[best]))
++                best = i;
++        if (best < 0 || k > size - 24)
++            break;
++        used[best] = 1;
++        k += snprintf(out + k, size - k, " %p:%d", h.fn[best], h.n[best]);
++    }
++}
++
++int SamplerThread(SceSize, void *) {
++    for (;;) {
++        sceKernelDelayThread(1000);
++        long long start = g_profFrameStart;
++        if (!start || (long long)sceKernelGetProcessTimeWide() - start < 200000)
++            continue;
++        int d = g_depth;
++        if (d > kShadow)
++            d = kShadow;
++        for (int lvl = 0; lvl < 3 && d - 1 - lvl >= 0; lvl++) {
++            void *fn = g_shadow[d - 1 - lvl];
++            HistAdd(g_frameHist[lvl], fn);
++            HistAdd(g_episodeHist[lvl], fn);
++        }
++        g_frameSamples++;
++        g_episodeSamples++;
++    }
++    return 0;
++}
++} // namespace
++
++extern "C" {
++void __cyg_profile_func_enter(void *fn, void *site) __attribute__((no_instrument_function));
++void __cyg_profile_func_exit(void *fn, void *site) __attribute__((no_instrument_function));
++
++void __cyg_profile_func_enter(void *fn, void *site) {
++    (void)site;
++    int d = g_depth;
++    if (d >= 0 && d < kShadow)
++        g_shadow[d] = fn;
++    g_depth = d + 1;
++}
++
++void __cyg_profile_func_exit(void *fn, void *site) {
++    (void)fn;
++    (void)site;
++    g_depth = g_depth - 1;
++}
++}
++
+ void PC_VitaProfCaller(void *ret, int n) {
+     if (!pc_vita_profile)
+         return;
+@@ -128,6 +219,15 @@ void PC_VitaProfCaller(void *ret, int n) {
+         g_callers[g_ncallers++] = Caller{ret, 1, n};
+ }
+ 
++void PC_VitaStartSampler(void) {
++    SceUID th = sceKernelCreateThread("thps-sampler", SamplerThread, 0x10000100 - 10, 0x4000, 0,
++                                      SCE_KERNEL_CPU_MASK_USER_1, NULL);
++    if (th >= 0)
++        sceKernelStartThread(th, 0, NULL);
++    else
++        fprintf(stderr, "profile: no sampler thread (0x%x)\n", (unsigned)th);
++}
++
+ void PC_VitaProfMix(long long us) {
+     if (!pc_vita_profile)
+         return;
+@@ -178,7 +278,25 @@ void PC_VitaProfFrame(void) {
+                 f[PC_PROF_VBLANK] / 1000.0, f[PC_PROF_STREAM] / 1000.0, f[PC_PROF_SLEEP] / 1000.0,
+                 g_mixMax / 1000.0, g_ncallers ? who : " (none)",
+                 (unsigned)(vglMemFree(VGL_MEM_RAM) >> 10), (unsigned)(mallinfo().fordblks >> 10));
++        char top[3][160];
++        for (int lvl = 0; lvl < 3; lvl++)
++            HistTop(g_frameHist[lvl], top[lvl], sizeof top[lvl]);
++        fprintf(stderr, "[stall-fn] frame %d: %d samples; leaf%s; caller%s; caller2%s\n", g_profFrameNo,
++                (int)g_frameSamples, top[0], top[1], top[2]);
++        g_episodeFrames++;
++    } else if (g_episodeFrames && g_episodeSamples) {
++        /* the first quick frame after stalled ones: the episode's summary */
++        char top[3][160];
++        for (int lvl = 0; lvl < 3; lvl++)
++            HistTop(g_episodeHist[lvl], top[lvl], sizeof top[lvl]);
++        fprintf(stderr, "[stall-top] %d stalled frames, %d samples; leaf%s; caller%s; caller2%s\n",
++                (int)g_episodeFrames, (int)g_episodeSamples, top[0], top[1], top[2]);
++        memset(g_episodeHist, 0, sizeof g_episodeHist);
++        g_episodeSamples = 0;
++        g_episodeFrames = 0;
+     }
++    memset(g_frameHist, 0, sizeof g_frameHist);
++    g_frameSamples = 0;
+     memset(g_profFrameUs, 0, sizeof g_profFrameUs);
+     g_ncallers = 0;
+     g_profFrameStart = now;
+diff --git a/platform/pc/tools/build.py b/platform/pc/tools/build.py
+index 78f48a1..852a058 100644
+--- a/platform/pc/tools/build.py
++++ b/platform/pc/tools/build.py
+@@ -80,6 +80,10 @@ if not WINDOWS:
+     # (the runtime is built the same way)
+     COMMON_FLAGS += ["-fno-pic", "-fno-pie"] + (["-freg-struct-return"] if I386 else [])
+ COMMON_FLAGS += VITA_FLAGS + VITA_GAME_FLAGS
++if VITA:
++    # the profile switch's stall sampler: each game function's entry and exit keep a shadow call
++    # stack (src/pc_vita.cpp) that a thread on another core reads during long frames
++    COMMON_FLAGS += ["-finstrument-functions", "-finstrument-functions-exclude-file-list=/include/"]
+ C_FLAGS = ["-std=gnu89", "-fpermissive", "-fcommon"]
+ # -fno-lifetime-dse: egcs destructors re-store their class's vptr (portsrc adds the store); g++ would
+ # drop stores into an object whose lifetime is ending, and those vptrs are read by the base dtors
+-- 
+2.53.0
+

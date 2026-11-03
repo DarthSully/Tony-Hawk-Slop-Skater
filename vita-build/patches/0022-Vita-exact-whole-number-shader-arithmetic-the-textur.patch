@@ -1,0 +1,762 @@
+From 2a5a6f83f92e7cef3bea61112f66179f644c4f73 Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Tue, 27 Oct 2026 15:53:01 +0300
+Subject: [PATCH] Vita: exact whole-number shader arithmetic (the texture
+ cache's 6-texel shift), native 3D draws split only where faces overlap,
+ programs kept on the card
+
+The texture cache's shift, found by t14's self-test. Slots in the atlas's first column read
+nothing, and every other slot read 6 texels to the left, in both atlas shapes. That is not a
+memory or address effect: the vertex shader's slot number came out a hair under the whole number.
+bits() was mod(floor(v / exp2(lo)), exp2(n)), and the Vita GPU's exp2(7.0) is a hair over 128, so
+slot 127 decoded as 126.98. Its atlas column (mod 16, times 256) then came out 6 texels short, slot
+0 wrapped to 127.98 (another place), and bit 15 of 0x8000 read 0 (slot 0 not cached at all).
+bits(), the slot's column and row, and every mod and division of whole numbers in the draw and
+copy shaders (pmod, the texture window, VRAM wrap, 4/8-bit texel and colour decoding) now round
+at each step. The emulated lookup had the same exposure wherever a field's lower bits were all 0
+(a page at x 0, a CLUT at x 0).
+
+Native 3D layers (THPS_RENDER3D unset: native, the default; psx stays a fallback). A layer's faces
+went to the GPU in a new draw whenever an opaque face already in the draw could be in front of
+the next face anywhere on screen: 300-600 draws a frame in a level, each costly in vitaGL. That
+test is now per 16x16 cell of a screen grid over the faces' projected bounds, so a draw only
+splits where faces overlap. The layer's last draw skips its depth-only pass, since nothing after
+it in the layer tests depth. The texture store's per-draw scan is skipped when no cell changed.
+The [gl] line gives GL draws a frame, 3D draws a frame, and why 3D draws split (depth, class,
+texture, 2D between, layer end).
+
+Start: vitaGL compiles GLSL at every start (shaders ready ~15 s in). A linked program is saved
+with glGetProgramBinary to PC_VITA_DIR/shaders/<hash of its sources and the build>.bin and loaded
+with glProgramBinary next time. It is used only if every uniform and attribute its sources name
+comes out where the compiled program had it, else it is compiled again. THPS_GL_SHADERCACHE=0
+always compiles. If the self-test's store row isn't exact, the loaded programs are removed. A
+[boot] line gives the time since the start, the programs' time (from the card / compiled) and
+the self-test's time.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ platform/pc/include/pc/gl_gpu.h          |   8 +-
+ platform/pc/include/pc/gl_shaders_gles.h |  85 ++++++-----
+ platform/pc/include/pc/render3d.h        |   9 +-
+ platform/pc/include/pc/texture_store.h   |   8 +
+ platform/pc/src/pc_gpu_gl.cpp            | 183 ++++++++++++++++++++++-
+ platform/pc/src/pc_render3d.cpp          |  82 ++++++++--
+ platform/pc/src/pc_texstore.cpp          |   1 +
+ 7 files changed, 319 insertions(+), 57 deletions(-)
+
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index b4cda5f..49f2f2c 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -73,6 +73,10 @@ struct GlVert {
+     uint8_t uvr[4];
+ };
+ 
++/* why a native 3D layer's faces start a new draw (GlGpu::LayerDraw, the [gl] line) */
++enum { PC_GL_SPLIT_END, PC_GL_SPLIT_2D, PC_GL_SPLIT_CLASS, PC_GL_SPLIT_TEXTURE, PC_GL_SPLIT_DEPTH,
++       PC_GL_SPLITS };
++
+ #define PC_GL_I_TEXTURED 0x0200
+ #define PC_GL_I_SEMI     0x0800
+ #define PC_GL_I_DEPTH    0x2000   /* emulated primitive with a view depth in z (set internally) */
+@@ -176,7 +180,8 @@ class GlGpu {
+     void LayerShadows(const GlShadow *s, int n);
+     void LayerBegin(const GlLayerParams *lp, const GlVert *v, int nv);
+     void LayerArea(int ofs_x, int ofs_y, const int clip[4], int wide);
+-    void LayerDraw(int first, int count, int cls, uint16_t hd);
++    /* depth 0: nothing after it in the layer tests depth (no depth pass); why: PC_GL_SPLIT_* */
++    void LayerDraw(int first, int count, int cls, uint16_t hd, int depth = 1, int why = 0);
+     void LayerEnd();
+     void HdForget(uint16_t h);
+     void TexturesChanging(int x, int y, int w, int h);
+@@ -225,6 +230,7 @@ class GlGpu {
+         int fast_batches, slow_batches, fast_tris, slow_tris, uncached_tris;
+         int store_cells, store_switches, store_copies, blit_pool, blit_copies;
+         int cache_stale, own_fixed;
++        int gl_draws, layer_draws, split[PC_GL_SPLITS];
+     };
+ 
+     /* targets */
+diff --git a/platform/pc/include/pc/gl_shaders_gles.h b/platform/pc/include/pc/gl_shaders_gles.h
+index 9bf9cd6..6d5e82a 100644
+--- a/platform/pc/include/pc/gl_shaders_gles.h
++++ b/platform/pc/include/pc/gl_shaders_gles.h
+@@ -49,7 +49,13 @@ static const char *gl_draw_vs =
+     "uniform vec4 u_target;\n"    /* the VRAM area drawn on: x, y, w, h */
+     "uniform float u_atlasCols;\n"    /* the texture cache's atlas: slots a row (16 or 8) */
+     /* n bits of v from bit lo (v a whole number below 2^24) */
+-    "float bits(float v, float lo, float n) { return mod(floor(v / exp2(lo)), exp2(n)); }\n"
++    /* (the Vita GPU's exp2 is a hair off a power of two, exp2(7.0) just over 128, and its
++     * divisions round: each step rounds to a whole number. Without it a cached slot 127 came out
++     * 126.98, its texels drawn 6 to the left, and slot 0 wasn't cached at all: t12-t14) */
++    "float bits(float v, float lo, float n) {\n"
++    "    float p = floor(exp2(lo) + 0.5), m = floor(exp2(n) + 0.5), q = floor((v + 0.5) / p);\n"
++    "    return q - m * floor((q + 0.5) / m);\n"
++    "}\n"
+     /* clip z for view depth w: a projective depth from the near plane to PC_GLES_FAR, its view
+      * z measured (1 - e) nearer. Linear in w, so clipping and interpolation are exact (e as well:
+      * z (A - C / (z (1 - e))) = A z - C / (1 - e)) */
+@@ -87,8 +93,8 @@ static const char *gl_draw_vs =
+      * origin instead of the CLUT */
+     "    float cached = bits(a_tex.x, 15.0, 1.0), slot = bits(a_tex.x, 0.0, 7.0);\n"
+     "    v_page = vec4(bits(info, 0.0, 4.0) * 64.0, bits(info, 4.0, 1.0) * 256.0,\n"
+-    "                  cached > 0.5 ? mod(slot, u_atlasCols) * 256.0 : bits(a_tex.x, 0.0, 6.0) * 16.0,\n"
+-    "                  cached > 0.5 ? floor(slot / u_atlasCols) * 256.0 : bits(a_tex.x, 6.0, 9.0));\n"
++    "                  cached > 0.5 ? (slot - u_atlasCols * floor((slot + 0.5) / u_atlasCols)) * 256.0 : bits(a_tex.x, 0.0, 6.0) * 16.0,\n"
++    "                  cached > 0.5 ? floor((slot + 0.5) / u_atlasCols) * 256.0 : bits(a_tex.x, 6.0, 9.0));\n"
+     "    v_mode = vec4(bits(info, 7.0, 2.0), bits(info, 5.0, 2.0), bits(info, 9.0, 1.0),\n"
+     "                  bits(info, 10.0, 1.0));\n"
+     "    v_flags = vec4(bits(info, 11.0, 1.0), view ? 1.0 : 0.0, cached, 0.0);\n"
+@@ -137,19 +143,20 @@ static const char *gl_draw_fs =
+     "uniform vec2 u_atlasFix;\n"      /* texels added to an atlas position (the boot self-test) */
+     "uniform float u_pass;\n"
+     /* the texture store's 16-bit texel at x, y (wrapping as VRAM does): its low and high bytes */
++    /* x mod y of whole numbers, rounding (the GPU's divisions are not exact) */
++    "float pmod(float x, float y) { return x - y * floor((x + 0.5) / y); }\n"
+     "vec2 vram(float x, float y) {\n"
+-    "    vec4 tx = texture2D(u_vram, (vec2(mod(x, 1024.0), mod(y, 512.0)) + 0.5) /\n"
++    "    vec4 tx = texture2D(u_vram, (vec2(pmod(x, 1024.0), pmod(y, 512.0)) + 0.5) /\n"
+     "                               vec2(1024.0, 512.0));\n"
+     "    return floor(vec2(tx.r, tx.a) * 255.0 + 0.5);\n"
+     "}\n"
+     /* (u & a) | o of 8-bit whole numbers: the texture window */
+-    "float pmod(float x, float y) { return x - y * floor(x / y); }\n"
+     "float window(float u, float a, float o) {\n"
+     "    if (a > 254.5 && o < 0.5) return u;\n"
+     "    float r = 0.0, p = 1.0;\n"
+     "    for (int i = 0; i < 8; i++) {\n"
+-    "        float ub = mod(floor(u / p), 2.0), ab = mod(floor(a / p), 2.0),\n"
+-    "              ob = mod(floor(o / p), 2.0);\n"
++    "        float ub = pmod(floor((u + 0.5) / p), 2.0), ab = pmod(floor((a + 0.5) / p), 2.0),\n"
++    "              ob = pmod(floor((o + 0.5) / p), 2.0);\n"
+     "        r += p * max(ub * ab, ob);\n"
+     "        p *= 2.0;\n"
+     "    }\n"
+@@ -187,19 +194,19 @@ static const char *gl_draw_fs =
+     "        float v = window(pmod(floor(uv.y), 256.0), tw.y, tw.w);\n"
+     "        vec2 tx;\n"
+     "        if (depth < 0.5) {\n"
+-    "            vec2 w = vram(page.x + floor(u / 4.0), page.y + v);\n"
+-    "            float q = mod(u, 4.0), b = q < 1.5 ? w.x : w.y;\n"
+-    "            float i = mod(q, 2.0) < 0.5 ? mod(b, 16.0) : floor(b / 16.0);\n"
++    "            vec2 w = vram(page.x + floor((u + 0.5) / 4.0), page.y + v);\n"
++    "            float q = pmod(u, 4.0), b = q < 1.5 ? w.x : w.y;\n"
++    "            float i = pmod(q, 2.0) < 0.5 ? pmod(b, 16.0) : floor((b + 0.5) / 16.0);\n"
+     "            tx = vram(page.z + i, page.w);\n"
+     "        } else if (depth < 1.5) {\n"
+-    "            vec2 w = vram(page.x + floor(u / 2.0), page.y + v);\n"
+-    "            tx = vram(page.z + (mod(u, 2.0) < 0.5 ? w.x : w.y), page.w);\n"
++    "            vec2 w = vram(page.x + floor((u + 0.5) / 2.0), page.y + v);\n"
++    "            tx = vram(page.z + (pmod(u, 2.0) < 0.5 ? w.x : w.y), page.w);\n"
+     "        } else {\n"
+     "            tx = vram(page.x + u, page.y + v);\n"
+     "        }\n"
+     "        if (tx.x + tx.y < 0.5) discard;\n"
+-    "        vec3 tc = vec3(mod(tx.x, 32.0), floor(tx.x / 32.0) + mod(tx.y, 4.0) * 8.0,\n"
+-    "                       mod(floor(tx.y / 4.0), 32.0)) / 31.0;\n"
++    "        vec3 tc = vec3(pmod(tx.x, 32.0), floor((tx.x + 0.5) / 32.0) + pmod(tx.y, 4.0) * 8.0,\n"
++    "                       pmod(floor((tx.y + 0.5) / 4.0), 32.0)) / 31.0;\n"
+     "        c = mode.w > 0.5 ? tc : min(tc * v_color * (255.0 / 128.0), vec3(1.0));\n"
+     "        blend = semi && tx.y > 127.5;\n"
+     "    }\n"
+@@ -236,19 +243,20 @@ static const char *gl_draw_fast_fs =
+     "uniform vec2 u_atlasFix;\n"      /* texels added to an atlas position (the boot self-test) */
+     "uniform float u_pass;\n"
+     /* the texture store's 16-bit texel at x, y (wrapping as VRAM does): its low and high bytes */
++    /* x mod y of whole numbers, rounding (the GPU's divisions are not exact) */
++    "float pmod(float x, float y) { return x - y * floor((x + 0.5) / y); }\n"
+     "vec2 vram(float x, float y) {\n"
+-    "    vec4 tx = texture2D(u_vram, (vec2(mod(x, 1024.0), mod(y, 512.0)) + 0.5) /\n"
++    "    vec4 tx = texture2D(u_vram, (vec2(pmod(x, 1024.0), pmod(y, 512.0)) + 0.5) /\n"
+     "                               vec2(1024.0, 512.0));\n"
+     "    return floor(vec2(tx.r, tx.a) * 255.0 + 0.5);\n"
+     "}\n"
+     /* (u & a) | o of 8-bit whole numbers: the texture window */
+-    "float pmod(float x, float y) { return x - y * floor(x / y); }\n"
+     "float window(float u, float a, float o) {\n"
+     "    if (a > 254.5 && o < 0.5) return u;\n"
+     "    float r = 0.0, p = 1.0;\n"
+     "    for (int i = 0; i < 8; i++) {\n"
+-    "        float ub = mod(floor(u / p), 2.0), ab = mod(floor(a / p), 2.0),\n"
+-    "              ob = mod(floor(o / p), 2.0);\n"
++    "        float ub = pmod(floor((u + 0.5) / p), 2.0), ab = pmod(floor((a + 0.5) / p), 2.0),\n"
++    "              ob = pmod(floor((o + 0.5) / p), 2.0);\n"
+     "        r += p * max(ub * ab, ob);\n"
+     "        p *= 2.0;\n"
+     "    }\n"
+@@ -314,19 +322,20 @@ static const char *gl_draw_fast_fs1 =
+     "uniform vec2 u_atlasFix;\n"      /* texels added to an atlas position (the boot self-test) */
+     "uniform float u_pass;\n"
+     /* the texture store's 16-bit texel at x, y (wrapping as VRAM does): its low and high bytes */
++    /* x mod y of whole numbers, rounding (the GPU's divisions are not exact) */
++    "float pmod(float x, float y) { return x - y * floor((x + 0.5) / y); }\n"
+     "vec2 vram(float x, float y) {\n"
+-    "    vec4 tx = texture2D(u_vram, (vec2(mod(x, 1024.0), mod(y, 512.0)) + 0.5) /\n"
++    "    vec4 tx = texture2D(u_vram, (vec2(pmod(x, 1024.0), pmod(y, 512.0)) + 0.5) /\n"
+     "                               vec2(1024.0, 512.0));\n"
+     "    return floor(vec2(tx.r, tx.a) * 255.0 + 0.5);\n"
+     "}\n"
+     /* (u & a) | o of 8-bit whole numbers: the texture window */
+-    "float pmod(float x, float y) { return x - y * floor(x / y); }\n"
+     "float window(float u, float a, float o) {\n"
+     "    if (a > 254.5 && o < 0.5) return u;\n"
+     "    float r = 0.0, p = 1.0;\n"
+     "    for (int i = 0; i < 8; i++) {\n"
+-    "        float ub = mod(floor(u / p), 2.0), ab = mod(floor(a / p), 2.0),\n"
+-    "              ob = mod(floor(o / p), 2.0);\n"
++    "        float ub = pmod(floor((u + 0.5) / p), 2.0), ab = pmod(floor((a + 0.5) / p), 2.0),\n"
++    "              ob = pmod(floor((o + 0.5) / p), 2.0);\n"
+     "        r += p * max(ub * ab, ob);\n"
+     "        p *= 2.0;\n"
+     "    }\n"
+@@ -390,19 +399,20 @@ static const char *gl_draw_fast_fs2 =
+     "uniform vec2 u_atlasFix;\n"      /* texels added to an atlas position (the boot self-test) */
+     "uniform float u_pass;\n"
+     /* the texture store's 16-bit texel at x, y (wrapping as VRAM does): its low and high bytes */
++    /* x mod y of whole numbers, rounding (the GPU's divisions are not exact) */
++    "float pmod(float x, float y) { return x - y * floor((x + 0.5) / y); }\n"
+     "vec2 vram(float x, float y) {\n"
+-    "    vec4 tx = texture2D(u_vram, (vec2(mod(x, 1024.0), mod(y, 512.0)) + 0.5) /\n"
++    "    vec4 tx = texture2D(u_vram, (vec2(pmod(x, 1024.0), pmod(y, 512.0)) + 0.5) /\n"
+     "                               vec2(1024.0, 512.0));\n"
+     "    return floor(vec2(tx.r, tx.a) * 255.0 + 0.5);\n"
+     "}\n"
+     /* (u & a) | o of 8-bit whole numbers: the texture window */
+-    "float pmod(float x, float y) { return x - y * floor(x / y); }\n"
+     "float window(float u, float a, float o) {\n"
+     "    if (a > 254.5 && o < 0.5) return u;\n"
+     "    float r = 0.0, p = 1.0;\n"
+     "    for (int i = 0; i < 8; i++) {\n"
+-    "        float ub = mod(floor(u / p), 2.0), ab = mod(floor(a / p), 2.0),\n"
+-    "              ob = mod(floor(o / p), 2.0);\n"
++    "        float ub = pmod(floor((u + 0.5) / p), 2.0), ab = pmod(floor((a + 0.5) / p), 2.0),\n"
++    "              ob = pmod(floor((o + 0.5) / p), 2.0);\n"
+     "        r += p * max(ub * ab, ob);\n"
+     "        p *= 2.0;\n"
+     "    }\n"
+@@ -465,19 +475,20 @@ static const char *gl_draw_fast_fs3 =
+     "uniform vec2 u_atlasFix;\n"      /* texels added to an atlas position (the boot self-test) */
+     "uniform float u_pass;\n"
+     /* the texture store's 16-bit texel at x, y (wrapping as VRAM does): its low and high bytes */
++    /* x mod y of whole numbers, rounding (the GPU's divisions are not exact) */
++    "float pmod(float x, float y) { return x - y * floor((x + 0.5) / y); }\n"
+     "vec2 vram(float x, float y) {\n"
+-    "    vec4 tx = texture2D(u_vram, (vec2(mod(x, 1024.0), mod(y, 512.0)) + 0.5) /\n"
++    "    vec4 tx = texture2D(u_vram, (vec2(pmod(x, 1024.0), pmod(y, 512.0)) + 0.5) /\n"
+     "                               vec2(1024.0, 512.0));\n"
+     "    return floor(vec2(tx.r, tx.a) * 255.0 + 0.5);\n"
+     "}\n"
+     /* (u & a) | o of 8-bit whole numbers: the texture window */
+-    "float pmod(float x, float y) { return x - y * floor(x / y); }\n"
+     "float window(float u, float a, float o) {\n"
+     "    if (a > 254.5 && o < 0.5) return u;\n"
+     "    float r = 0.0, p = 1.0;\n"
+     "    for (int i = 0; i < 8; i++) {\n"
+-    "        float ub = mod(floor(u / p), 2.0), ab = mod(floor(a / p), 2.0),\n"
+-    "              ob = mod(floor(o / p), 2.0);\n"
++    "        float ub = pmod(floor((u + 0.5) / p), 2.0), ab = pmod(floor((a + 0.5) / p), 2.0),\n"
++    "              ob = pmod(floor((o + 0.5) / p), 2.0);\n"
+     "        r += p * max(ub * ab, ob);\n"
+     "        p *= 2.0;\n"
+     "    }\n"
+@@ -541,19 +552,20 @@ static const char *gl_draw_fast_fs4 =
+     "uniform vec2 u_atlasFix;\n"      /* texels added to an atlas position (the boot self-test) */
+     "uniform float u_pass;\n"
+     /* the texture store's 16-bit texel at x, y (wrapping as VRAM does): its low and high bytes */
++    /* x mod y of whole numbers, rounding (the GPU's divisions are not exact) */
++    "float pmod(float x, float y) { return x - y * floor((x + 0.5) / y); }\n"
+     "vec2 vram(float x, float y) {\n"
+-    "    vec4 tx = texture2D(u_vram, (vec2(mod(x, 1024.0), mod(y, 512.0)) + 0.5) /\n"
++    "    vec4 tx = texture2D(u_vram, (vec2(pmod(x, 1024.0), pmod(y, 512.0)) + 0.5) /\n"
+     "                               vec2(1024.0, 512.0));\n"
+     "    return floor(vec2(tx.r, tx.a) * 255.0 + 0.5);\n"
+     "}\n"
+     /* (u & a) | o of 8-bit whole numbers: the texture window */
+-    "float pmod(float x, float y) { return x - y * floor(x / y); }\n"
+     "float window(float u, float a, float o) {\n"
+     "    if (a > 254.5 && o < 0.5) return u;\n"
+     "    float r = 0.0, p = 1.0;\n"
+     "    for (int i = 0; i < 8; i++) {\n"
+-    "        float ub = mod(floor(u / p), 2.0), ab = mod(floor(a / p), 2.0),\n"
+-    "              ob = mod(floor(o / p), 2.0);\n"
++    "        float ub = pmod(floor((u + 0.5) / p), 2.0), ab = pmod(floor((a + 0.5) / p), 2.0),\n"
++    "              ob = pmod(floor((o + 0.5) / p), 2.0);\n"
+     "        r += p * max(ub * ab, ob);\n"
+     "        p *= 2.0;\n"
+     "    }\n"
+@@ -608,11 +620,12 @@ static const char *gl_copy_fs =
+     "#endif\n"
+     "uniform sampler2D u_vram;\n"
+     "varying vec2 v_src;\n"         /* the pixel's VRAM position less the pixels' x, y */
++    "float pmod(float x, float y) { return x - y * floor((x + 0.5) / y); }\n"
+     "void main() {\n"
+     "    vec4 sx = texture2D(u_vram, (floor(v_src) + 0.5) / vec2(1024.0, 512.0));\n"
+     "    vec2 tx = floor(vec2(sx.r, sx.a) * 255.0 + 0.5);\n"
+-    "    gl_FragColor = vec4(vec3(mod(tx.x, 32.0), floor(tx.x / 32.0) + mod(tx.y, 4.0) * 8.0,\n"
+-    "                             mod(floor(tx.y / 4.0), 32.0)) / 31.0, tx.y > 127.5 ? 1.0 : 0.0);\n"
++    "    gl_FragColor = vec4(vec3(pmod(tx.x, 32.0), floor((tx.x + 0.5) / 32.0) + pmod(tx.y, 4.0) * 8.0,\n"
++    "                             pmod(floor((tx.y + 0.5) / 4.0), 32.0)) / 31.0, tx.y > 127.5 ? 1.0 : 0.0);\n"
+     "}\n";
+ 
+ static const char *gl_copy_vs =
+diff --git a/platform/pc/include/pc/render3d.h b/platform/pc/include/pc/render3d.h
+index 7b35ca6..a485ad1 100644
+--- a/platform/pc/include/pc/render3d.h
++++ b/platform/pc/include/pc/render3d.h
+@@ -112,7 +112,9 @@ private:
+     void Faces(Batch *b, uintptr_t face, int n, int fast, const Water *water);
+ 
+     static bool ShadowMap(const ShadowSet *s, GlShadow *out);
+-    void DrawUpto(uint32_t bucket);
++    /* last: LayerEnd's, after which nothing in the layer tests depth */
++    void DrawUpto(uint32_t bucket, int last = 0);
++    void FaceCells(const Batch *b, const Face *f, int c[4]) const;
+     void LayerEnd();
+     void LayerStart(uint32_t id);
+     void StatsTick();
+@@ -121,6 +123,11 @@ private:
+     bool m_native = false, m_verify = false, m_showStats = false, m_nearDrop = false;
+     bool m_retailFade = false, m_nclip = false;
+     Stats m_st = {};
++    /* DrawUpto's screen grid: 16x16 cells over 1024x512 of a layer's projection, each with the
++     * nearest depth of the opaque faces of the current draw that cover it (generation m_gridCur) */
++    float m_gridZ[32][64] = {};
++    uint16_t m_gridGen[32][64] = {};
++    uint16_t m_gridCur = 0;
+ 
+     /* float vertices */
+     Shadow m_pv[kPvSlots] = {}, m_sp[kSpSlots] = {};
+diff --git a/platform/pc/include/pc/texture_store.h b/platform/pc/include/pc/texture_store.h
+index d33468f..5f1857e 100644
+--- a/platform/pc/include/pc/texture_store.h
++++ b/platform/pc/include/pc/texture_store.h
+@@ -29,12 +29,20 @@ class TextureStore {
+     /* The texels (pc::kTexW x pc::kTexH), and a byte of PC_TEX_* bits per 16x16 cell, row by row. */
+     const uint16_t *Data() const { return &m_tex[0][0]; }
+     uint8_t *Cells() { return &m_cell[0][0]; }
++    /* whether any cell was marked changed since the last call (the renderer skips its scan else) */
++    int TakeChanged()
++    {
++        int c = m_changed;
++        m_changed = 0;
++        return c;
++    }
+ 
+   private:
+     void Mark(int x, int y, int w, int h);
+ 
+     uint16_t m_tex[kTexH][kTexW] = {};
+     uint8_t m_cell[kTexH / kTexCell][kTexW / kTexCell] = {};
++    int m_changed = 0;
+ };
+ 
+ extern TextureStore g_textureStore;
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index 605e20b..bc3cdd2 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -35,6 +35,11 @@
+ #include "pc/precise.h"
+ #include "pc/render3d.h"
+ #ifdef __vita__
++#include <ctype.h>
++#include <sys/stat.h>
++
++#include <psp2/kernel/processmgr.h>
++
+ #include "pc/platform.h"
+ #endif
+ 
+@@ -114,8 +119,143 @@ GLuint Compile(GLenum type, const char *src)
+     return s;
+ }
+ 
++#ifdef __vita__
++/* ---- programs kept on the card ----
++ * vitaGL compiles GLSL with the console's shader compiler at every start, seconds a program. A
++ * program linked once is saved (glGetProgramBinary) to PC_VITA_DIR/shaders/<hash of its sources
++ * and this build>.bin and loaded with glProgramBinary at the next start, but only if each uniform
++ * and attribute its sources name comes out where the compiled one had it; else it is compiled
++ * and saved again (THPS_GL_SHADERCACHE=0: always compiled). */
++int s_progCached, s_progCompiled, s_progPathN;
++long long s_progUs;
++char s_progPaths[8][96];   /* the programs loaded from the card (the self-test may remove them) */
++constexpr int kProgNames = 64;
++struct ProgHeader {
++    char magic[8];
++    uint32_t format, n, len;
++};
++
++uint64_t Fnv(const char *s, uint64_t h)
++{
++    for (; *s; s++)
++        h = (h ^ (uint8_t)*s) * 0x100000001b3ull;
++    return h;
++}
++
++/* the names src declares with kw ("uniform", "attribute") at a line's start, after the n in names */
++int SourceNames(const char *src, const char *kw, char names[][32], int n)
++{
++    size_t kl = strlen(kw);
++    for (const char *p = strstr(src, kw); p && n < kProgNames; p = strstr(p + kl, kw)) {
++        if (p > src && p[-1] != '\n')
++            continue;
++        const char *q = p + kl;
++        while (*q == ' ')
++            q++;
++        while (*q && *q != ' ')
++            q++;   /* the type */
++        while (*q == ' ')
++            q++;
++        int k = 0;
++        while (k < 31 && (isalnum((unsigned char)*q) || *q == '_'))
++            names[n][k++] = *q++;
++        names[n][k] = 0;
++        if (k)
++            n++;
++    }
++    return n;
++}
++
++/* where program p has the names its sources declare: uniforms (vs, fs), then attributes */
++int ProgramLocs(GLuint p, const char *vs, const char *fs, int32_t *locs)
++{
++    char names[kProgNames][32];
++    int nu = SourceNames(fs, "uniform", names, SourceNames(vs, "uniform", names, 0));
++    int n = SourceNames(vs, "attribute", names, nu);
++    for (int i = 0; i < n; i++)
++        locs[i] = i < nu ? glGetUniformLocation(p, names[i]) : glGetAttribLocation(p, names[i]);
++    return n;
++}
++
++GLuint ProgramLoad(const char *path, const char *vs, const char *fs)
++{
++    FILE *f = fopen(path, "rb");
++    if (!f)
++        return 0;
++    ProgHeader h;
++    int32_t locs[kProgNames], now[kProgNames];
++    void *data = nullptr;
++    GLuint p = 0;
++    if (fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, "THPSPRG1", 8) && h.n <= kProgNames &&
++        fread(locs, 4, h.n, f) == h.n && h.len && h.len < (8u << 20) &&
++        (data = malloc(h.len)) && fread(data, 1, h.len, f) == h.len) {
++        p = glCreateProgram();
++        glProgramBinary(p, (GLenum)h.format, data, (GLsizei)h.len);
++        GLint ok = 0;
++        glGetProgramiv(p, GL_LINK_STATUS, &ok);
++        if (!ok || ProgramLocs(p, vs, fs, now) != (int)h.n || memcmp(now, locs, h.n * 4)) {
++            glDeleteProgram(p);
++            p = 0;
++        }
++    }
++    free(data);
++    fclose(f);
++    if (!p)
++        remove(path);   /* (stale or foreign: compiled and saved again) */
++    else if (s_progPathN < 8)
++        snprintf(s_progPaths[s_progPathN++], sizeof s_progPaths[0], "%s", path);
++    return p;
++}
++
++void ProgramSave(GLuint p, const char *path, const char *vs, const char *fs)
++{
++    GLint len = 0;
++    glGetProgramiv(p, GL_PROGRAM_BINARY_LENGTH, &len);
++    if (len <= 0 || len > (8 << 20))
++        return;
++    void *data = malloc((size_t)len);
++    if (!data)
++        return;
++    ProgHeader h;
++    int32_t locs[kProgNames];
++    GLsizei got = 0;
++    GLenum fmt = 0;
++    glGetProgramBinary(p, len, &got, &fmt, data);
++    memcpy(h.magic, "THPSPRG1", 8);
++    h.format = fmt;
++    h.n = (uint32_t)ProgramLocs(p, vs, fs, locs);
++    h.len = (uint32_t)got;
++    mkdir(PC_VITA_DIR "/shaders", 0777);
++    FILE *f = got > 0 ? fopen(path, "wb") : nullptr;
++    if (f) {
++        int ok = fwrite(&h, sizeof h, 1, f) == 1 && fwrite(locs, 4, h.n, f) == h.n &&
++                 fwrite(data, 1, (size_t)got, f) == (size_t)got;
++        fclose(f);
++        if (!ok)
++            remove(path);
++    }
++    free(data);
++}
++#endif
++
+ GLuint Program(const char *vs, const char *fs)
+ {
++#ifdef __vita__
++    long long t0 = sceKernelGetProcessTimeWide();
++    char path[96];
++    const char *sc = getenv("THPS_GL_SHADERCACHE");
++    int cache = !(sc && sc[0] == '0');
++    snprintf(path, sizeof path, PC_VITA_DIR "/shaders/%016llx.bin",
++             (unsigned long long)Fnv(fs, Fnv(vs, Fnv(__DATE__ " " __TIME__, 0xcbf29ce484222325ull))));
++    if (cache) {
++        GLuint c = ProgramLoad(path, vs, fs);
++        if (c) {
++            s_progCached++;
++            s_progUs += sceKernelGetProcessTimeWide() - t0;
++            return c;
++        }
++    }
++#endif
+     GLuint p = glCreateProgram(), v = Compile(GL_VERTEX_SHADER, vs),
+            f = Compile(GL_FRAGMENT_SHADER, fs);
+     GLint ok;
+@@ -153,6 +293,12 @@ GLuint Program(const char *vs, const char *fs)
+         glDeleteProgram(p);
+         return 0;
+     }
++#ifdef __vita__
++    if (cache)
++        ProgramSave(p, path, vs, fs);
++    s_progCompiled++;
++    s_progUs += sceKernelGetProcessTimeWide() - t0;
++#endif
+     return p;
+ }
+ 
+@@ -544,6 +690,9 @@ bool GlGpu::AnyDrawn(int x0, int y0, int x1, int y1) const
+ 
+ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+ {
++#ifdef __vita__
++    long long boot0 = sceKernelGetProcessTimeWide();
++#endif
+ #ifdef PC_GLES
+ #ifdef __vita__
+     /* compile each shader in glCompileShader, where a failure is reported, not in
+@@ -787,8 +936,14 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+ #ifdef __vita__
+     {
+         const char *st = getenv("THPS_GL_SELFTEST");
++        long long t1 = sceKernelGetProcessTimeWide();
+         if (!(st && st[0] == '0'))
+             SelfTest();
++        long long t2 = sceKernelGetProcessTimeWide();
++        fprintf(stderr, "[boot] %.1f s after the start: renderer ready in %.1f s (programs %.1f s: "
++                        "%d from the card, %d compiled; self-test %.2f s)\n",
++                t2 / 1e6, (t2 - boot0) / 1e6, s_progUs / 1e6, s_progCached, s_progCompiled,
++                (t2 - t1) / 1e6);
+     }
+ #endif
+     return 0;
+@@ -851,6 +1006,8 @@ void GlGpu::Shutdown()
+ /* The texture store's changed cells to its texture. */
+ void GlGpu::UploadTexStore()
+ {
++    if (!g_textureStore.TakeChanged())
++        return;   /* no cell marked since the last scan (a native layer's draws each come here) */
+     const uint16_t *tex = g_textureStore.Data();
+     uint8_t *cell = g_textureStore.Cells();
+     int any = 0;
+@@ -1364,6 +1521,12 @@ void GlGpu::SelfTest()
+     }
+     m_cacheOn = cache;
+     fprintf(stderr, "[gl] self-test: %s\n", line);
++    if (!TestExact(t) && s_progPathN) {
++        for (int i = 0; i < s_progPathN; i++)
++            remove(s_progPaths[i]);
++        fprintf(stderr, "[gl] self-test: the programs loaded from the card may be wrong: removed, "
++                        "compiled at the next start\n");
++    }
+ 
+     /* the texture cache: this atlas shape, the other, then the shift they share undone */
+     if (m_cacheOn) {
+@@ -1665,6 +1828,7 @@ void GlGpu::Flush()
+         }
+         glDrawArrays(GL_TRIANGLES, 0, b.nv);
+         m_st.draws++;
++        m_st.gl_draws += b.sub ? 2 : 1;
+     }
+     glDisable(GL_SCISSOR_TEST);
+     glDisable(GL_BLEND);
+@@ -2168,7 +2332,7 @@ void GlGpu::LayerBegin(const GlLayerParams *lp, const GlVert *v, int nv)
+     l.active = 1;
+ }
+ 
+-void GlGpu::LayerDraw(int first, int count, int cls, uint16_t hd)
++void GlGpu::LayerDraw(int first, int count, int cls, uint16_t hd, int depth, int why)
+ {
+ #ifdef __vita__
+     PC_VITA_PROF_SCOPE(PC_PROF_DRAW);
+@@ -2176,6 +2340,9 @@ void GlGpu::LayerDraw(int first, int count, int cls, uint16_t hd)
+     Layer &l = m_layer;
+     if (!l.active || count <= 0)
+         return;
++    m_st.layer_draws++;
++    if (why >= 0 && why < PC_GL_SPLITS)
++        m_st.split[why]++;
+     Flush();        /* emulated primitives submitted before these are behind them */
+     Prepare();
+ #ifdef PC_GLES
+@@ -2233,8 +2400,9 @@ void GlGpu::LayerDraw(int first, int count, int cls, uint16_t hd)
+         }
+         glDrawArrays(GL_TRIANGLES, first, count);
+         m_st.draws++;
+-        if (cls == 0) {
+-            /* opaque: now the true depth (see the shaders) */
++        m_st.gl_draws += (cls == 2 ? 2 : 1) + (cls == 0 && depth ? 1 : 0);
++        if (cls == 0 && depth) {
++            /* opaque: now the true depth (see the shaders), unless nothing after it tests it */
+             DPass(1);
+             glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+             glDepthMask(GL_TRUE);
+@@ -2823,13 +2991,18 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                         "deferred, %d stale; fast program %d batches/%d tris, slow %d batches/%d "
+                         "tris (%d textured tris without a slot); %d texture windows seen; texture "
+                         "store %d cells written in place, %d new copies, %d waits for the GPU; "
+-                        "blits %d in place, %d copied by vitaGL; %d descriptors pointed back\n",
++                        "blits %d in place, %d copied by vitaGL; %d descriptors pointed back; "
++                        "GL draws %.0f a frame; 3D %.0f draws a frame (new draw for depth %d, "
++                        "class %d, texture %d, 2D between %d, layer end %d)\n",
+                 m_st.draws, m_st.readbacks, m_st.tex_ups, m_st.blits, m_st.cache_hits,
+                 m_st.cache_misses, m_st.cache_inval, m_st.cache_full, m_st.cache_deferred,
+                 m_st.cache_stale, m_st.fast_batches, m_st.fast_tris, m_st.slow_batches,
+                 m_st.slow_tris, m_st.uncached_tris, (int)m_windows.size(), m_st.store_cells,
+                 m_st.store_switches, m_st.store_copies, m_st.blit_pool, m_st.blit_copies,
+-                m_st.own_fixed);
++                m_st.own_fixed, m_st.gl_draws / 60.0, m_st.layer_draws / 60.0,
++                m_st.split[PC_GL_SPLIT_DEPTH], m_st.split[PC_GL_SPLIT_CLASS],
++                m_st.split[PC_GL_SPLIT_TEXTURE], m_st.split[PC_GL_SPLIT_2D],
++                m_st.split[PC_GL_SPLIT_END]);
+         m_st = Stats{};
+         m_st.on = 1;
+     }
+diff --git a/platform/pc/src/pc_render3d.cpp b/platform/pc/src/pc_render3d.cpp
+index 73ca98b..67166a3 100644
+--- a/platform/pc/src/pc_render3d.cpp
++++ b/platform/pc/src/pc_render3d.cpp
+@@ -1206,13 +1206,41 @@ bool Renderer3D::ShadowMap(const ShadowSet *s, GlShadow *out)
+ /* ---------------------------------------------------------------------------------------------
+  * Drawing, while PC_DrawOT walks the ordering table */
+ 
++/* The 16x16 cells of DrawUpto's grid a face covers on screen (x0, y0, x1, y1, inclusive): all of
++ * them for a face that reaches the near plane or isn't in view space */
++void Renderer3D::FaceCells(const Batch *b, const Face *f, int c[4]) const
++{
++    const GlVert *v = &b->sv[f->first];
++    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f, near = b->hither > 1 ? b->hither : 1;
++    c[0] = c[1] = 0;
++    c[2] = 63;
++    c[3] = 31;
++    if (!f->nv)
++        return;
++    for (int k = 0; k < f->nv; k++) {
++        if (!(v[k].info & PC_GL_I_VIEW) || v[k].z < near)
++            return;
++        float r = b->h / v[k].z, x = b->ofx + v[k].x * r, y = b->ofy + v[k].y * r;
++        x0 = fminf(x0, x);
++        y0 = fminf(y0, y);
++        x1 = fmaxf(x1, x);
++        y1 = fmaxf(y1, y);
++    }
++    c[0] = x0 < 0 ? 0 : x0 >= 1023 ? 63 : (int)(x0 / 16);
++    c[1] = y0 < 0 ? 0 : y0 >= 511 ? 31 : (int)(y0 / 16);
++    c[2] = x1 < 0 ? 0 : x1 >= 1023 ? 63 : (int)(x1 / 16);
++    c[3] = y1 < 0 ? 0 : y1 >= 511 ? 31 : (int)(y1 / 16);
++}
++
+ /* Faces go to the GPU in the PS1's painter order, in draws of one class. Within a draw, colour is
+  * tested against the depth the earlier draws wrote, not against the faces of the same draw, so a
+- * face joins the draw only if no opaque face already in it can be in front of it by more than
+- * the decal tolerance (the shader tests colour at z - (z/256 + 2)); otherwise a new draw starts
+- * and the face is depth-tested against them. Order alone would repeat the PS1's sorting errors
+- * (objects showing through walls and floors whose far corner is further away). */
+-void Renderer3D::DrawUpto(uint32_t bucket)
++ * face joins the draw only if no opaque face already in it, covering the same part of the screen,
++ * can be in front of it by more than the decal tolerance (the shader tests colour at
++ * z - (z/256 + 2)); otherwise a new draw starts and the face is depth-tested against them. Order
++ * alone would repeat the PS1's sorting errors (objects showing through walls and floors whose
++ * far corner is further away). The test was once for the whole screen: 300-600 draws a frame
++ * in a level, each costly in vitaGL; now per 16x16 cell of a screen grid. */
++void Renderer3D::DrawUpto(uint32_t bucket, int last)
+ {
+     Batch *b = m_layer;
+     int i = b->next;
+@@ -1223,19 +1251,45 @@ void Renderer3D::DrawUpto(uint32_t bucket)
+     }
+     while (i < b->nf && b->sf[i].bucket >= bucket) {
+         int cls = b->sf[i].cls, first = (int)b->sf[i].first, count = 0, j = i;
++        int why = PC_GL_SPLIT_END;
+         uint16_t hd = b->sf[i].hd;
+-        float front = 1e30f;   /* nearest z of the opaque faces in this draw */
+-        while (j < b->nf && b->sf[j].bucket >= bucket && b->sf[j].cls == cls &&
+-               b->sf[j].hd == hd) {
++        if (++m_gridCur == 0) {
++            memset(m_gridGen, 0, sizeof m_gridGen);
++            m_gridCur = 1;
++        }
++        for (; j < b->nf; j++) {
+             const Face *f = &b->sf[j];
+-            if (front < f->zmax - (f->zmax / 256 + 2))
++            if (f->bucket < bucket) {
++                why = PC_GL_SPLIT_2D;
+                 break;
+-            if (cls == 0 && f->zmin < front)
+-                front = f->zmin;
++            }
++            if (f->cls != cls || f->hd != hd) {
++                why = f->cls != cls ? PC_GL_SPLIT_CLASS : PC_GL_SPLIT_TEXTURE;
++                break;
++            }
++            int c[4], hit = 0;
++            float behind = f->zmax - (f->zmax / 256 + 2);
++            FaceCells(b, f, c);
++            for (int cy = c[1]; cy <= c[3] && !hit; cy++)
++                for (int cx = c[0]; cx <= c[2]; cx++)
++                    if (m_gridGen[cy][cx] == m_gridCur && m_gridZ[cy][cx] < behind) {
++                        hit = 1;
++                        break;
++                    }
++            if (hit) {
++                why = PC_GL_SPLIT_DEPTH;
++                break;
++            }
++            if (cls == 0)
++                for (int cy = c[1]; cy <= c[3]; cy++)
++                    for (int cx = c[0]; cx <= c[2]; cx++)
++                        if (m_gridGen[cy][cx] != m_gridCur || f->zmin < m_gridZ[cy][cx]) {
++                            m_gridGen[cy][cx] = m_gridCur;
++                            m_gridZ[cy][cx] = f->zmin;
++                        }
+             count += f->nv;
+-            j++;
+         }
+-        g_glGpu.LayerDraw(first, count, cls, hd);
++        g_glGpu.LayerDraw(first, count, cls, hd, !(last && j == b->nf), why);
+         m_st.draws++;
+         i = j;
+     }
+@@ -1244,7 +1298,7 @@ void Renderer3D::DrawUpto(uint32_t bucket)
+ 
+ void Renderer3D::LayerEnd()
+ {
+-    DrawUpto(0);
++    DrawUpto(0, 1);
+     g_glGpu.LayerEnd();
+     m_layer = nullptr;
+ }
+diff --git a/platform/pc/src/pc_texstore.cpp b/platform/pc/src/pc_texstore.cpp
+index 0b2851b..551c214 100644
+--- a/platform/pc/src/pc_texstore.cpp
++++ b/platform/pc/src/pc_texstore.cpp
+@@ -29,6 +29,7 @@ static bool Clip(int &x, int &y, int &w, int &h) {
+ 
+ /* Mark the cells under x, y, w, h (in the store) changed and used. */
+ void TextureStore::Mark(int x, int y, int w, int h) {
++    m_changed = 1;
+     for (int cy = y / kTexCell; cy <= (y + h - 1) / kTexCell; cy++)
+         for (int cx = x / kTexCell; cx <= (x + w - 1) / kTexCell; cx++)
+             m_cell[cy][cx] |= kTexDirty | kTexUsed;
+-- 
+2.53.0
+

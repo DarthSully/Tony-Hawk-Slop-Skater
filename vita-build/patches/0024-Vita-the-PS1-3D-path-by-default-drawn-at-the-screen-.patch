@@ -1,0 +1,538 @@
+From fad9daa91d10d0609d418745578d9f75d4744fd1 Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Tue, 27 Oct 2026 20:35:04 +0300
+Subject: [PATCH] Vita: the PS1 3D path by default, drawn at the screen's
+ resolution; t16's overlap test removed; the game thread on core 0
+
+The native renderer's draws cost the Vita's CPU more than the PS1 path does (t15 38 fps, t16
+less), so on the Vita 3D goes the PS1 way by default again; THPS_RENDER3D=native brings the
+native renderer back (elsewhere the default stays native).
+
+The screens are no longer fixed at the PS1's resolution: the display surfaces are drawn at the
+size they are shown at, 4:3 within 960x544 (728x544, a whole number of 8 pixels so a surface's
+texture rows are its width and it is shown 1:1), with the vertices' sub-pixel positions;
+THPS_GL_SCALE=n draws them at n times the PS1's resolution again (THPS_GL_SCALE=1: as before).
+Scaled up, the geometry doesn't move by half a pixel (u_shift 0), so the ES 2 shaders take texels
+at the pixel's centre instead of adding half a texel (u_shift goes to the fragment stage in
+v_flags.w). Reading the screens back (ReadPixels, ReadArea) on the Vita reads texels where they
+are after a glFinish, for the surfaces and the readback texture too, as for the base before:
+vitaGL's glReadPixels takes a framebuffer's rows from the far end.
+
+t16's per-triangle overlap test cost 20-40 ms of CPU a frame and split the native renderer's
+draws no less: back to the face's box and depth range. The layers' vertex buffers stay.
+
+The game thread (the main thread) keeps to core 0: with all three cores allowed it was moved
+about 150 times a second.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ platform/pc/include/pc/gl_gpu.h          |   4 +
+ platform/pc/include/pc/gl_shaders_gles.h |  37 +++--
+ platform/pc/include/pc/render3d.h        |  13 +-
+ platform/pc/src/pc_gpu_gl.cpp            |  42 +++++-
+ platform/pc/src/pc_render3d.cpp          | 176 ++++++-----------------
+ platform/pc/src/pc_vita.cpp              |   6 +
+ 6 files changed, 114 insertions(+), 164 deletions(-)
+
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index 95fb9a9..763fe4e 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -124,6 +124,9 @@ struct RenderTarget {
+     int pw, ph;               /* size in pixels */
+     float sx, sy;             /* pixels per VRAM pixel */
+     GLuint tex, depth, fbo;   /* RGBA8 colour, DEPTH32F for the native 3D layers (pc_render3d.cpp) */
++    /* the Vita: tex's texels (vitaGL's), rows of align(pw, 8) pixels, row y = the drawn row y;
++     * read there after a glFinish (vitaGL's glReadPixels takes an FBO's rows from the far end) */
++    uint8_t *ptr;
+     /* Antialiasing (GlGpu::SetSamples): with samples > 0 drawing goes to the multisampled ms_fbo
+      * (colour ms_color, and depth), and tex/fbo hold its resolved pixels, brought up to date by
+      * Resolve before anything reads them. */
+@@ -417,6 +420,7 @@ class GlGpu {
+     InPlace m_blitPool[kBlitPool] = {};
+     InPlace m_imagePool[kImagePool] = {};
+     uint8_t *m_basePtr = nullptr;   /* the base target's texels: row y is VRAM row y */
++    uint8_t *m_rbPtr = nullptr;     /* m_rbTex's texels, likewise (ReadPixels from the screens) */
+     InPlace m_atlasTex = {};        /* the texture cache's atlas */
+     int m_warnedOwn = 0;
+     /* a free texture of a pool (no draw of the last 4 frames used it), w x h of fmt, made the first
+diff --git a/platform/pc/include/pc/gl_shaders_gles.h b/platform/pc/include/pc/gl_shaders_gles.h
+index 6d5e82a..33e40c9 100644
+--- a/platform/pc/include/pc/gl_shaders_gles.h
++++ b/platform/pc/include/pc/gl_shaders_gles.h
+@@ -14,8 +14,9 @@
+  * - No gl_FragDepth: depth comes from the vertex stage, as a projective depth of view z (near =
+  *   the layer's near plane, which also clips as gl_ClipDistance did), monotonic like the linear
+  *   z / 2^20 it stands for. The colour pass's tolerance (u_dpass 0) is a relative one (clipZ).
+- * - The screens are drawn at the PS1's resolution (GlGpu::Init: fixed scale 1), so there is no
+- *   texture-coordinate fix (u_uvfix, derivatives) and the geometry moves by half a pixel.
++ * - At the PS1's resolution the geometry moves by half a pixel (u_shift). Scaled up (t17) it
++ *   doesn't, and instead of gl_shaders.h's texture-coordinate fix (u_uvfix, derivatives) texels
++ *   are taken at the pixel's centre (u_shift reaches the fragment stage in v_flags.w).
+  * - vitaGL's translator (GLSL to Cg) defines s, t, st, ts, ss and tt as swizzle macros and makes
+  *   vector comparisons component-wise: no variables by those names, and notEqual/any for vectors.
+  * - Neither the Dreamcast's skater shadows nor filtered HD texture gradients (the Dreamcast data's
+@@ -97,7 +98,7 @@ static const char *gl_draw_vs =
+     "                  cached > 0.5 ? floor((slot + 0.5) / u_atlasCols) * 256.0 : bits(a_tex.x, 6.0, 9.0));\n"
+     "    v_mode = vec4(bits(info, 7.0, 2.0), bits(info, 5.0, 2.0), bits(info, 9.0, 1.0),\n"
+     "                  bits(info, 10.0, 1.0));\n"
+-    "    v_flags = vec4(bits(info, 11.0, 1.0), view ? 1.0 : 0.0, cached, 0.0);\n"
++    "    v_flags = vec4(bits(info, 11.0, 1.0), view ? 1.0 : 0.0, cached, u_shift);\n"
+     "    v_twin = a_twin;\n"
+     "    v_uvr = a_uvr;\n"
+     "}\n";
+@@ -168,8 +169,9 @@ static const char *gl_draw_fs =
+     "    bool view = v_flags.y > 0.5;\n"
+     "    float depth = mode.x, abr = mode.y;\n"
+     /* texture coordinates at the pixel's corner, rounded to the nearest texel like the PS1 (at
+-     * the PS1's resolution the geometry moved by half a pixel instead, gl_shaders.h) */
+-    "    vec2 uv = v_uv + 0.5;\n"
++     * the PS1's resolution the geometry moved by half a pixel instead, gl_shaders.h); scaled up
++     * (no move, v_flags.w 0) the pixel's centre, which is inside the PS1 pixel's texel */
++    "    vec2 uv = v_uv + floor(v_flags.w * 2.0 + 0.5) * 0.5;\n"
+     "    if (view || any(notEqual(uvr, vec4(0.0, 0.0, 255.0, 255.0))))\n"
+     "        uv = clamp(uv, uvr.xy, uvr.zw + 0.999);\n"
+     "    bool semi = v_flags.x > 0.5;\n"
+@@ -268,8 +270,9 @@ static const char *gl_draw_fast_fs =
+     "    bool view = v_flags.y > 0.5;\n"
+     "    float depth = mode.x, abr = mode.y;\n"
+     /* texture coordinates at the pixel's corner, rounded to the nearest texel like the PS1 (at
+-     * the PS1's resolution the geometry moved by half a pixel instead, gl_shaders.h) */
+-    "    vec2 uv = v_uv + 0.5;\n"
++     * the PS1's resolution the geometry moved by half a pixel instead, gl_shaders.h); scaled up
++     * (no move, v_flags.w 0) the pixel's centre, which is inside the PS1 pixel's texel */
++    "    vec2 uv = v_uv + floor(v_flags.w * 2.0 + 0.5) * 0.5;\n"
+     "    if (view || any(notEqual(uvr, vec4(0.0, 0.0, 255.0, 255.0))))\n"
+     "        uv = clamp(uv, uvr.xy, uvr.zw + 0.999);\n"
+     "    bool semi = v_flags.x > 0.5;\n"
+@@ -347,8 +350,9 @@ static const char *gl_draw_fast_fs1 =
+     "    bool view = v_flags.y > 0.5;\n"
+     "    float depth = mode.x, abr = mode.y;\n"
+     /* texture coordinates at the pixel's corner, rounded to the nearest texel like the PS1 (at
+-     * the PS1's resolution the geometry moved by half a pixel instead, gl_shaders.h) */
+-    "    vec2 uv = v_uv + 0.5;\n"
++     * the PS1's resolution the geometry moved by half a pixel instead, gl_shaders.h); scaled up
++     * (no move, v_flags.w 0) the pixel's centre, which is inside the PS1 pixel's texel */
++    "    vec2 uv = v_uv + floor(v_flags.w * 2.0 + 0.5) * 0.5;\n"
+     "    if (view || any(notEqual(uvr, vec4(0.0, 0.0, 255.0, 255.0))))\n"
+     "        uv = clamp(uv, uvr.xy, uvr.zw + 0.999);\n"
+     "    bool semi = v_flags.x > 0.5;\n"
+@@ -424,8 +428,9 @@ static const char *gl_draw_fast_fs2 =
+     "    bool view = v_flags.y > 0.5;\n"
+     "    float depth = mode.x, abr = mode.y;\n"
+     /* texture coordinates at the pixel's corner, rounded to the nearest texel like the PS1 (at
+-     * the PS1's resolution the geometry moved by half a pixel instead, gl_shaders.h) */
+-    "    vec2 uv = v_uv + 0.5;\n"
++     * the PS1's resolution the geometry moved by half a pixel instead, gl_shaders.h); scaled up
++     * (no move, v_flags.w 0) the pixel's centre, which is inside the PS1 pixel's texel */
++    "    vec2 uv = v_uv + floor(v_flags.w * 2.0 + 0.5) * 0.5;\n"
+     "    if (view || any(notEqual(uvr, vec4(0.0, 0.0, 255.0, 255.0))))\n"
+     "        uv = clamp(uv, uvr.xy, uvr.zw + 0.999);\n"
+     "    bool semi = v_flags.x > 0.5;\n"
+@@ -500,8 +505,9 @@ static const char *gl_draw_fast_fs3 =
+     "    bool view = v_flags.y > 0.5;\n"
+     "    float depth = mode.x, abr = mode.y;\n"
+     /* texture coordinates at the pixel's corner, rounded to the nearest texel like the PS1 (at
+-     * the PS1's resolution the geometry moved by half a pixel instead, gl_shaders.h) */
+-    "    vec2 uv = v_uv + 0.5;\n"
++     * the PS1's resolution the geometry moved by half a pixel instead, gl_shaders.h); scaled up
++     * (no move, v_flags.w 0) the pixel's centre, which is inside the PS1 pixel's texel */
++    "    vec2 uv = v_uv + floor(v_flags.w * 2.0 + 0.5) * 0.5;\n"
+     "    if (view || any(notEqual(uvr, vec4(0.0, 0.0, 255.0, 255.0))))\n"
+     "        uv = clamp(uv, uvr.xy, uvr.zw + 0.999);\n"
+     "    bool semi = v_flags.x > 0.5;\n"
+@@ -577,8 +583,9 @@ static const char *gl_draw_fast_fs4 =
+     "    bool view = v_flags.y > 0.5;\n"
+     "    float depth = mode.x, abr = mode.y;\n"
+     /* texture coordinates at the pixel's corner, rounded to the nearest texel like the PS1 (at
+-     * the PS1's resolution the geometry moved by half a pixel instead, gl_shaders.h) */
+-    "    vec2 uv = v_uv + 0.5;\n"
++     * the PS1's resolution the geometry moved by half a pixel instead, gl_shaders.h); scaled up
++     * (no move, v_flags.w 0) the pixel's centre, which is inside the PS1 pixel's texel */
++    "    vec2 uv = v_uv + floor(v_flags.w * 2.0 + 0.5) * 0.5;\n"
+     "    if (view || any(notEqual(uvr, vec4(0.0, 0.0, 255.0, 255.0))))\n"
+     "        uv = clamp(uv, uvr.xy, uvr.zw + 0.999);\n"
+     "    bool semi = v_flags.x > 0.5;\n"
+diff --git a/platform/pc/include/pc/render3d.h b/platform/pc/include/pc/render3d.h
+index 97a8522..a485ad1 100644
+--- a/platform/pc/include/pc/render3d.h
++++ b/platform/pc/include/pc/render3d.h
+@@ -114,9 +114,7 @@ private:
+     static bool ShadowMap(const ShadowSet *s, GlShadow *out);
+     /* last: LayerEnd's, after which nothing in the layer tests depth */
+     void DrawUpto(uint32_t bucket, int last = 0);
+-    /* the cells of DrawUpto's grid face f covers and its depth range in each, into m_span */
+-    void FaceSpans(const Batch *b, const Face *f);
+-    void SpanBox(int x0, int y0, int x1, int y1, float lo, float hi);
++    void FaceCells(const Batch *b, const Face *f, int c[4]) const;
+     void LayerEnd();
+     void LayerStart(uint32_t id);
+     void StatsTick();
+@@ -124,21 +122,12 @@ private:
+     /* options (environment, Init) */
+     bool m_native = false, m_verify = false, m_showStats = false, m_nearDrop = false;
+     bool m_retailFade = false, m_nclip = false;
+-    bool m_exact = true;   /* THPS_R3D_EXACT=0: a face's bounding box and whole depth range */
+     Stats m_st = {};
+     /* DrawUpto's screen grid: 16x16 cells over 1024x512 of a layer's projection, each with the
+      * nearest depth of the opaque faces of the current draw that cover it (generation m_gridCur) */
+     float m_gridZ[32][64] = {};
+     uint16_t m_gridGen[32][64] = {};
+     uint16_t m_gridCur = 0;
+-    /* FaceSpans: a cell (y * 64 + x) and the face's nearest and farthest depth in it */
+-    struct CellZ {
+-        uint16_t cell;
+-        float lo, hi;
+-    };
+-    static constexpr int kSpans = 8192;
+-    CellZ m_span[kSpans];
+-    int m_nspan = 0;
+ 
+     /* float vertices */
+     Shadow m_pv[kPvSlots] = {}, m_sp[kSpSlots] = {};
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index a032fb2..bbcfb6d 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -562,6 +562,11 @@ bool RenderTarget::Create(int x_, int y_, int w_, int h_, int pad, int pw_, int
+         Destroy();
+         return false;
+     }
++#ifdef __vita__
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, tex);
++    ptr = (uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
++#endif
+     return true;
+ }
+ 
+@@ -699,9 +704,8 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+      * glLinkProgram (vitaGL's default), which crashes on one; Program() compiles them in pairs */
+     vglSetSemanticBindingMode(VGL_MODE_SHADER_PAIR);
+ #endif
+-    /* the screens at the PS1's resolution, scaled when shown (pc/gl_shaders_gles.h) */
+-    (void)fixed_scale;
+-    fixed_scale = 1;
++    /* the screens at the window's resolution (t17; before, always the PS1's, scaled when shown),
++     * or THPS_GL_SCALE times the PS1's: THPS_GL_SCALE=1 is the old way */
+     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &m_maxTex);
+     m_maxSamples = 0;
+ #else
+@@ -916,6 +920,8 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+     glActiveTexture(GL_TEXTURE0);
+     glBindTexture(GL_TEXTURE_2D, m_base.tex);
+     m_basePtr = (uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
++    glBindTexture(GL_TEXTURE_2D, m_rbTex);
++    m_rbPtr = (uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
+     fprintf(stderr, "[gl] base target texels at %p, its descriptor's %p\n", (void *)m_basePtr,
+             sceGxmTextureGetData(vglGetGxmTexture(GL_TEXTURE_2D)));
+ #endif
+@@ -990,6 +996,7 @@ void GlGpu::Shutdown()
+     memset(m_imagePool, 0, sizeof m_imagePool);
+     m_nstore = 0;
+     m_basePtr = nullptr;
++    m_rbPtr = nullptr;
+ #endif
+     glDeleteFramebuffers(1, &m_rbFbo);
+     if (m_shadowState) {
+@@ -2555,6 +2562,25 @@ void GlGpu::ReadPixels(int x0, int y0, int x1, int y1, uint16_t *out)
+     glPixelStorei(GL_PACK_ALIGNMENT, 4);
+ #ifdef __vita__
+     long long prof_t0 = PC_VitaProfNow();
++    if (m_rbPtr && nt > 0) {
++        /* the screens' pixels, scaled down into m_rbTex: read where they are, as the base's
++         * above (vitaGL's glReadPixels takes the rows from the far end) */
++        glFinish();
++        glBindFramebuffer(GL_FRAMEBUFFER, 0);
++        int w = x1 - x0 + 1;
++        for (int y = y0; y <= y1; y++) {
++            memcpy(buf, m_rbPtr + ((size_t)y * VRAM_W + x0) * 4, (size_t)w * 4);
++            uint16_t *d = out + (size_t)(y - y0) * w;
++            for (int i = 0; i < w; i++) {
++                const uint8_t *s = buf + i * 4;
++                d[i] = (uint16_t)(m_to5[s[0]] | m_to5[s[1]] << 5 | m_to5[s[2]] << 10 |
++                                  (s[3] >= 128 ? 0x8000 : 0));
++            }
++        }
++        PC_VitaProfAdd(PC_PROF_READBACK, PC_VitaProfNow() - prof_t0);
++        m_st.readbacks++;
++        return;
++    }
+     glReadPixels(px, py, pw, ph, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+     PC_VitaProfAdd(PC_PROF_READBACK, PC_VitaProfNow() - prof_t0);
+ #else
+@@ -2708,11 +2734,12 @@ uint32_t *GlGpu::ReadArea(int x, int y, int w, int h, int *out_w, int *out_h)
+     glPixelStorei(GL_PACK_ALIGNMENT, 4);
+ #ifdef __vita__
+     long long prof_t0 = PC_VitaProfNow();
+-    if (t == &m_base && m_basePtr) {
++    if (t->ptr) {
+         /* as ReadPixels: vitaGL's glReadPixels would take the rows from the far end */
++        size_t stride = (size_t)((t->pw + 7) & ~7) * 4;
+         glFinish();
+         for (int j = 0; j < sh; j++)
+-            memcpy(out + (size_t)j * sw, m_basePtr + ((size_t)(py0 + j) * VRAM_W + px0) * 4,
++            memcpy(out + (size_t)j * sw, t->ptr + (size_t)(py0 + j) * stride + (size_t)px0 * 4,
+                    (size_t)sw * 4);
+     } else
+         glReadPixels(px0, py0, sw, sh, GL_RGBA, GL_UNSIGNED_BYTE, out);
+@@ -2751,6 +2778,11 @@ void GlGpu::PictureRect(int w, int rw, int *r) const
+         dw = (int)(m_outH * a + 0.5);
+     else
+         dh = (int)(m_outW / a + 0.5);
++#ifdef __vita__
++    /* a whole number of 8 pixels: the surface's texture rows are then its width (RenderTarget.ptr)
++     * and it is shown 1:1 (4:3 at 544 rows: 728, not 725) */
++    dw = (dw + 4) & ~7;
++#endif
+     if (dw > m_outW)
+         dw = m_outW;
+     if (dh > m_outH)
+diff --git a/platform/pc/src/pc_render3d.cpp b/platform/pc/src/pc_render3d.cpp
+index 3d6bae9..7dc39bd 100644
+--- a/platform/pc/src/pc_render3d.cpp
++++ b/platform/pc/src/pc_render3d.cpp
+@@ -1206,123 +1206,30 @@ bool Renderer3D::ShadowMap(const ShadowSet *s, GlShadow *out)
+ /* ---------------------------------------------------------------------------------------------
+  * Drawing, while PC_DrawOT walks the ordering table */
+ 
+-namespace {
+-
+-/* a screen position's cell column (row: limit 31) */
+-int GridCell(float p, int limit)
+-{
+-    return p < 0 ? 0 : p >= (float)(limit * 16 + 15) ? limit : (int)(p / 16);
+-}
+-
+-} // namespace
+-
+-/* cells x0..x1, y0..y1 (inclusive) at depths lo..hi, into m_span */
+-void Renderer3D::SpanBox(int x0, int y0, int x1, int y1, float lo, float hi)
++/* The 16x16 cells of DrawUpto's grid a face covers on screen (x0, y0, x1, y1, inclusive): all of
++ * them for a face that reaches the near plane or isn't in view space */
++void Renderer3D::FaceCells(const Batch *b, const Face *f, int c[4]) const
+ {
+-    for (int cy = y0; cy <= y1; cy++)
+-        for (int cx = x0; cx <= x1; cx++)
+-            m_span[m_nspan++] = CellZ{ (uint16_t)(cy * 64 + cx), lo, hi };
+-}
+-
+-/* The cells of DrawUpto's grid a face covers on screen and its depth range in each (m_span): per
+- * triangle, the cells its outline reaches (a cell, widened by a pixel, against the triangle's
+- * edges), at the depths its plane has over the part of the cell inside the triangle's box (1/z is
+- * linear on the screen, so the box's corners bound it), within the triangle's corners' range. A
+- * face that reaches the near plane or isn't in view space has every cell at its whole range; one
+- * in a single cell, or with THPS_R3D_EXACT=0, its box at its whole range. */
+-void Renderer3D::FaceSpans(const Batch *b, const Face *f)
+-{
+-    static constexpr int kMaxNv = 24;
+     const GlVert *v = &b->sv[f->first];
+-    float near = b->hither > 1 ? b->hither : 1;
+-    float sx[kMaxNv], sy[kMaxNv], x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+-    m_nspan = 0;
+-    if (!f->nv || f->nv > kMaxNv) {
+-        SpanBox(0, 0, 63, 31, f->zmin, f->zmax);
++    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f, near = b->hither > 1 ? b->hither : 1;
++    c[0] = c[1] = 0;
++    c[2] = 63;
++    c[3] = 31;
++    if (!f->nv)
+         return;
+-    }
+     for (int k = 0; k < f->nv; k++) {
+-        if (!(v[k].info & PC_GL_I_VIEW) || v[k].z < near) {
+-            SpanBox(0, 0, 63, 31, f->zmin, f->zmax);
++        if (!(v[k].info & PC_GL_I_VIEW) || v[k].z < near)
+             return;
+-        }
+-        float r = b->h / v[k].z;
+-        sx[k] = b->ofx + v[k].x * r;
+-        sy[k] = b->ofy + v[k].y * r;
+-        x0 = fminf(x0, sx[k]);
+-        y0 = fminf(y0, sy[k]);
+-        x1 = fmaxf(x1, sx[k]);
+-        y1 = fmaxf(y1, sy[k]);
+-    }
+-    int c0 = GridCell(x0, 63), c1 = GridCell(y0, 31), c2 = GridCell(x1, 63), c3 = GridCell(y1, 31);
+-    if (!m_exact || f->nv % 3 || (c0 == c2 && c1 == c3)) {
+-        SpanBox(c0, c1, c2, c3, f->zmin, f->zmax);
+-        return;
+-    }
+-    for (int t = 0; t + 2 < f->nv; t += 3) {
+-        const float px[3] = { sx[t], sx[t + 1], sx[t + 2] }, py[3] = { sy[t], sy[t + 1], sy[t + 2] };
+-        const float w[3] = { 1 / v[t].z, 1 / v[t + 1].z, 1 / v[t + 2].z };
+-        float zlo = fminf(v[t].z, fminf(v[t + 1].z, v[t + 2].z));
+-        float zhi = fmaxf(v[t].z, fmaxf(v[t + 1].z, v[t + 2].z));
+-        float bx0 = fminf(px[0], fminf(px[1], px[2])), bx1 = fmaxf(px[0], fmaxf(px[1], px[2]));
+-        float by0 = fminf(py[0], fminf(py[1], py[2])), by1 = fmaxf(py[0], fmaxf(py[1], py[2]));
+-        int t0 = GridCell(bx0 - 1, 63), t1 = GridCell(by0 - 1, 31);
+-        int t2 = GridCell(bx1 + 1, 63), t3 = GridCell(by1 + 1, 31);
+-        float ex1 = px[1] - px[0], ey1 = py[1] - py[0], ex2 = px[2] - px[0], ey2 = py[2] - py[0];
+-        float det = ex1 * ey2 - ex2 * ey1;
+-        if (m_nspan + (t2 - t0 + 1) * (t3 - t1 + 1) > kSpans) {
+-            m_nspan = 0;
+-            SpanBox(c0, c1, c2, c3, f->zmin, f->zmax);
+-            return;
+-        }
+-        if (fabsf(det) < 1) {
+-            /* edge-on (less than a pixel of area): its box at its range */
+-            SpanBox(t0, t1, t2, t3, zlo, zhi);
+-            continue;
+-        }
+-        /* w = 1/z = A x + B y + C */
+-        float dw1 = w[1] - w[0], dw2 = w[2] - w[0];
+-        float A = (dw1 * ey2 - dw2 * ey1) / det, B = (ex1 * dw2 - ex2 * dw1) / det;
+-        float C = w[0] - A * px[0] - B * py[0];
+-        float sg = det > 0 ? 1.0f : -1.0f;
+-        for (int cy = t1; cy <= t3; cy++) {
+-            float ry0 = (float)(cy * 16) - 1, ry1 = (float)(cy * 16 + 16) + 1;
+-            for (int cx = t0; cx <= t2; cx++) {
+-                float rx0 = (float)(cx * 16) - 1, rx1 = (float)(cx * 16 + 16) + 1;
+-                /* outside an edge: all four corners of the cell on its outer side */
+-                bool out = false;
+-                for (int e = 0; e < 3 && !out; e++) {
+-                    float ax = px[e], ay = py[e], dx = px[(e + 1) % 3] - ax, dy = py[(e + 1) % 3] - ay;
+-                    float m = -1e30f;
+-                    m = fmaxf(m, sg * (dx * (ry0 - ay) - dy * (rx0 - ax)));
+-                    m = fmaxf(m, sg * (dx * (ry0 - ay) - dy * (rx1 - ax)));
+-                    m = fmaxf(m, sg * (dx * (ry1 - ay) - dy * (rx0 - ax)));
+-                    m = fmaxf(m, sg * (dx * (ry1 - ay) - dy * (rx1 - ax)));
+-                    out = m < 0;
+-                }
+-                if (out)
+-                    continue;
+-                float qx0 = fmaxf(rx0, bx0), qx1 = fminf(rx1, bx1);
+-                float qy0 = fmaxf(ry0, by0), qy1 = fminf(ry1, by1);
+-                if (qx0 > qx1)
+-                    qx0 = qx1 = (qx0 + qx1) * 0.5f;
+-                if (qy0 > qy1)
+-                    qy0 = qy1 = (qy0 + qy1) * 0.5f;
+-                float wa = A * qx0 + B * qy0 + C, wb = A * qx1 + B * qy0 + C;
+-                float wc = A * qx0 + B * qy1 + C, wd = A * qx1 + B * qy1 + C;
+-                float wmin = fminf(fminf(wa, wb), fminf(wc, wd));
+-                float wmax = fmaxf(fmaxf(wa, wb), fmaxf(wc, wd));
+-                float lo = wmax > 0 ? fmaxf(zlo, 1 / wmax) : zlo;
+-                float hi = wmin > 0 ? fminf(zhi, 1 / wmin) : zhi;
+-                if (lo > hi) {
+-                    lo = zlo;
+-                    hi = zhi;
+-                }
+-                /* the float maths' error, towards the safe side */
+-                m_span[m_nspan++] = CellZ{ (uint16_t)(cy * 64 + cx), lo - lo / 1024, hi + hi / 1024 };
+-            }
+-        }
++        float r = b->h / v[k].z, x = b->ofx + v[k].x * r, y = b->ofy + v[k].y * r;
++        x0 = fminf(x0, x);
++        y0 = fminf(y0, y);
++        x1 = fmaxf(x1, x);
++        y1 = fmaxf(y1, y);
+     }
++    c[0] = x0 < 0 ? 0 : x0 >= 1023 ? 63 : (int)(x0 / 16);
++    c[1] = y0 < 0 ? 0 : y0 >= 511 ? 31 : (int)(y0 / 16);
++    c[2] = x1 < 0 ? 0 : x1 >= 1023 ? 63 : (int)(x1 / 16);
++    c[3] = y1 < 0 ? 0 : y1 >= 511 ? 31 : (int)(y1 / 16);
+ }
+ 
+ /* Faces go to the GPU in the PS1's painter order, in draws of one class. Within a draw, colour is
+@@ -1332,8 +1239,7 @@ void Renderer3D::FaceSpans(const Batch *b, const Face *f)
+  * z - (z/256 + 2)); otherwise a new draw starts and the face is depth-tested against them. Order
+  * alone would repeat the PS1's sorting errors (objects showing through walls and floors whose
+  * far corner is further away). The test was once for the whole screen: 300-600 draws a frame
+- * in a level, each costly in vitaGL; now per 16x16 cell of a screen grid, with each face's
+- * depth in that cell (FaceSpans) rather than over all of it. */
++ * in a level, each costly in vitaGL; now per 16x16 cell of a screen grid. */
+ void Renderer3D::DrawUpto(uint32_t bucket, int last)
+ {
+     Batch *b = m_layer;
+@@ -1361,29 +1267,26 @@ void Renderer3D::DrawUpto(uint32_t bucket, int last)
+                 why = f->cls != cls ? PC_GL_SPLIT_CLASS : PC_GL_SPLIT_TEXTURE;
+                 break;
+             }
+-            int hit = 0;
+-            FaceSpans(b, f);
+-            for (int s = 0; s < m_nspan; s++) {
+-                const CellZ &c = m_span[s];
+-                int cy = c.cell >> 6, cx = c.cell & 63;
+-                if (m_gridGen[cy][cx] == m_gridCur && m_gridZ[cy][cx] < c.hi - (c.hi / 256 + 2)) {
+-                    hit = 1;
+-                    break;
+-                }
+-            }
++            int c[4], hit = 0;
++            float behind = f->zmax - (f->zmax / 256 + 2);
++            FaceCells(b, f, c);
++            for (int cy = c[1]; cy <= c[3] && !hit; cy++)
++                for (int cx = c[0]; cx <= c[2]; cx++)
++                    if (m_gridGen[cy][cx] == m_gridCur && m_gridZ[cy][cx] < behind) {
++                        hit = 1;
++                        break;
++                    }
+             if (hit) {
+                 why = PC_GL_SPLIT_DEPTH;
+                 break;
+             }
+             if (cls == 0)
+-                for (int s = 0; s < m_nspan; s++) {
+-                    const CellZ &c = m_span[s];
+-                    int cy = c.cell >> 6, cx = c.cell & 63;
+-                    if (m_gridGen[cy][cx] != m_gridCur || c.lo < m_gridZ[cy][cx]) {
+-                        m_gridGen[cy][cx] = m_gridCur;
+-                        m_gridZ[cy][cx] = c.lo;
+-                    }
+-                }
++                for (int cy = c[1]; cy <= c[3]; cy++)
++                    for (int cx = c[0]; cx <= c[2]; cx++)
++                        if (m_gridGen[cy][cx] != m_gridCur || f->zmin < m_gridZ[cy][cx]) {
++                            m_gridGen[cy][cx] = m_gridCur;
++                            m_gridZ[cy][cx] = f->zmin;
++                        }
+             count += f->nv;
+         }
+         g_glGpu.LayerDraw(first, count, cls, hd, !(last && j == b->nf), why);
+@@ -1524,16 +1427,25 @@ void Renderer3D::StatsTick()
+ void Renderer3D::Init(int gl)
+ {
+     const char *e = getenv("THPS_RENDER3D");
++#ifdef __vita__
++    /* the PS1 path at the screen's resolution unless asked: the native renderer's draws cost
++     * the Vita's CPU more than the PS1 path does (t15, t16) */
++    m_native = gl && e && strcmp(e, "native") == 0;
++#else
+     m_native = gl && !(e && strcmp(e, "psx") == 0);
++#endif
+     m_showStats = getenv("THPS_R3DSTATS") && atoi(getenv("THPS_R3DSTATS"));
+     m_verify = getenv("THPS_R3D_VERIFY") && atoi(getenv("THPS_R3D_VERIFY"));
+     m_nearDrop = getenv("THPS_R3D_NEARDROP") && atoi(getenv("THPS_R3D_NEARDROP"));
+     m_retailFade = getenv("THPS_R3D_RETAILFADE") && atoi(getenv("THPS_R3D_RETAILFADE"));
+     m_nclip = getenv("THPS_R3D_NCLIP") && atoi(getenv("THPS_R3D_NCLIP"));
+-    m_exact = !(getenv("THPS_R3D_EXACT") && getenv("THPS_R3D_EXACT")[0] == '0');
+     if (m_native)
+         g_precise.Enable(true);
++#ifdef __vita__
++    fprintf(stderr, "[r3d] 3D: %s\n", m_native ? "native (THPS_RENDER3D=native)" : "PS1 (default)");
++#else
+     fprintf(stderr, "[r3d] 3D: %s\n", m_native ? "native" : "PS1 (THPS_RENDER3D=psx)");
++#endif
+ }
+ 
+ } // namespace pc
+diff --git a/platform/pc/src/pc_vita.cpp b/platform/pc/src/pc_vita.cpp
+index cd4e2dd..6915000 100644
+--- a/platform/pc/src/pc_vita.cpp
++++ b/platform/pc/src/pc_vita.cpp
+@@ -162,6 +162,12 @@ void PC_VitaLogOpen(void) {
+     scePowerSetBusClockFrequency(222);
+     scePowerSetGpuClockFrequency(222);
+     scePowerSetGpuXbarClockFrequency(166);
++    /* the game thread on core 0 only: with all three it was moved ~150 times a second (t16), and
++     * the stream, log and sampler threads keep to cores 1 and 2 */
++    {
++        int r = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_0);
++        fprintf(stderr, "game thread: core 0 only%s\n", r < 0 ? " (refused)" : "");
++    }
+     fprintf(stderr, "clocks: cpu %d MHz, bus %d, gpu %d, xbar %d\n", scePowerGetArmClockFrequency(),
+             scePowerGetBusClockFrequency(), scePowerGetGpuClockFrequency(),
+             scePowerGetGpuXbarClockFrequency());
+-- 
+2.53.0
+

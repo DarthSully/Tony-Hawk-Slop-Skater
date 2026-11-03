@@ -1,0 +1,924 @@
+From 4e19cf21f6b87f57d34e5ba741eda091b03a8e2c Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Tue, 27 Oct 2026 10:58:01 +0300
+Subject: [PATCH] Vita: a boot self-test of every texture path (fixing or
+ dropping what isn't exact), game code at -O2 without per-call instrumentation
+
+t13 put the texture cache's atlas in memory of our own and checked it every frame. The checks
+were clean for a whole run (0 stale slots, 0 descriptors pointed back), yet every cached texel
+was still drawn from 6 to its left: the slots held the right texels where the descriptor
+pointed, and the GPU read them shifted. The renderer now measures this at boot instead of
+guessing.
+
+The self-test (THPS_GL_SELFTEST=0 skips it) uploads a 16-bit test page whose every texel's colour
+spells its u and row. It draws it through every way a draw reads a texture, as the game draws:
+the emulated lookup on the store's texture, the cache at slots in the atlas's corners and middle,
+a blit (copy program, pool texture) and a movie picture (present program, pool texture). It reads
+each row back from the base target, with a flat white pixel after each as the read-back's own
+reference, and logs what the GPU returned ("[gl] self-test: ..." lines). Anything not exact is
+fixed or dropped before the game draws:
+- The cache tries the other atlas shape (2048x4096, the same 128 slots).
+- If both shapes are off, it undoes the shift they share, first in the descriptor's address,
+  then in the shader (u_atlasFix).
+- If none of that is exact, the cache turns off.
+- The store's own copies give way to vitaGL's texture.
+- The blit and movie-picture pools give way to vitaGL's copies.
+The atlas's shape and correction are now shader uniforms (u_atlasCols, u_atlasScale,
+u_atlasFix) instead of constants.
+
+Speed: in t13's slow scenes a level frame was ~35 ms of CPU (swap under 7 ms). The game code is
+now built at -O2 (THPS_VITA_OPT=1 gives -O1 again), without identical-code folding (function
+pointers the game compares stay distinct) or the vectoriser. -finstrument-functions, two calls
+more on every game call for the stall sampler, is only built with THPS_VITA_INSTRUMENT=1; without
+it the profile has no [stall-fn] or [stall-top] lines.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ platform/pc/include/pc/gl_gpu.h          |  37 +-
+ platform/pc/include/pc/gl_shaders_gles.h |  29 +-
+ platform/pc/src/pc_gpu_gl.cpp            | 466 +++++++++++++++++++++--
+ platform/pc/src/pc_vita.cpp              |  18 +-
+ platform/pc/tools/build.py               |  13 +-
+ 5 files changed, 516 insertions(+), 47 deletions(-)
+
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index d1a0038..b4cda5f 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -313,7 +313,10 @@ class GlGpu {
+         int x, y, w;         /* its texels in VRAM (halfwords) */
+         int cx, cy, cw;      /* its CLUT (cw 0: 15-bit, none) */
+     };
+-    static constexpr int kCacheSlots = 128, kAtlasW = 4096, kAtlasH = 2048, kAtlasUnit = 4;
++    static constexpr int kCacheSlots = 128, kAtlasUnit = 4;
++    /* the atlas: 16x8 slots of 256x256, or 8x16 (the boot self-test, SelfTest) */
++    int m_atlasW = 4096, m_atlasH = 2048, m_atlasCols = 16;
++    float m_atlasFix[2] = {};   /* texels added to atlas positions (the self-test's correction) */
+     /* new pages decoded a frame at most; the rest keep the emulated lookup a frame or two (a
+      * level's first frame wanted 89 at once: 0.77 s) */
+     static constexpr int kDecodesPerFrame = 8;
+@@ -344,6 +347,10 @@ class GlGpu {
+     void CacheRefresh();
+     /* row y of a slot's texels, decoded from the store into out (256 RGBA texels) */
+     void DecodeRow(const CacheSlot &c, int y, uint32_t *out);
++    /* a slot's page from its key: its texels and CLUT in VRAM, drawn this frame */
++    void SlotFill(CacheSlot &c, uint64_t key);
++    /* the atlas's shape and correction to the draw programs' uniforms */
++    void AtlasUniforms();
+ #ifdef __vita__
+     /* rows of the decoded slots checked against a fresh decode, a few each frame (CacheCheck) */
+     int m_checkSlot = 0, m_checkRow = 0, m_warnedStale = 0;
+@@ -352,7 +359,8 @@ class GlGpu {
+     uint32_t *AtlasRow(int s, int y)
+     {
+         return (uint32_t *)(m_atlasPtr +
+-                            (((size_t)(s / 16) * 256 + y) * kAtlasW + (size_t)(s % 16) * 256) * 4);
++                            (((size_t)(s / m_atlasCols) * 256 + y) * m_atlasW +
++                             (size_t)(s % m_atlasCols) * 256) * 4);
+     }
+ #endif
+ #ifdef __vita__
+@@ -371,8 +379,9 @@ class GlGpu {
+         uint8_t *ptr;    /* its texels: linear rows of align(w, 8) texels */
+         uint32_t used;   /* m_frameNo when last drawn with (0: never) */
+         int w, h;
+-        SceGxmTexture *gxm;   /* vitaGL's descriptor of tex, pointed at ptr */
++        SceGxmTexture *gxm;   /* vitaGL's descriptor of tex, pointed at ptr + bias */
+         void *block;          /* the vglAlloc block ptr is in */
++        int bias;             /* bytes the descriptor's address is past ptr (the self-test's fix) */
+     };
+     InPlace m_store[kStoreVersions] = {};   /* the store's copies (THPS_GL_INPLACE=0: m_texstore) */
+     uint32_t m_storeGen[kStoreVersions][CELLS_Y * CELLS_X] = {};
+@@ -391,10 +400,30 @@ class GlGpu {
+     /* a texture of fmt (bpp bytes a texel), w x h, whose texels are a 4 KB-aligned block of
+      * vitaGL's graphics memory (vitaGL keeps an 8x8 placeholder); 0 without the memory */
+     int OwnTexture(InPlace *t, GLenum fmt, int bpp, int w, int h);
+-    void FreeOwn(InPlace *t);
++    /* now: the GPU is done with it (glFinish), freed at once */
++    void FreeOwn(InPlace *t, int now = 0);
+     /* each frame: a descriptor no longer pointing at its texels is pointed back (logged) */
+     void OwnCheck();
+     void OwnFix(InPlace *t, const char *what);
++    /* the boot self-test (pc_gpu_gl.cpp, SelfTest) */
++    struct TestResult {
++        int shift, agree;   /* the commonest texel shift (shown - meant), and its pixels of 256 */
++        int row;            /* the commonest page-row shift */
++        int ref;            /* the white reference pixel's place less 256 (-999: not found) */
++    };
++    int m_poolBlits = 1, m_poolImages = 1;   /* the self-test may drop the pools */
++    void SelfTest();
++    void TestClear(int y);
++    void TestWhite(int y);
++    void TestSprite(int y, int r);
++    void TestPicture(GLuint tex, float u1, float v1, int y);
++    TestResult TestRow(int y, int r);
++    TestResult TestSlot(int s, int y, int r);
++    int TestCache(int y, int *shift, char *out, int n);
++    int CacheCorrect(int shift);
++    int AtlasLayout(int w, int h);
++    static int TestExact(const TestResult &t);
++    static const char *TestText(const TestResult &t, char *buf, int n);
+ #endif
+ #endif
+     GLuint m_dispTex = 0;                  /* RGBA8 1024x512: pictures shown instead (movies) */
+diff --git a/platform/pc/include/pc/gl_shaders_gles.h b/platform/pc/include/pc/gl_shaders_gles.h
+index 4edd02d..9bf9cd6 100644
+--- a/platform/pc/include/pc/gl_shaders_gles.h
++++ b/platform/pc/include/pc/gl_shaders_gles.h
+@@ -47,6 +47,7 @@ static const char *gl_draw_vs =
+     "uniform float u_dpass;\n"
+     "uniform vec4 u_proj;\n"
+     "uniform vec4 u_target;\n"    /* the VRAM area drawn on: x, y, w, h */
++    "uniform float u_atlasCols;\n"    /* the texture cache's atlas: slots a row (16 or 8) */
+     /* n bits of v from bit lo (v a whole number below 2^24) */
+     "float bits(float v, float lo, float n) { return mod(floor(v / exp2(lo)), exp2(n)); }\n"
+     /* clip z for view depth w: a projective depth from the near plane to PC_GLES_FAR, its view
+@@ -86,8 +87,8 @@ static const char *gl_draw_vs =
+      * origin instead of the CLUT */
+     "    float cached = bits(a_tex.x, 15.0, 1.0), slot = bits(a_tex.x, 0.0, 7.0);\n"
+     "    v_page = vec4(bits(info, 0.0, 4.0) * 64.0, bits(info, 4.0, 1.0) * 256.0,\n"
+-    "                  cached > 0.5 ? mod(slot, 16.0) * 256.0 : bits(a_tex.x, 0.0, 6.0) * 16.0,\n"
+-    "                  cached > 0.5 ? floor(slot / 16.0) * 256.0 : bits(a_tex.x, 6.0, 9.0));\n"
++    "                  cached > 0.5 ? mod(slot, u_atlasCols) * 256.0 : bits(a_tex.x, 0.0, 6.0) * 16.0,\n"
++    "                  cached > 0.5 ? floor(slot / u_atlasCols) * 256.0 : bits(a_tex.x, 6.0, 9.0));\n"
+     "    v_mode = vec4(bits(info, 7.0, 2.0), bits(info, 5.0, 2.0), bits(info, 9.0, 1.0),\n"
+     "                  bits(info, 10.0, 1.0));\n"
+     "    v_flags = vec4(bits(info, 11.0, 1.0), view ? 1.0 : 0.0, cached, 0.0);\n"
+@@ -132,6 +133,8 @@ static const char *gl_draw_fs =
+     "uniform sampler2D u_vram;\n"
+     "uniform sampler2D u_hd;\n"
+     "uniform sampler2D u_atlas;\n"
++    "uniform vec2 u_atlasScale;\n"    /* 1 / the atlas's size */
++    "uniform vec2 u_atlasFix;\n"      /* texels added to an atlas position (the boot self-test) */
+     "uniform float u_pass;\n"
+     /* the texture store's 16-bit texel at x, y (wrapping as VRAM does): its low and high bytes */
+     "vec2 vram(float x, float y) {\n"
+@@ -175,7 +178,7 @@ static const char *gl_draw_fs =
+     "    } else if (mode.z > 0.5 && v_flags.z > 0.5) {\n"
+     "        float u = window(pmod(floor(uv.x), 256.0), tw.x, tw.z);\n"
+     "        float v = window(pmod(floor(uv.y), 256.0), tw.y, tw.w);\n"
+-    "        vec4 ta = texture2D(u_atlas, (page.zw + vec2(u, v) + 0.5) / vec2(4096.0, 2048.0));\n"
++    "        vec4 ta = texture2D(u_atlas, (page.zw + vec2(u, v) + 0.5 + u_atlasFix) * u_atlasScale);\n"
+     "        if (ta.a < 0.25) discard;\n"
+     "        c = mode.w > 0.5 ? ta.rgb : min(ta.rgb * v_color * (255.0 / 128.0), vec3(1.0));\n"
+     "        blend = semi && ta.a < 0.75;\n"
+@@ -229,6 +232,8 @@ static const char *gl_draw_fast_fs =
+     "uniform sampler2D u_vram;\n"
+     "uniform sampler2D u_hd;\n"
+     "uniform sampler2D u_atlas;\n"
++    "uniform vec2 u_atlasScale;\n"    /* 1 / the atlas's size */
++    "uniform vec2 u_atlasFix;\n"      /* texels added to an atlas position (the boot self-test) */
+     "uniform float u_pass;\n"
+     /* the texture store's 16-bit texel at x, y (wrapping as VRAM does): its low and high bytes */
+     "vec2 vram(float x, float y) {\n"
+@@ -272,7 +277,7 @@ static const char *gl_draw_fast_fs =
+     "    } else if (mode.z > 0.5 && v_flags.z > 0.5) {\n"
+     "        float u = pmod(floor(uv.x), 256.0);\n"
+     "        float v = pmod(floor(uv.y), 256.0);\n"
+-    "        vec4 ta = texture2D(u_atlas, (page.zw + vec2(u, v) + 0.5) / vec2(4096.0, 2048.0));\n"
++    "        vec4 ta = texture2D(u_atlas, (page.zw + vec2(u, v) + 0.5 + u_atlasFix) * u_atlasScale);\n"
+     "        if (ta.a < 0.25) discard;\n"
+     "        c = mode.w > 0.5 ? ta.rgb : min(ta.rgb * v_color * (255.0 / 128.0), vec3(1.0));\n"
+     "        blend = semi && ta.a < 0.75;\n"
+@@ -305,6 +310,8 @@ static const char *gl_draw_fast_fs1 =
+     "uniform sampler2D u_vram;\n"
+     "uniform sampler2D u_hd;\n"
+     "uniform sampler2D u_atlas;\n"
++    "uniform vec2 u_atlasScale;\n"    /* 1 / the atlas's size */
++    "uniform vec2 u_atlasFix;\n"      /* texels added to an atlas position (the boot self-test) */
+     "uniform float u_pass;\n"
+     /* the texture store's 16-bit texel at x, y (wrapping as VRAM does): its low and high bytes */
+     "vec2 vram(float x, float y) {\n"
+@@ -348,7 +355,7 @@ static const char *gl_draw_fast_fs1 =
+     "    } else if (mode.z > 0.5 && v_flags.z > 0.5) {\n"
+     "        float u = pmod(floor(uv.x), 256.0);\n"
+     "        float v = pmod(floor(uv.y), 256.0);\n"
+-    "        vec4 ta = texture2D(u_atlas, (page.zw + vec2(u, v) + 0.5) / vec2(4096.0, 2048.0));\n"
++    "        vec4 ta = texture2D(u_atlas, (page.zw + vec2(u, v) + 0.5 + u_atlasFix) * u_atlasScale);\n"
+     "        if (ta.a < 0.25) discard;\n"
+     "        c = mode.w > 0.5 ? ta.rgb : min(ta.rgb * v_color * (255.0 / 128.0), vec3(1.0));\n"
+     "        blend = semi && ta.a < 0.75;\n"
+@@ -379,6 +386,8 @@ static const char *gl_draw_fast_fs2 =
+     "uniform sampler2D u_vram;\n"
+     "uniform sampler2D u_hd;\n"
+     "uniform sampler2D u_atlas;\n"
++    "uniform vec2 u_atlasScale;\n"    /* 1 / the atlas's size */
++    "uniform vec2 u_atlasFix;\n"      /* texels added to an atlas position (the boot self-test) */
+     "uniform float u_pass;\n"
+     /* the texture store's 16-bit texel at x, y (wrapping as VRAM does): its low and high bytes */
+     "vec2 vram(float x, float y) {\n"
+@@ -422,7 +431,7 @@ static const char *gl_draw_fast_fs2 =
+     "    } else if (mode.z > 0.5 && v_flags.z > 0.5) {\n"
+     "        float u = window(pmod(floor(uv.x), 256.0), tw.x, tw.z);\n"
+     "        float v = window(pmod(floor(uv.y), 256.0), tw.y, tw.w);\n"
+-    "        vec4 ta = texture2D(u_atlas, (page.zw + vec2(u, v) + 0.5) / vec2(4096.0, 2048.0));\n"
++    "        vec4 ta = texture2D(u_atlas, (page.zw + vec2(u, v) + 0.5 + u_atlasFix) * u_atlasScale);\n"
+     "        c = mode.w > 0.5 ? ta.rgb : min(ta.rgb * v_color * (255.0 / 128.0), vec3(1.0));\n"
+     "        blend = semi && ta.a < 0.75;\n"
+     "    }\n"
+@@ -452,6 +461,8 @@ static const char *gl_draw_fast_fs3 =
+     "uniform sampler2D u_vram;\n"
+     "uniform sampler2D u_hd;\n"
+     "uniform sampler2D u_atlas;\n"
++    "uniform vec2 u_atlasScale;\n"    /* 1 / the atlas's size */
++    "uniform vec2 u_atlasFix;\n"      /* texels added to an atlas position (the boot self-test) */
+     "uniform float u_pass;\n"
+     /* the texture store's 16-bit texel at x, y (wrapping as VRAM does): its low and high bytes */
+     "vec2 vram(float x, float y) {\n"
+@@ -495,7 +506,7 @@ static const char *gl_draw_fast_fs3 =
+     "    } else if (mode.z > 0.5 && v_flags.z > 0.5) {\n"
+     "        float u = window(pmod(floor(uv.x), 256.0), tw.x, tw.z);\n"
+     "        float v = window(pmod(floor(uv.y), 256.0), tw.y, tw.w);\n"
+-    "        vec4 ta = texture2D(u_atlas, (page.zw + 128.5) / vec2(4096.0, 2048.0));\n"
++    "        vec4 ta = texture2D(u_atlas, (page.zw + 128.5 + u_atlasFix) * u_atlasScale);\n"
+     "        if (ta.a < 0.25) discard;\n"
+     "        c = mode.w > 0.5 ? ta.rgb : min(ta.rgb * v_color * (255.0 / 128.0), vec3(1.0));\n"
+     "        blend = semi && ta.a < 0.75;\n"
+@@ -526,6 +537,8 @@ static const char *gl_draw_fast_fs4 =
+     "uniform sampler2D u_vram;\n"
+     "uniform sampler2D u_hd;\n"
+     "uniform sampler2D u_atlas;\n"
++    "uniform vec2 u_atlasScale;\n"    /* 1 / the atlas's size */
++    "uniform vec2 u_atlasFix;\n"      /* texels added to an atlas position (the boot self-test) */
+     "uniform float u_pass;\n"
+     /* the texture store's 16-bit texel at x, y (wrapping as VRAM does): its low and high bytes */
+     "vec2 vram(float x, float y) {\n"
+@@ -569,7 +582,7 @@ static const char *gl_draw_fast_fs4 =
+     "    } else if (mode.z > 0.5 && v_flags.z > 0.5) {\n"
+     "        float u = pmod(floor(uv.x), 256.0);\n"
+     "        float v = pmod(floor(uv.y), 256.0);\n"
+-    "        vec4 ta = texture2D(u_atlas, (page.zw + vec2(u, v) + 0.5) / vec2(4096.0, 2048.0));\n"
++    "        vec4 ta = texture2D(u_atlas, (page.zw + vec2(u, v) + 0.5 + u_atlasFix) * u_atlasScale);\n"
+     "        c = mode.w > 0.5 ? ta.rgb : min(ta.rgb * v_color * (255.0 / 128.0), vec3(1.0));\n"
+     "        blend = semi && ta.a < 0.75;\n"
+     "    }\n"
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index a1d647e..605e20b 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -271,6 +271,21 @@ void Put(GVert *o, const GlPrim *p, uint16_t info, float x, float y, uint8_t r,
+     o->uvr[2] = o->uvr[3] = 255;
+ }
+ 
++/* the texture cache's key for a textured triangle (CacheSlot.key), from its first vertex; 0 for
++ * an untextured one or an HD texture (which has its own) */
++uint64_t SlotKey(const GVert &v)
++{
++    uint16_t info = v.info;
++    uint32_t depth = (info >> 7) & 3;
++    if (!(info & I_TEXTURED) || depth == 3)
++        return 0;
++    uint32_t clut = depth == 2 ? 0 : (uint32_t)(v.clut & 0x7fff);
++    uint32_t win = (uint32_t)v.tw[0] | (uint32_t)v.tw[1] << 8 | (uint32_t)v.tw[2] << 16 |
++                   (uint32_t)v.tw[3] << 24;
++    return (1u | depth << 1 | (uint32_t)(info & 15) << 3 | (uint32_t)((info >> 4) & 1) << 7 |
++            clut << 8) | (uint64_t)win << 32;
++}
++
+ /* The texels the PS1 samples on a triangle with whole-pixel corners: its texture coordinates at
+  * the first and last pixel corners it covers (x0..x1-1, y0..y1-1), rounded, and never past its
+  * vertices'. Scaled up, pixel centres also land between the PS1's last corner and the edge, which
+@@ -597,7 +612,7 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+          * was 24 bytes past where the GPU read them: every cached texel was drawn from 6 texels to
+          * its left (t12's menus: cut letters, bits of the glyph or page beside them, the background
+          * redrawn 6 pixels over) */
+-        if (OwnTexture(&m_atlasTex, GL_RGBA, 4, kAtlasW, kAtlasH)) {
++        if (OwnTexture(&m_atlasTex, GL_RGBA, 4, m_atlasW, m_atlasH)) {
+             m_atlas = m_atlasTex.tex;
+             m_atlasPtr = m_atlasTex.ptr;
+         } else {
+@@ -607,7 +622,8 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+ #else
+         glGenTextures(1, &m_atlas);
+         glBindTexture(GL_TEXTURE_2D, m_atlas);
+-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kAtlasW, kAtlasH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, m_atlasW, m_atlasH, 0, GL_RGBA, GL_UNSIGNED_BYTE,
++                     NULL);
+ #endif
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+@@ -646,6 +662,7 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+             glUseProgram(m_drawProg);
+         }
+     }
++    AtlasUniforms();
+     fprintf(stderr, "[gl] texture cache: %s%s\n",
+             m_cacheOn ? "on (128 pages of 256x256, THPS_GL_TEXCACHE=0 turns it off)" : "off",
+             m_cacheOn && !m_drawProgFast ? ", no fast program" : "");
+@@ -767,6 +784,13 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+     else
+         fprintf(stderr, "[gl] OpenGL renderer: %s, screens at %dx%d\n",
+                 (const char *)glGetString(GL_RENDERER), m_outW, m_outH);
++#ifdef __vita__
++    {
++        const char *st = getenv("THPS_GL_SELFTEST");
++        if (!(st && st[0] == '0'))
++            SelfTest();
++    }
++#endif
+     return 0;
+ }
+ 
+@@ -1027,12 +1051,16 @@ int GlGpu::OwnTexture(InPlace *t, GLenum fmt, int bpp, int w, int h)
+     return 1;
+ }
+ 
+-void GlGpu::FreeOwn(InPlace *t)
++void GlGpu::FreeOwn(InPlace *t, int now)
+ {
+     if (t->tex)
+         glDeleteTextures(1, &t->tex);   /* vitaGL frees its placeholder */
+-    if (t->block)
+-        vglLazyFree(t->block);          /* once the GPU is done with it */
++    if (t->block) {
++        if (now)
++            vglFree(t->block);
++        else
++            vglLazyFree(t->block);      /* once the GPU is done with it */
++    }
+     *t = InPlace{};
+ }
+ 
+@@ -1040,16 +1068,17 @@ void GlGpu::FreeOwn(InPlace *t)
+  * pointed back at the texels, logged and counted */
+ void GlGpu::OwnFix(InPlace *t, const char *what)
+ {
+-    if (!t->gxm || (sceGxmTextureGetData(t->gxm) == t->ptr && (int)sceGxmTextureGetWidth(t->gxm) == t->w &&
++    if (!t->gxm || (sceGxmTextureGetData(t->gxm) == t->ptr + t->bias &&
++                    (int)sceGxmTextureGetWidth(t->gxm) == t->w &&
+                     (int)sceGxmTextureGetHeight(t->gxm) == t->h))
+         return;
+     if (m_warnedOwn < 8) {
+         m_warnedOwn++;
+         fprintf(stderr, "[gl] %s's descriptor changed (texels %p, %ux%u): pointed back at %p\n", what,
+                 sceGxmTextureGetData(t->gxm), sceGxmTextureGetWidth(t->gxm),
+-                sceGxmTextureGetHeight(t->gxm), (void *)t->ptr);
++                sceGxmTextureGetHeight(t->gxm), (void *)(t->ptr + t->bias));
+     }
+-    sceGxmTextureSetData(t->gxm, t->ptr);
++    sceGxmTextureSetData(t->gxm, t->ptr + t->bias);
+     sceGxmTextureSetWidth(t->gxm, t->w);
+     sceGxmTextureSetHeight(t->gxm, t->h);
+     m_st.own_fixed++;
+@@ -1065,6 +1094,377 @@ void GlGpu::OwnCheck()
+     for (InPlace &t : m_imagePool)
+         OwnFix(&t, "a movie picture's texture");
+ }
++
++/* ---------------------------------------------------------------------------------------------
++ * The boot self-test (THPS_GL_SELFTEST=0 skips it). Known texels go through every way a draw
++ * reads a texture and the base target's pixels are read back, so the log shows what the GPU
++ * returned rather than what should be there. A test row is 256 pixels showing texels 0..255 of a
++ * 16-bit test page, each texel's colour spelling its u and page row, then a flat white pixel: the
++ * read-back's own reference. A path that isn't exact is fixed or dropped before the game draws:
++ * the texture cache tries its other atlas shape, then the shift it measured in the descriptor's
++ * address, then in the shader, else turns off; the store's own copies give way to vitaGL's
++ * texture; the blit and movie-picture pools to vitaGL's copies. (t12 and t13's menus: every cached
++ * texel came from 6 to its left, though the slots held the right texels where the descriptor
++ * pointed.) */
++
++namespace {
++constexpr int kTestPageX = 768, kTestPageY = 256;   /* a 16-bit page: its rows 0..3 hold the test */
++constexpr int kTestY = 496;                          /* VRAM rows 496..511: unused at boot, cleared */
++
++/* test texel u of page row r, 15 bits: R u & 31, G u >> 5 | r << 3, B 21 (never 0: opaque) */
++uint16_t TestTexel(int u, int r)
++{
++    return (uint16_t)((u & 31) | ((u >> 5) | r << 3) << 5 | 21 << 10);
++}
++
++/* a raw 16-bit sprite of the test page (textured), or a flat one, over all of VRAM */
++void TestPrim(GlPrim *p, int textured)
++{
++    *p = GlPrim{};
++    p->textured = textured;
++    p->raw = textured;
++    p->depth = 2;
++    p->tp_x = kTestPageX;
++    p->tp_y = kTestPageY;
++    p->tw_and_x = p->tw_and_y = 0xff;
++    p->clip_r = GlGpu::VRAM_W - 1;
++    p->clip_b = GlGpu::VRAM_H - 1;
++}
++}   // namespace
++
++int GlGpu::TestExact(const TestResult &t)
++{
++    int off = t.ref < 0 ? -t.ref : t.ref;
++    return t.ref != -999 && t.shift == 0 && t.agree >= 256 - off;
++}
++
++const char *GlGpu::TestText(const TestResult &t, char *buf, int n)
++{
++    if (TestExact(t) && !t.ref)
++        snprintf(buf, n, "exact");
++    else if (t.ref == -999)
++        snprintf(buf, n, "no reference pixel (read-back or flat drawing wrong)");
++    else
++        snprintf(buf, n, "texels %+d (%d of 256 pixels), page rows %+d, read-back %+d", t.shift,
++                 t.agree, t.row, t.ref);
++    return buf;
++}
++
++/* VRAM row y blank (a test that draws nothing mustn't find the last one's pixels) */
++void GlGpu::TestClear(int y)
++{
++    Fill(0, y, 288, 1, 0);
++}
++
++/* the flat white reference pixel at 256, y, and everything drawn */
++void GlGpu::TestWhite(int y)
++{
++    GlPrim f;
++    TestPrim(&f, 0);
++    Rect(&f, 256, y, 1, 1, 255, 255, 255, 0, 0, 0, 0);
++    Flush();
++}
++
++/* test row r at VRAM row y as the game draws a 16-bit sprite: pixel x shows texel x */
++void GlGpu::TestSprite(int y, int r)
++{
++    GlPrim p;
++    TestPrim(&p, 1);
++    TestClear(y);
++    Rect(&p, 0, y, 256, 1, 128, 128, 128, 0, r, 0, 0);
++    TestWhite(y);
++}
++
++/* a texture's texels 0..255 (u 0..u1, v 0..v1) onto VRAM row y, pixels 0..255, by the present
++ * program, as a movie picture is shown */
++void GlGpu::TestPicture(GLuint tex, float u1, float v1, int y)
++{
++    TestClear(y);
++    m_base.Use();
++    glDisable(GL_SCISSOR_TEST);
++    glDisable(GL_BLEND);
++    glDisable(GL_DEPTH_TEST);
++    float x0 = -1.0f, x1 = 2.0f * 256 / m_base.pw - 1.0f;
++    float y0 = 2.0f * y / m_base.ph - 1.0f, y1 = 2.0f * (y + 1) / m_base.ph - 1.0f;
++    float q[16] = { x0, y0, 0, 0, x1, y0, u1, 0, x0, y1, 0, v1, x1, y1, u1, v1 };
++    glUseProgram(m_presentProg);
++    glUniform1f(m_presentUAlpha, 1.0f);
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, tex);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    QuadAttribs(q, 4, 1);
++    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++}
++
++/* how VRAM row y came out after test row r was drawn there */
++GlGpu::TestResult GlGpu::TestRow(int y, int r)
++{
++    TestResult res = { 0, 0, 0, -999 };
++    uint16_t px[288];
++    Read(0, y, 288, 1, px);
++    for (int k = 224; k < 288; k++)
++        if ((px[k] & 0x7fff) == 0x7fff) {
++            res.ref = k - 256;
++            break;
++        }
++    int off = res.ref == -999 ? 0 : res.ref, shifts[64] = {}, rows[8] = {};
++    for (int k = 0; k < 256; k++) {
++        int q = px[k] & 0x7fff, g = (q >> 5) & 31;
++        if (((q >> 10) & 31) != 21)
++            continue;
++        rows[(g >> 3) - r + 4]++;
++        if ((g >> 3) != r)
++            continue;
++        int d = ((q & 31) | (g & 7) << 5) - (k - off);
++        if (d >= -32 && d < 32)
++            shifts[d + 32]++;
++    }
++    for (int d = 0; d < 64; d++)
++        if (shifts[d] > res.agree) {
++            res.agree = shifts[d];
++            res.shift = d - 32;
++        }
++    for (int d = 0, most = 0; d < 8; d++)
++        if (rows[d] > most) {
++            most = rows[d];
++            res.row = d - 4;
++        }
++    return res;
++}
++
++/* the texture cache's slot s holding the test page (decoded as a miss would be), drawn at y */
++GlGpu::TestResult GlGpu::TestSlot(int s, int y, int r)
++{
++    GlPrim p;
++    GVert v;
++    TestPrim(&p, 1);
++    Put(&v, &p, PrimInfo(&p), 0, 0, 0, 0, 0, 0, 0);
++    memset(m_slot, 0, sizeof m_slot);
++    SlotFill(m_slot[s], SlotKey(v));
++    CacheDecode(s);
++    m_lastSlot = s;
++    TestSprite(y, r);
++    TestResult res = TestRow(y, r);
++    memset(m_slot, 0, sizeof m_slot);
++    m_lastSlot = -1;
++    return res;
++}
++
++/* the cache's rows at slots in the atlas's corners and middle, from VRAM row y (5 rows): all
++ * exact? The shift they all share (else 0) in *shift, a line for the log in out */
++int GlGpu::TestCache(int y, int *shift, char *out, int n)
++{
++    int c = m_atlasCols, last = kCacheSlots - 1;
++    int slots[5] = { 0, c - 1, (kCacheSlots / c / 2) * c + c / 2, last - c + 1, last };
++    int exact = 1, same = 1, at = snprintf(out, n, "%dx%d%s:", m_atlasW, m_atlasH,
++                                           m_atlasTex.bias ? " (address fix)" :
++                                           m_atlasFix[0] ? " (shader fix)" : "");
++    *shift = 0;
++    for (int i = 0; i < 5; i++) {
++        TestResult t = TestSlot(slots[i], y + i, i & 3);
++        int ok = TestExact(t);
++        exact &= ok;
++        if (i == 0)
++            *shift = t.shift;
++        else if (t.shift != *shift)
++            same = 0;
++        if (t.agree < 240)
++            same = 0;
++        if (at < n) {
++            if (ok)
++                at += snprintf(out + at, n - at, " slot %d ok", slots[i]);
++            else
++                at += snprintf(out + at, n - at, " slot %d %+d (%d/256, rows %+d, ref %+d)", slots[i],
++                               t.shift, t.agree, t.row, t.ref);
++        }
++    }
++    if (!same || exact)
++        *shift = 0;
++    return exact;
++}
++
++/* the cache's atlas made again as w x h (16x8 or 8x16 slots), empty; 0 without the memory */
++int GlGpu::AtlasLayout(int w, int h)
++{
++    glFinish();
++    glActiveTexture(GL_TEXTURE0 + kAtlasUnit);
++    FreeOwn(&m_atlasTex, 1);
++    int ok = OwnTexture(&m_atlasTex, GL_RGBA, 4, w, h);
++    glActiveTexture(GL_TEXTURE0);
++    m_atlas = m_atlasTex.tex;
++    m_atlasPtr = m_atlasTex.ptr;
++    m_atlasW = w;
++    m_atlasH = h;
++    m_atlasCols = w / 256;
++    m_atlasFix[0] = m_atlasFix[1] = 0;
++    memset(m_slot, 0, sizeof m_slot);
++    m_lastSlot = -1;
++    AtlasUniforms();
++    return ok;
++}
++
++/* the atlas's measured texel shift undone: in the descriptor's address, else in the shader;
++ * exact? (each try logged) */
++int GlGpu::CacheCorrect(int shift)
++{
++    char line[400];
++    int sh;
++    glFinish();
++    m_atlasTex.bias = -4 * shift;
++    if (sceGxmTextureSetData(m_atlasTex.gxm, m_atlasTex.ptr + m_atlasTex.bias) >= 0) {
++        int ok = TestCache(kTestY, &sh, line, sizeof line);
++        fprintf(stderr, "[gl] self-test: texture cache %s%s\n", line, ok ? ": using it" : "");
++        if (ok)
++            return 1;
++    }
++    glFinish();
++    m_atlasTex.bias = 0;
++    sceGxmTextureSetData(m_atlasTex.gxm, m_atlasTex.ptr);
++    m_atlasFix[0] = (float)-shift;
++    AtlasUniforms();
++    int ok = TestCache(kTestY, &sh, line, sizeof line);
++    fprintf(stderr, "[gl] self-test: texture cache %s%s\n", line, ok ? ": using it" : "");
++    if (ok)
++        return 1;
++    m_atlasFix[0] = 0;
++    AtlasUniforms();
++    return 0;
++}
++
++void GlGpu::SelfTest()
++{
++    char line[400], a[160], b[160];
++    uint16_t pat[4][256], zero[4][256] = {}, row[256];
++    for (int r = 0; r < 4; r++)
++        for (int u = 0; u < 256; u++)
++            pat[r][u] = TestTexel(u, r);
++    for (int i = 0; i < 32; i++)
++        m_to8[i] = (uint8_t)((i * 255 + 15) / 31);
++    g_textureStore.Upload(kTestPageX, kTestPageY, 256, 4, pat);
++
++    /* the emulated lookup (no cache): the store's texture */
++    int cache = m_cacheOn, ys = kTestY + 5;
++    m_cacheOn = 0;
++    TestSprite(ys, 1);
++    TestResult t = TestRow(ys, 1);
++    snprintf(line, sizeof line, "texture store (%s): %s", m_nstore ? "own copies" : "vitaGL's texture",
++             TestText(t, a, sizeof a));
++    if (!TestExact(t) && m_nstore) {
++        /* vitaGL's texture instead, as with THPS_GL_INPLACE=0 */
++        glFinish();
++        for (int i = 0; i < m_nstore; i++)
++            FreeOwn(&m_store[i], 1);
++        m_nstore = 0;
++        g_textureStore.Upload(kTestPageX, kTestPageY, 256, 4, pat);
++        TestSprite(ys, 1);
++        t = TestRow(ys, 1);
++        snprintf(line + strlen(line), sizeof line - strlen(line), " -> vitaGL's texture: %s",
++                 TestText(t, b, sizeof b));
++    }
++    m_cacheOn = cache;
++    fprintf(stderr, "[gl] self-test: %s\n", line);
++
++    /* the texture cache: this atlas shape, the other, then the shift they share undone */
++    if (m_cacheOn) {
++        int sh0, sh1 = 0, w0 = m_atlasW, h0 = m_atlasH;
++        int ok = TestCache(kTestY, &sh0, line, sizeof line);
++        fprintf(stderr, "[gl] self-test: texture cache %s%s\n", line, ok ? ": using it" : "");
++        if (!ok) {
++            ok = AtlasLayout(h0, w0);
++            if (ok) {
++                ok = TestCache(kTestY, &sh1, line, sizeof line);
++                fprintf(stderr, "[gl] self-test: texture cache %s%s\n", line, ok ? ": using it" : "");
++            }
++            if (!ok && sh1 && m_atlasPtr)
++                ok = CacheCorrect(sh1);
++            if (!ok && sh0 && AtlasLayout(w0, h0))
++                ok = CacheCorrect(sh0);
++        }
++        if (!ok) {
++            glFinish();
++            glActiveTexture(GL_TEXTURE0 + kAtlasUnit);
++            FreeOwn(&m_atlasTex, 1);
++            glActiveTexture(GL_TEXTURE0);
++            m_atlas = 0;
++            m_atlasPtr = nullptr;
++            m_cacheOn = 0;
++            fprintf(stderr, "[gl] self-test: texture cache off: no atlas shape or correction read "
++                            "exact (the emulated lookup draws everything, slower)\n");
++        }
++    }
++
++    /* blits: the CPU's pixels drawn by the copy program, from a pool texture */
++    int yb = kTestY + 6;
++    for (int u = 0; u < 256; u++)
++        row[u] = TestTexel(u, 2);
++    TestClear(yb);
++    Blit(0, yb, 256, 1, row);
++    TestWhite(yb);
++    t = TestRow(yb, 2);
++    snprintf(line, sizeof line, "blits (%s): %s", m_inPlace && m_poolBlits ? "pool" : "vitaGL's copy",
++             TestText(t, a, sizeof a));
++    if (!TestExact(t) && m_inPlace && m_poolBlits) {
++        m_poolBlits = 0;
++        TestClear(yb);
++        Blit(0, yb, 256, 1, row);
++        TestWhite(yb);
++        t = TestRow(yb, 2);
++        snprintf(line + strlen(line), sizeof line - strlen(line), " -> vitaGL's copy: %s",
++                 TestText(t, b, sizeof b));
++    }
++    fprintf(stderr, "[gl] self-test: %s\n", line);
++
++    /* movie pictures: an RGBA picture drawn by the present program, from a pool texture */
++    int ym = kTestY + 7;
++    uint32_t rgba[256];
++    for (int u = 0; u < 256; u++) {
++        uint16_t q = TestTexel(u, 3);
++        rgba[u] = (uint32_t)m_to8[q & 31] | (uint32_t)m_to8[(q >> 5) & 31] << 8 |
++                  (uint32_t)m_to8[(q >> 10) & 31] << 16 | 0xff000000u;
++    }
++    line[0] = 0;
++    int ip = m_inPlace && m_poolImages ? PoolTake(m_imagePool, kImagePool, 256, 1, GL_RGBA) : -1;
++    if (ip >= 0) {
++        memcpy(m_imagePool[ip].ptr, rgba, sizeof rgba);
++        TestPicture(m_imagePool[ip].tex, 1.0f, 1.0f, ym);
++        TestWhite(ym);
++        t = TestRow(ym, 3);
++        FreeOwn(&m_imagePool[ip], 1);   /* (read back: the GPU is done) */
++        snprintf(line, sizeof line, "movie pictures (pool): %s", TestText(t, a, sizeof a));
++        if (!TestExact(t))
++            m_poolImages = 0;
++    }
++    if (ip < 0 || !m_poolImages) {
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, m_dispTex);
++        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
++        TestPicture(m_dispTex, 256.0f / VRAM_W, 1.0f / VRAM_H, ym);
++        TestWhite(ym);
++        t = TestRow(ym, 3);
++        glBindTexture(GL_TEXTURE_2D, m_dispTex);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, m_filter ? GL_LINEAR : GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, m_filter ? GL_LINEAR : GL_NEAREST);
++        snprintf(line + strlen(line), sizeof line - strlen(line), "%smovie pictures (vitaGL's copy): %s",
++                 line[0] ? " -> " : "", TestText(t, b, sizeof b));
++    }
++    fprintf(stderr, "[gl] self-test: %s\n", line);
++
++    /* nothing left behind: the test page and rows blank, the cache empty, the counts at 0 */
++    g_textureStore.Upload(kTestPageX, kTestPageY, 256, 4, zero);
++    Fill(0, kTestY, VRAM_W, VRAM_H - kTestY, 0);
++    memset(m_slot, 0, sizeof m_slot);
++    m_lastSlot = -1;
++    int on = m_st.on;
++    m_st = Stats{};
++    m_st.on = on;
++    fprintf(stderr, "[gl] self-test done: texture cache %s, store %s, blits %s, movie pictures %s\n",
++            !m_cacheOn ? "off" : m_atlasTex.bias ? "with an address fix" :
++            m_atlasFix[0] ? "with a shader fix" : m_atlasW == 4096 ? "4096x2048" : "2048x4096",
++            m_nstore ? "own copies" : "vitaGL's", m_inPlace && m_poolBlits ? "pool" : "vitaGL's",
++            m_inPlace && m_poolImages ? "pool" : "vitaGL's");
++}
+ #endif
+ 
+ void GlGpu::TexturesChanging(int x, int y, int w, int h)
+@@ -1989,7 +2389,8 @@ void GlGpu::Blit(int x, int y, int w, int h, const uint16_t *src)
+     GLuint pixels = m_blit;
+ #ifdef __vita__
+     long long prof_t0 = PC_VitaProfNow();
+-    int bp = m_inPlace ? PoolTake(m_blitPool, kBlitPool, VRAM_W, VRAM_H, GL_LUMINANCE_ALPHA) : -1;
++    int bp = m_inPlace && m_poolBlits
++                 ? PoolTake(m_blitPool, kBlitPool, VRAM_W, VRAM_H, GL_LUMINANCE_ALPHA) : -1;
+     if (bp >= 0) {
+         /* in place, into a texture no draw in flight reads (L the low byte, A the high) */
+         InPlace &b = m_blitPool[bp];
+@@ -2321,7 +2722,8 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+             v1 = (float)ih / VRAM_H;
+ #ifdef __vita__
+             long long prof_ti = PC_VitaProfNow();
+-            int ip = m_inPlace ? PoolTake(m_imagePool, kImagePool, iw, ih, GL_RGBA) : -1;
++            int ip = m_inPlace && m_poolImages
++                         ? PoolTake(m_imagePool, kImagePool, iw, ih, GL_RGBA) : -1;
+             if (ip >= 0) {
+                 /* in place, into a texture of the picture's size no draw in flight reads (RGBA rows
+                  * of align(iw, 8) texels) */
+@@ -2521,7 +2923,14 @@ int GlGpu::CacheSlotFor(uint64_t key)
+         return -1;
+     }
+     m_decodesLeft--;
+-    CacheSlot &c = m_slot[victim];
++    SlotFill(m_slot[victim], key);
++    CacheDecode(victim);
++    m_st.cache_misses++;
++    return m_lastSlot = victim;
++}
++
++void GlGpu::SlotFill(CacheSlot &c, uint64_t key)
++{
+     int depth = (int)(key >> 1) & 3;
+     uint32_t clut = (uint32_t)(key >> 8) & 0x7fff;
+     c.key = key;
+@@ -2533,9 +2942,20 @@ int GlGpu::CacheSlotFor(uint64_t key)
+     c.cx = (int)(clut & 63) * 16;
+     c.cy = (int)(clut >> 6) & 511;
+     c.cw = depth == 0 ? 16 : depth == 1 ? 256 : 0;
+-    CacheDecode(victim);
+-    m_st.cache_misses++;
+-    return m_lastSlot = victim;
++}
++
++void GlGpu::AtlasUniforms()
++{
++    GLuint progs[2] = { m_drawProg, m_drawProgFast };
++    for (GLuint p : progs) {
++        if (!p)
++            continue;
++        glUseProgram(p);
++        glUniform1f(glGetUniformLocation(p, "u_atlasCols"), (float)m_atlasCols);
++        glUniform2f(glGetUniformLocation(p, "u_atlasScale"), 1.0f / m_atlasW, 1.0f / m_atlasH);
++        glUniform2f(glGetUniformLocation(p, "u_atlasFix"), m_atlasFix[0], m_atlasFix[1]);
++    }
++    glUseProgram(m_drawProg);
+ }
+ 
+ /* row y of a slot's 256x256 texels from the texture store, as RGBA: a 0 for the PS1's transparent
+@@ -2585,7 +3005,8 @@ void GlGpu::CacheDecode(int s)
+     glActiveTexture(GL_TEXTURE0 + kAtlasUnit);
+     glBindTexture(GL_TEXTURE_2D, m_atlas);
+     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+-    glTexSubImage2D(GL_TEXTURE_2D, 0, (s % 16) * 256, (s / 16) * 256, 256, 256, GL_RGBA,
++    glTexSubImage2D(GL_TEXTURE_2D, 0, (s % m_atlasCols) * 256, (s / m_atlasCols) * 256, 256, 256,
++                    GL_RGBA,
+                     GL_UNSIGNED_BYTE, m_decode.data());
+     glActiveTexture(GL_TEXTURE0);
+ #endif
+@@ -2597,17 +3018,12 @@ int GlGpu::CacheVerts(GlVert *v, int n)
+ {
+     int slow = 0;
+     for (int i = 0; i + 2 < n; i += 3) {
+-        uint16_t info = v[i].info;
+-        if (!(info & I_TEXTURED) || (v[i].clut & 0x8000))
++        if (v[i].clut & 0x8000)
++            continue;
++        uint64_t key = SlotKey(v[i]);
++        if (!key)
+             continue;
+-        uint32_t depth = (info >> 7) & 3;
+-        if (depth == 3)
+-            continue;   /* HD textures have their own */
+-        uint32_t clut = depth == 2 ? 0 : (uint32_t)(v[i].clut & 0x7fff);
+-        uint32_t win = (uint32_t)v[i].tw[0] | (uint32_t)v[i].tw[1] << 8 | (uint32_t)v[i].tw[2] << 16 |
+-                       (uint32_t)v[i].tw[3] << 24;
+-        uint64_t key = (1u | depth << 1 | (uint32_t)(info & 15) << 3 | (uint32_t)((info >> 4) & 1) << 7 |
+-                        clut << 8) | (uint64_t)win << 32;
++        uint32_t win = (uint32_t)(key >> 32);
+         if (win != 0xffffu) {
+             size_t k;
+             for (k = 0; k < m_windows.size() && m_windows[k] != win; k++) {
+diff --git a/platform/pc/src/pc_vita.cpp b/platform/pc/src/pc_vita.cpp
+index 606e637..cd4e2dd 100644
+--- a/platform/pc/src/pc_vita.cpp
++++ b/platform/pc/src/pc_vita.cpp
+@@ -323,8 +323,10 @@ void PC_VitaWatchThread(const char *name, int thid) {
+ }
+ 
+ /* ---- the stall sampler ------------------------------------------------------------------------
+- * The game's code is built with -finstrument-functions (tools/build.py): every game function's
+- * entry and exit push and pop its address here. Only the game thread runs game code. A thread on
++ * The game's code built with THPS_VITA_INSTRUMENT=1 has -finstrument-functions (tools/build.py;
++ * by default it hasn't, for speed): every game function's entry and exit push and pop its address
++ * here; without it there are no [stall-fn] or [stall-top] lines. Only the game thread runs game
++ * code. A thread on
+  * core 1 looks every millisecond; while a frame has run over 200 ms it counts the innermost three
+  * functions, which the stall lines print as their first instruction's address, the Thumb bit
+  * cleared (as is PC_VitaLogOpen's in the profile line): minus PC_VitaLogOpen's logged address,
+@@ -333,6 +335,7 @@ namespace {
+ constexpr int kShadow = 64, kHist = 24;
+ void *volatile g_shadow[kShadow];
+ volatile int g_depth;
++volatile int g_instrumented; /* a game function was entered: the game code is instrumented */
+ 
+ struct Hist {
+     void *fn[kHist];
+@@ -399,6 +402,7 @@ void __cyg_profile_func_exit(void *fn, void *site) __attribute__((no_instrument_
+ 
+ void __cyg_profile_func_enter(void *fn, void *site) {
+     (void)site;
++    g_instrumented = 1;
+     int d = g_depth;
+     if (d >= 0 && d < kShadow)
+         g_shadow[d] = fn;
+@@ -490,16 +494,18 @@ void PC_VitaProfFrame(void) {
+         char top[3][160];
+         for (int lvl = 0; lvl < 3; lvl++)
+             HistTop(g_frameHist[lvl], top[lvl], sizeof top[lvl]);
+-        fprintf(stderr, "[stall-fn] frame %d: %d samples; leaf%s; caller%s; caller2%s\n", g_profFrameNo,
+-                (int)g_frameSamples, top[0], top[1], top[2]);
++        if (g_instrumented)
++            fprintf(stderr, "[stall-fn] frame %d: %d samples; leaf%s; caller%s; caller2%s\n",
++                    g_profFrameNo, (int)g_frameSamples, top[0], top[1], top[2]);
+         g_episodeFrames++;
+     } else if (g_episodeFrames && g_episodeSamples) {
+         /* the first quick frame after stalled ones: the episode's summary */
+         char top[3][160];
+         for (int lvl = 0; lvl < 3; lvl++)
+             HistTop(g_episodeHist[lvl], top[lvl], sizeof top[lvl]);
+-        fprintf(stderr, "[stall-top] %d stalled frames, %d samples; leaf%s; caller%s; caller2%s\n",
+-                (int)g_episodeFrames, (int)g_episodeSamples, top[0], top[1], top[2]);
++        if (g_instrumented)
++            fprintf(stderr, "[stall-top] %d stalled frames, %d samples; leaf%s; caller%s; caller2%s\n",
++                    (int)g_episodeFrames, (int)g_episodeSamples, top[0], top[1], top[2]);
+         memset(g_episodeHist, 0, sizeof g_episodeHist);
+         g_episodeSamples = 0;
+         g_episodeFrames = 0;
+diff --git a/platform/pc/tools/build.py b/platform/pc/tools/build.py
+index 852a058..6231d4a 100644
+--- a/platform/pc/tools/build.py
++++ b/platform/pc/tools/build.py
+@@ -49,8 +49,12 @@ CODE_END = 0x8009D0E0  # hand-written assembly rewritten in C (reimpl.tsv) lies
+ # code and data only: VitaSDK's SDL2 and system headers keep the target's short enums
+ VITA_GAME_FLAGS = ["-fno-short-enums"] if VITA else []
+ 
++# the game code's optimisation: -O2 on the Vita (THPS_VITA_OPT=1 builds -O1, as before t14), with
++# no identical-code folding (function pointers the game compares stay distinct) and no vectoriser
++GAME_OPT = ["-O" + os.environ.get("THPS_VITA_OPT", "2"), "-fno-ipa-icf", "-fno-tree-loop-vectorize",
++            "-fno-tree-slp-vectorize"] if VITA else ["-O1"]
+ COMMON_FLAGS = [
+-    MFLAG, "-O1", "-g",
++    MFLAG, *GAME_OPT, "-g",
+     "-fno-strict-aliasing", "-fwrapv", "-fno-delete-null-pointer-checks", "-fno-builtin",
+     "-fno-omit-frame-pointer", "-w", "-DPC_PORT=1",
+     # plain char is unsigned in the PS1 ABI (egcs on MIPS): the decompiled code is verified with it
+@@ -80,9 +84,10 @@ if not WINDOWS:
+     # (the runtime is built the same way)
+     COMMON_FLAGS += ["-fno-pic", "-fno-pie"] + (["-freg-struct-return"] if I386 else [])
+ COMMON_FLAGS += VITA_FLAGS + VITA_GAME_FLAGS
+-if VITA:
+-    # the profile switch's stall sampler: each game function's entry and exit keep a shadow call
+-    # stack (src/pc_vita.cpp) that a thread on another core reads during long frames
++if VITA and os.environ.get("THPS_VITA_INSTRUMENT") == "1":
++    # the profile switch's stall sampler ([stall-fn]): each game function's entry and exit keep a
++    # shadow call stack (src/pc_vita.cpp) that a thread on another core reads during long frames.
++    # Two more calls on every game call: only when asked for (t14)
+     COMMON_FLAGS += ["-finstrument-functions", "-finstrument-functions-exclude-file-list=/include/"]
+ C_FLAGS = ["-std=gnu89", "-fpermissive", "-fcommon"]
+ # -fno-lifetime-dse: egcs destructors re-store their class's vptr (portsrc adds the store); g++ would
+-- 
+2.53.0
+

@@ -1,0 +1,352 @@
+From 06af0cb272572d84f75e7eb2ed70210d2c2ac0e8 Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Thu, 29 Oct 2026 09:19:35 +0300
+Subject: [PATCH] Vita: render sizes 832x472 and 864x488, half-precision colour
+ in the no-discard program, Data's files in subfolders
+
+- GRAPHICS > RENDER RESOLUTION (and THPS_VITA_RES) adds 832x472 and 864x488 between 720x408
+  and the screen's 960x544: t29 at 960x544 had the GPU at ~20 ms a frame (41-52 fps), 720x408
+  fits 60; these are 75 and 81 percent of the screen's pixels.
+- The no-discard program (opaque faces without transparent texels, most of a level) gets a
+  variant with its colour maths in mediump (the texel, vertex colour and blend weight; texel
+  coordinates stay highp), compiled last; rejected, the full-precision one stays.
+  THPS_GL_HALF=0: not built. Boot line "[gl] half-precision colour: ...".
+- Data's files at its top can move into 64 subfolders (bk00-bk63 by a hash of the name):
+  opening a file in Data took 250-800 ms (t29: one sceIoOpen, ~6 ms reading), the card's
+  lookup in a ~2000-file folder. Renames only, resumable (a file is in one place or the other),
+  capped per start (THPS_DATA_BUCKETS_SECS, default 60); Manifest.txt's check and the
+  extraction look in both places, the index searches subfolders. Off with
+  THPS_DATA_BUCKETS=0 (on by default on the Vita; =undo moves them back, removing the empty
+  subfolders). Tested off-device: move cut at 700 of 2000 files, resumed, run again, undo cut at
+  500, finished: every listed file found at each step, contents and folder tree as at the start.
+- Checked: no multisampling on the Vita (samples 0), depth D24S8 (the projective depth needs 24
+  bits), atlas and layer buffers in vitaGL's graphics memory: nothing to change there.
+---
+ platform/pc/README.md            |   4 +-
+ platform/pc/include/pc/assets.h  |   5 ++
+ platform/pc/include/pc/gl_gpu.h  |   2 +
+ platform/pc/include/pc_vitagfx.h |   4 +-
+ platform/pc/src/pc_assets.cpp    | 109 ++++++++++++++++++++++++++++---
+ platform/pc/src/pc_gpu_gl.cpp    |  46 +++++++++++++
+ platform/pc/src/pc_vitagfx.cpp   |   6 +-
+ 7 files changed, 162 insertions(+), 14 deletions(-)
+
+diff --git a/platform/pc/README.md b/platform/pc/README.md
+index 6bda689..633142a 100644
+--- a/platform/pc/README.md
++++ b/platform/pc/README.md
+@@ -570,10 +570,12 @@ window, `THPS_FAST`, `THPS_DETERMINISTIC`) never wait for a display.
+ | `THPS_RENDER3D=psx` | OpenGL: draw the world and models through the PS1 path (default `native`, see Graphics) |
+ | `THPS_PGXP=0` | OpenGL: both of the above off (`THPS_GL_PRECISE=0 THPS_GL_PERSPECTIVE=0`) |
+ | `THPS_R3D_BATCH=0` | OpenGL ES (Vita): a native 3D layer's faces drawn in the PS1's order, split where they overlap (before t20); default: each run of faces between 2D primitives in one depth pass and one colour pass for the opaque faces, then the semi-transparent ones in order |
+-| `THPS_VITA_RES=WxH` | Vita: screens drawn at most 512x240, 720x408 or 960x544 (default; t24-t25: 720x408), scaled up to the screen |
++| `THPS_VITA_RES=WxH` | Vita: screens drawn at most 512x240, 720x408, 832x472, 864x488 or 960x544 (default; t24-t25: 720x408), scaled up to the screen |
+ | `THPS_R3D_PREPASS=0` | OpenGL ES (Vita), batched 3D: opaque faces in one pass at the true depth (t24; decals can flicker); default (t25): depth first, then colour with the decal tolerance, the no-discard program in both where it can |
+ | `THPS_GL_DEPTHFS=0` | OpenGL ES (Vita), batched 3D: the depth pass of opaque faces without transparent texels shades with the no-discard program instead of one that reads no texture |
+ | `THPS_GL_GPUTIME=1` | Vita, a measurement: each frame drawn to the end before the swap, the GPU time logged (`[gpu]`); slower |
++| `THPS_GL_HALF=0` | OpenGL ES (Vita): the opaque no-discard program's colour maths in full precision (default t30: half, where the compiler takes it) |
++| `THPS_DATA_BUCKETS=0` | Vita: Data's files stay where they are (default t30: moved into 64 subfolders bk00-bk63 at start, renames only; files are found either way); `=undo` moves them back; `THPS_DATA_BUCKETS_SECS=n` caps a start's work (default 60) |
+ | `THPS_FILE_DIRECT=0` | Vita: game files read with stdio as before t28 (default: sceIoRead in pieces of 1 MB, an open reads only the header) |
+ | `THPS_GL_DECODE_THREADS=n` | Vita: texture cache pages decoded by n threads on cores 1-3 with the game thread (default 3, 0 = the game thread alone) |
+ | `THPS_GL_NODISCARD=0` | OpenGL ES (Vita), batched 3D: no separate no-discard, no-blend program for opaque faces with no transparent texel under them |
+diff --git a/platform/pc/include/pc/assets.h b/platform/pc/include/pc/assets.h
+index ed4643d..9f8e692 100644
+--- a/platform/pc/include/pc/assets.h
++++ b/platform/pc/include/pc/assets.h
+@@ -51,6 +51,11 @@ private:
+     void ExtractStrFiles(const StrFile *e, int n);
+     void WritePlaylist(const StrFile *e, int n);
+     bool WadComplete();
++    /* t30: THPS_DATA_BUCKETS=1 moves Data's files into 64 subfolders (bk00-bk63, by a hash of
++     * the name; renames only), =undo moves them back; the index finds them either way */
++    void Buckets();
++    /* a file Manifest.txt lists at rel: where it is (Data/rel, else its bucket); false if neither */
++    bool Present(const char *rel, char *path, int n);
+     void ExtractWadFiles();
+     bool ManifestIsDreamcast();
+     void ExtractDreamcast(const StrFile *str, int nstr);
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index 93699f7..1990134 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -390,6 +390,8 @@ class GlGpu {
+      * program, as t25-t28). UseDraw(1, 2) */
+     GLuint m_drawProgDepth = 0;
+     DrawLocs m_locDepth = {};
++    std::string m_solidFs;   /* t30: the no-discard program's fragment source (SolidHalf) */
++    void SolidHalf();
+     /* t25: the batched opaque faces' depth pass, then their colour within the decal tolerance,
+      * the no-discard program in both where it can (default; THPS_R3D_PREPASS=0: t24's single
+      * pass) */
+diff --git a/platform/pc/include/pc_vitagfx.h b/platform/pc/include/pc_vitagfx.h
+index 31f4112..9126f8c 100644
+--- a/platform/pc/include/pc_vitagfx.h
++++ b/platform/pc/include/pc_vitagfx.h
+@@ -6,7 +6,7 @@
+ #define PC_VITAGFX_H
+ 
+ typedef struct PC_VitaGfx {
+-    int render_w, render_h; /* 3D/screen render size: 512x240, 720x408 or 960x544 (default 960x544) */
++    int render_w, render_h; /* 3D/screen render size: 512x240, 720x408, 832x472, 864x488 or 960x544 (default 960x544) */
+     int widescreen;         /* 1 = 16:9 3D (default 1) */
+     int smoothing;          /* 1 = bilinear upscale of the picture (default 1) */
+     int frame_rate;         /* 60 or 30 (locked 30) (default 60) */
+@@ -28,7 +28,7 @@ const PC_VitaGfx *PC_VitaGfxSaved(void);
+ /* For the menu: the render sizes it offers (smallest first), and setting what Settings.ini
+  * keeps (written by the next save, PC_VideoSave; nothing changes before a restart). Invalid
+  * values become the defaults. */
+-#define PC_VITAGFX_SIZES 3
++#define PC_VITAGFX_SIZES 5   /* t30: 832x472 and 864x488 between 720x408 and the screen */
+ void PC_VitaGfxSize(int i, int *w, int *h);
+ void PC_VitaGfxSetSaved(const PC_VitaGfx *g);
+ 
+diff --git a/platform/pc/src/pc_assets.cpp b/platform/pc/src/pc_assets.cpp
+index 13c6a9a..a02268a 100644
+--- a/platform/pc/src/pc_assets.cpp
++++ b/platform/pc/src/pc_assets.cpp
+@@ -33,6 +33,12 @@
+ #include <stdlib.h>
+ #include <ctype.h>
+ #include <string.h>
++#ifdef _WIN32
++#include <direct.h>
++#define rmdir _rmdir
++#else
++#include <unistd.h>
++#endif
+ 
+ #include "pc/assets.h"
+ #include "pc/disc_image.h"
+@@ -426,6 +432,95 @@ void Assets::Path(char *out, int n, const char *rel) {
+     os::PathFix(out);
+ }
+ 
++/* t30: a name's bucket folder under Data (bk00-bk63) */
++static void BucketName(const char *name, char *out, int n) {
++    uint32_t h = 2166136261u;
++    for (const char *p = name; *p; p++)
++        h = (h ^ (uint8_t)(*p >= 'A' && *p <= 'Z' ? *p + 32 : *p)) * 16777619u;
++    snprintf(out, n, "bk%02u", (unsigned)(h % 64));
++}
++
++bool Assets::Present(const char *rel, char *path, int n) {
++    Path(path, n, rel);
++    if (os::IsFile(path))
++        return true;
++    if (strchr(rel, '\\') || strchr(rel, '/'))
++        return false;   /* (only files at Data's top are moved) */
++    char b[8], r[MAX_PATH];
++    BucketName(rel, b, sizeof b);
++    snprintf(r, sizeof r, "%s\\%s", b, rel);
++    Path(path, n, r);
++    return os::IsFile(path);
++}
++
++/* t30: the card looks a file up in a folder slowly when the folder is big: Data's ~2000 files
++ * cost 250-800 ms an open (t29), each load. In 64 subfolders each holds ~30. Renames only; a
++ * file is in one place or the other at any moment, so a start that stops part way (a crash, the
++ * time cap) finishes at the next. On by default on the Vita (Sully, t30); THPS_DATA_BUCKETS=0
++ * leaves Data as it is, =undo moves them back, =1 does it elsewhere too;
++ * THPS_DATA_BUCKETS_SECS (default 60) caps a start's work. Manifest.txt keeps the old paths:
++ * Present looks in both places. */
++void Assets::Buckets() {
++    const char *e = getenv("THPS_DATA_BUCKETS");
++#ifdef __vita__
++    if (e && e[0] == '0')
++        return;
++#else
++    if (!e || !e[0] || e[0] == '0')
++        return;
++#endif
++    bool undo = e && !_stricmp(e, "undo");
++    const char *cs = getenv("THPS_DATA_BUCKETS_SECS");
++    int64_t cap = (int64_t)(cs ? atoi(cs) : 60) * os::ClockFreq();
++    int64_t t0 = os::ClockNow();
++    char path[MAX_PATH], line[MAX_PATH], from[MAX_PATH], to[MAX_PATH], b[8], r[MAX_PATH];
++    int moved = 0, left = 0;
++    Path(path, sizeof path, "Manifest.txt");
++    FILE *f = fopen(path, "r");
++    if (!f)
++        return;
++    if (!undo)
++        for (int i = 0; i < 64; i++) {
++            snprintf(r, sizeof r, "bk%02d", i);
++            MakeDirs(r);
++        }
++    while (fgets(line, sizeof line, f)) {
++        line[strcspn(line, "\r\n")] = 0;
++        if (!line[0] || line[0] == '#' || strchr(line, '\\') || strchr(line, '/'))
++            continue;
++        BucketName(line, b, sizeof b);
++        snprintf(r, sizeof r, "%s\\%s", b, line);
++        Path(undo ? to : from, MAX_PATH, line);
++        Path(undo ? from : to, MAX_PATH, r);
++        if (!os::IsFile(from))
++            continue;
++        if (os::ClockNow() - t0 > cap) {
++            left++;
++            continue;
++        }
++        if (rename(from, to) == 0) {
++            moved++;
++            if (moved % 250 == 0)
++                PC_Log("data buckets: %d files %s, %.1f s", moved, undo ? "moved back" : "moved",
++                       (double)(os::ClockNow() - t0) / (double)os::ClockFreq());
++        }
++    }
++    fclose(f);
++    if (undo && !left)
++        for (int i = 0; i < 64; i++) {
++            snprintf(r, sizeof r, "bk%02d", i);
++            Path(path, sizeof path, r);
++            rmdir(path);   /* (only when empty) */
++        }
++    if (!moved && !left)
++        return;   /* (done at an earlier start: nothing to say) */
++    PC_Log("data buckets: %s %d files in %.1f s%s", undo ? "moved back" : "moved", moved,
++           (double)(os::ClockNow() - t0) / (double)os::ClockFreq(),
++           left ? " (time cap reached: the rest at the next start)" : "");
++    if (left)
++        PC_Log("data buckets: %d files still to move", left);
++}
++
+ void Assets::MakeDirs(const char *rel) {
+     char p[MAX_PATH];
+     Path(p, sizeof p, rel);
+@@ -508,8 +603,7 @@ bool Assets::WadComplete() {
+         line[strcspn(line, "\r\n")] = 0;
+         if (!line[0] || line[0] == '#')
+             continue;
+-        Path(file, sizeof file, line);
+-        ok = os::IsFile(file);
++        ok = Present(line, file, sizeof file);
+         any = true;
+     }
+     fclose(f);
+@@ -529,16 +623,14 @@ void Assets::ExtractWadFiles() {
+     n = ListWadFiles(w);
+     if (!g_discImage.FindFile("\\CD.WAD;1", &wadLba, &wadSize))
+         PC_Fatal("CD.WAD is not on the disc image. Is it Tony Hawk's Pro Skater (USA)?");
+-    for (i = 0; i < n; i++) {
+-        Path(path, sizeof path, w[i].rel);
+-        missing += !os::IsFile(path);
+-    }
++    for (i = 0; i < n; i++)
++        missing += !Present(w[i].rel, path, sizeof path);
+     PC_Log("extracting %d game files from the disc to %s", missing, Root());
+     for (i = 0; i < n; i++) {
+         uint32_t sectors = (w[i].size + 2047) / 2048;
+-        Path(path, sizeof path, w[i].rel);
+-        if (os::IsFile(path))
++        if (Present(w[i].rel, path, sizeof path))
+             continue;
++        Path(path, sizeof path, w[i].rel);
+         if (w[i].offset % 2048 || w[i].offset + w[i].size > wadSize)
+             PC_Fatal("CD.HED entry %s is outside CD.WAD", w[i].name);
+         if (cap < (size_t)sectors * 2048) {
+@@ -933,6 +1025,7 @@ void Assets::Init() {
+     if (m_both)
+         PC_Log("game files: %s (both versions are there; Options > Graphics switches)", m_root);
+     g_mods.Init();
++    Buckets();
+     BuildIndex();
+     if (m_dc) {
+         DreamcastFixups();
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index 5de4b06..835ff0b 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -3689,6 +3689,7 @@ void GlGpu::SolidProgram()
+         }
+         fs.erase(at, strlen(c));
+     }
++    m_solidFs = fs;
+     GLuint p = Program(gl_draw_vs, fs.c_str());
+     if (!p) {
+         fprintf(stderr, "[gl] opaque no-discard program: REJECTED by the compiler, off (source above)\n");
+@@ -3736,6 +3737,51 @@ void GlGpu::SolidProgram()
+     glUseProgram(m_drawProg);
+     m_drawProgDepth = d;
+     fprintf(stderr, "[gl] depth-pass program: ok (THPS_GL_DEPTHFS=0 turns it off)\n");
++    SolidHalf();
++}
++
++/* t30: the no-discard program with its colour maths in half precision (mediump: the texel,
++ * the vertex colour, the blend weight; the texel coordinates stay highp, the atlas is 4096
++ * wide). Compiled last of all; rejected, the full-precision one stays. THPS_GL_HALF=0: not
++ * built */
++void GlGpu::SolidHalf()
++{
++    const char *e = getenv("THPS_GL_HALF");
++    if ((e && e[0] == '0') || !m_drawProgSolid || m_solidFs.empty()) {
++        fprintf(stderr, "[gl] half-precision colour: off%s\n", e && e[0] == '0' ? " (THPS_GL_HALF=0)" : "");
++        return;
++    }
++    static const char *const pairs[][2] = {
++        { "    vec3 c = v_color;\n", "    mediump vec3 c = v_color;\n" },
++        { "        vec4 tx = texture2D(u_hd, v_uv / 256.0);\n", "        mediump vec4 tx = texture2D(u_hd, v_uv / 256.0);\n" },
++        { "        vec4 ta = texture2D(u_atlas,", "        mediump vec4 ta = texture2D(u_atlas," },
++        { "    float keep = 0.0;\n", "    mediump float keep = 0.0;\n" },
++    };
++    std::string fs = m_solidFs;
++    for (auto &pr : pairs) {
++        size_t at = fs.find(pr[0]);
++        if (at == std::string::npos) {
++            fprintf(stderr, "[gl] half-precision colour: the shader has changed, off\n");
++            return;
++        }
++        fs.replace(at, strlen(pr[0]), pr[1]);
++    }
++    GLuint p = Program(gl_draw_vs, fs.c_str());
++    if (!p) {
++        fprintf(stderr, "[gl] half-precision colour: REJECTED by the compiler, full precision kept (source above)\n");
++        glUseProgram(m_drawProg);
++        return;
++    }
++    glUseProgram(p);
++    glUniform1i(glGetUniformLocation(p, "u_vram"), 0);
++    glUniform1i(glGetUniformLocation(p, "u_hd"), 1);
++    glUniform1i(glGetUniformLocation(p, "u_atlas"), kAtlasUnit);
++    m_locSolid = DrawLocs{glGetUniformLocation(p, "u_pass"), glGetUniformLocation(p, "u_dpass"),
++                          glGetUniformLocation(p, "u_proj"), glGetUniformLocation(p, "u_target"),
++                          glGetUniformLocation(p, "u_shift"), glGetUniformLocation(p, "u_uvfix")};
++    glUseProgram(m_drawProg);
++    m_drawProgSolid = p;
++    fprintf(stderr, "[gl] half-precision colour: ok, opaque faces without discard (THPS_GL_HALF=0 turns it off)\n");
+ }
+ 
+ /* row y of slot s's decoded texels: its 8x8 cells that hold a transparent one (0) */
+diff --git a/platform/pc/src/pc_vitagfx.cpp b/platform/pc/src/pc_vitagfx.cpp
+index 95022dd..e54b5b4 100644
+--- a/platform/pc/src/pc_vitagfx.cpp
++++ b/platform/pc/src/pc_vitagfx.cpp
+@@ -15,7 +15,7 @@ namespace pc {
+ namespace {
+ 
+ const PC_VitaGfx kDefaults = {960, 544, 1, 1, 60, 1, 1};
+-const int kSizes[PC_VITAGFX_SIZES][2] = {{512, 240}, {720, 408}, {960, 544}};
++const int kSizes[PC_VITAGFX_SIZES][2] = {{512, 240}, {720, 408}, {832, 472}, {864, 488}, {960, 544}};
+ 
+ PC_VitaGfx s_saved = kDefaults;   /* Settings.ini's (the menu's) */
+ PC_VitaGfx s_eff = kDefaults;     /* in effect: s_saved at load, then the environment */
+@@ -93,7 +93,7 @@ int VitaGfxSettingsLine(const char *section, const char *key, const char *value)
+ void VitaGfxWriteSettings(FILE *f) {
+ #ifdef __vita__
+     fputs("\n; PS Vita graphics (Options > Graphics), read when the game starts.\n"
+-          "; RenderResolution = 512x240, 720x408 or 960x544 (the screen's). Widescreen = On draws\n"
++          "; RenderResolution = 512x240, 720x408, 832x472, 864x488 or 960x544 (the screen's). Widescreen = On draws\n"
+           "; the 3D 16:9, Off 4:3. Smoothing = On scales the picture up smoothly. FrameRate = 60\n"
+           "; or 30 (locked). Renderer3D = Native or PlayStation (the PS1's 3D path). PGXP = On\n"
+           "; draws vertices between pixels and textures in perspective.\n",
+@@ -121,7 +121,7 @@ void VitaGfxFreeze() {
+             s_eff.render_w = w;
+             s_eff.render_h = h;
+         } else {
+-            PC_Log("vitagfx: THPS_VITA_RES=%s ignored (512x240, 720x408 or 960x544)", e);
++            PC_Log("vitagfx: THPS_VITA_RES=%s ignored (512x240, 720x408, 832x472, 864x488 or 960x544)", e);
+         }
+     }
+     if ((e = getenv("THPS_WIDESCREEN")))
+-- 
+2.53.0
+

@@ -1,0 +1,724 @@
+From 19e56da4f2b62620d3f682127ce4fd303ffa604f Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Wed, 28 Oct 2026 23:35:09 +0300
+Subject: [PATCH] Vita: Options > Graphics edits the Vita settings ([Vita] in
+ Settings.ini) with a PGXP row; program cache loads without
+ glBindAttribLocation
+
+- t26 crashed at every start after the first: loading a saved program bound the attribute
+  numbers (glBindAttribLocation) on a program with no shaders attached, and vitaGL's
+  glBindAttribLocation reads the vertex shader (data abort, dump of 2026-10-28 23:16). The load
+  path no longer binds them; the binary keeps them, and the attribute check rejects (compiles)
+  one that lost them.
+- The GRAPHICS menu parked since t20 (_staging/t20-menu, SHA-1 5465448...): pc_vitagfx reads
+  Settings.ini's [Vita] section (RenderResolution, Widescreen, Smoothing, FrameRate, Renderer3D,
+  and now PGXP), env.txt's THPS_* overriding; on the Vita Options > Graphics shows RENDER
+  RESOLUTION, WIDESCREEN, SMOOTHING, FRAME RATE, 3D and PRECISE 3D (saved by APPLY, in effect
+  after a restart, which it offers: "RESTART TO APPLY") with the distance and fog rows; the
+  PC's window rows are hidden. PGXP comes from [Vita] PGXP (THPS_PGXP overrides). Boot line
+  "[gfx] render ..., PGXP on|off (Settings.ini [Vita], then env.txt)".
+---
+ game/src/frontend.cpp             | 147 ++++++++++++++++++++++-
+ platform/pc/README.md             |   9 ++
+ platform/pc/include/pc/settings.h |  15 ++-
+ platform/pc/include/pc_vitagfx.h  |  38 ++++--
+ platform/pc/src/pc_gpu_gl.cpp     |  14 +--
+ platform/pc/src/pc_settings.cpp   |   7 +-
+ platform/pc/src/pc_video.cpp      |  11 ++
+ platform/pc/src/pc_vitagfx.cpp    | 190 +++++++++++++++++++++++++-----
+ 8 files changed, 375 insertions(+), 56 deletions(-)
+
+diff --git a/game/src/frontend.cpp b/game/src/frontend.cpp
+index e15ac4d..9a8f99e 100644
+--- a/game/src/frontend.cpp
++++ b/game/src/frontend.cpp
+@@ -43,6 +43,7 @@ extern "C" {
+ #include <stdlib.h>
+ #include "pc_input.h"
+ #include "pc_video.h"
++#include "pc_vitagfx.h"
+ #include "game/vector.h"
+ #include "game/rfront.h"
+ #include "game/camera.h"
+@@ -413,10 +414,17 @@ static const ControlsRow s_rows[] = {
+ /* the area redrawn every frame (640x480 front-end coordinates = VRAM), and the background there */
+ static RECT s_area = { 110, 40, 520, 380 };
+ static ulong *s_saved;
++/* (the PS Vita shows its own rows, read at startup, instead of the PC's window rows: RowShown) */
+ enum {
+ 	GFX_MODE,
+ 	GFX_RESOLUTION,
+ 	GFX_WIDESCREEN,
++	GFX_VITA_RES,
++	GFX_VITA_WIDESCREEN,
++	GFX_VITA_SMOOTHING,
++	GFX_VITA_FRAME_RATE,
++	GFX_VITA_3D,
++	GFX_VITA_PGXP,
+ 	GFX_DRAW_DISTANCE,
+ 	GFX_OBJECT_DISTANCE,
+ 	GFX_FOG,
+@@ -6534,17 +6542,67 @@ static int SameSettings(const PcVideoSettings *a, const PcVideoSettings *b) {
+ 	       a->vsync == b->vsync && a->data == b->data;
+ }
+ 
++static int SameVita(const PC_VitaGfx *a, const PC_VitaGfx *b) {
++	return a->render_w == b->render_w && a->render_h == b->render_h &&
++	       a->widescreen == b->widescreen && a->smoothing == b->smoothing &&
++	       a->frame_rate == b->frame_rate && a->native3d == b->native3d && a->pgxp == b->pgxp;
++}
++
++#ifdef __vita__
++/* the Vita: one screen (no window rows, VSync or antialiasing), no shadows on OpenGL ES, one
++   version's files; its own rows instead */
++static int RowShown(int i) {
++	switch (i) {
++		case GFX_MODE:
++		case GFX_RESOLUTION:
++		case GFX_WIDESCREEN:
++		case GFX_SHADOWS:
++		case GFX_ANTIALIASING:
++		case GFX_VSYNC:
++		case GFX_DATA:
++			return 0;
++		default:
++			return 1;
++	}
++}
++#else
+ static int RowShown(int i) {
++	if (i >= GFX_VITA_RES && i <= GFX_VITA_PGXP)
++		return 0;
++
+ 	return i != GFX_DATA || PC_DataBothVersions();
+ }
++#endif
+ 
+-/* the saved settings play with the other version's files: they are read at startup */
++/* the saved settings play with the other version's files: they are read at startup (on the Vita
++   also its own rows) */
+ static int NeedsRestart(const PcVideoSettings *s) {
++#ifdef __vita__
++	if (!SameVita(PC_VitaGfxSaved(), PC_VitaGfxGet()))
++		return 1;
++#endif
+ 	return PC_DataBothVersions() && s->data != (PC_DreamcastData() ? PC_DATA_DC : PC_DATA_PS1);
+ }
+ 
++/* the Vita's render size one step on */
++static void StepVitaRes(PC_VitaGfx *g, int d) {
++	int i, w, h, at = PC_VITAGFX_SIZES - 1;
++
++	for (i = 0; i < PC_VITAGFX_SIZES; i++) {
++		PC_VitaGfxSize(i, &w, &h);
++
++		if (w == g->render_w && h == g->render_h)
++			at = i;
++	}
++
++	at = (at + d + PC_VITAGFX_SIZES) % PC_VITAGFX_SIZES;
++	PC_VitaGfxSize(at, &g->render_w, &g->render_h);
++}
++
+ extern "C" void PC_GraphicsOptions(int a) {
+ 	PcVideoSettings cur, edit, old;
++	/* the Vita's rows: as saved, and as edited (saved by APPLY, in effect after a restart) */
++	PC_VitaGfx vcur = *PC_VitaGfxSaved(), vedit = vcur;
+ 	int sel = 0, keep = 0, restart = 0, rows, i;
+ 	int base_scale = Mess_GetFontScale();
+ 	int small_scale = base_scale * 3 / 4;
+@@ -6559,6 +6617,10 @@ extern "C" void PC_GraphicsOptions(int a) {
+ 	edit = cur;
+ 	old = cur;
+ 
++	/* the first row shown */
++	while (!RowShown(sel))
++		sel++;
++
+ 	FrontLoader_LoadSet(11);
+ 	FrontLoader_Defragment();
+ 	DownloadBMP16x2(FrontLoader_TakeFile("options.bmp"));
+@@ -6606,6 +6668,8 @@ extern "C" void PC_GraphicsOptions(int a) {
+ 			if (p->MenuAccept.Triggered) {
+ 				keep = 0;
+ 				cur = edit;
++				PC_VitaGfxSetSaved(&vedit);
++				vcur = vedit;
+ 				PC_VideoSave();
+ 				restart = NeedsRestart(&cur);
+ 				SFX_PlayX(SND_SELECT1, 8192, 0);
+@@ -6650,6 +6714,24 @@ extern "C" void PC_GraphicsOptions(int a) {
+ 			} else if (d && sel == GFX_WIDESCREEN) {
+ 				edit.widescreen ^= 1;
+ 				SFX_PlayX(SND_MENUCHANGE2, 8192, 0);
++			} else if (d && sel == GFX_VITA_RES) {
++				StepVitaRes(&vedit, d);
++				SFX_PlayX(SND_MENUCHANGE2, 8192, 0);
++			} else if (d && sel == GFX_VITA_WIDESCREEN) {
++				vedit.widescreen ^= 1;
++				SFX_PlayX(SND_MENUCHANGE2, 8192, 0);
++			} else if (d && sel == GFX_VITA_SMOOTHING) {
++				vedit.smoothing ^= 1;
++				SFX_PlayX(SND_MENUCHANGE2, 8192, 0);
++			} else if (d && sel == GFX_VITA_FRAME_RATE) {
++				vedit.frame_rate = vedit.frame_rate == 30 ? 60 : 30;
++				SFX_PlayX(SND_MENUCHANGE2, 8192, 0);
++			} else if (d && sel == GFX_VITA_3D) {
++				vedit.native3d ^= 1;
++				SFX_PlayX(SND_MENUCHANGE2, 8192, 0);
++			} else if (d && sel == GFX_VITA_PGXP) {
++				vedit.pgxp ^= 1;
++				SFX_PlayX(SND_MENUCHANGE2, 8192, 0);
+ 			} else if (d && sel == GFX_DRAW_DISTANCE) {
+ 				edit.draw_distance = StepDistance(edit.draw_distance, d, DRAW_STEPS);
+ 				SFX_PlayX(SND_MENUCHANGE2, 8192, 0);
+@@ -6677,12 +6759,14 @@ extern "C" void PC_GraphicsOptions(int a) {
+ 			}
+ 
+ 			if (p->MenuAccept.Triggered && sel == GFX_APPLY) {
+-				if (SameSettings(&edit, &cur)) {
++				if (SameSettings(&edit, &cur) && SameVita(&vedit, &vcur)) {
+ 					SFX_PlayX(SND_GOBACK2, 8192, 0);
+ 				} else if (SameWindow(&edit, &cur)) {
+ 					PC_VideoApply(&edit);
+ 
+ 					cur = edit;
++					PC_VitaGfxSetSaved(&vedit);
++					vcur = vedit;
+ 					PC_VideoSave();
+ 					restart = NeedsRestart(&cur);
+ 					SFX_PlayX(SND_SELECT1, 8192, 0);
+@@ -6746,6 +6830,37 @@ extern "C" void PC_GraphicsOptions(int a) {
+ 					Text(NAME_X, y, 1, "WIDESCREEN");
+ 					Text(SLOT_X1 - 60, y, 0, edit.widescreen ? "ON" : "OFF");
+ 					break;
++				case GFX_VITA_RES:
++					SetColour(on, 0);
++					Text(NAME_X, y, 1, "RENDER RESOLUTION");
++					sprintf(buf, (char *)"%d X %d", vedit.render_w, vedit.render_h);
++					Text(SLOT_X1 - 60, y, 0, buf);
++					break;
++				case GFX_VITA_WIDESCREEN:
++					SetColour(on, 0);
++					Text(NAME_X, y, 1, "WIDESCREEN");
++					Text(SLOT_X1 - 60, y, 0, vedit.widescreen ? "ON" : "OFF");
++					break;
++				case GFX_VITA_SMOOTHING:
++					SetColour(on, 0);
++					Text(NAME_X, y, 1, "SMOOTHING");
++					Text(SLOT_X1 - 60, y, 0, vedit.smoothing ? "ON" : "OFF");
++					break;
++				case GFX_VITA_FRAME_RATE:
++					SetColour(on, 0);
++					Text(NAME_X, y, 1, "FRAME RATE");
++					Text(SLOT_X1 - 60, y, 0, vedit.frame_rate == 30 ? "LOCKED 30" : "60");
++					break;
++				case GFX_VITA_3D:
++					SetColour(on, 0);
++					Text(NAME_X, y, 1, "3D");
++					Text(SLOT_X1 - 60, y, 0, vedit.native3d ? "NATIVE" : "PLAYSTATION");
++					break;
++				case GFX_VITA_PGXP:
++					SetColour(on, 0);
++					Text(NAME_X, y, 1, "PRECISE 3D");
++					Text(SLOT_X1 - 60, y, 0, vedit.pgxp ? "ON" : "OFF");
++					break;
+ 				case GFX_DRAW_DISTANCE:
+ 					SetColour(on, 0);
+ 					Text(NAME_X, y, 1, "DRAW DISTANCE");
+@@ -6790,7 +6905,7 @@ extern "C" void PC_GraphicsOptions(int a) {
+ 					Text(SLOT_X1 - 60, y, 0, s_dataLabels[edit.data]);
+ 					break;
+ 				case GFX_APPLY:
+-					SetColour(on, SameSettings(&edit, &cur));
++					SetColour(on, SameSettings(&edit, &cur) && SameVita(&vedit, &vcur));
+ 					Text(NAME_X, y, 1, "APPLY");
+ 					break;
+ 				default:
+@@ -6802,7 +6917,11 @@ extern "C" void PC_GraphicsOptions(int a) {
+ 
+ 		if (restart) {
+ 			Mess_SetRGB(182, 132, 36, 0);
++#ifdef __vita__
++			Text(NAME_X, ROW_TOP + (rows + 1) * ROW_HEIGHT + 7, 1, "RESTART TO APPLY");
++#else
+ 			Text(NAME_X, ROW_TOP + (rows + 1) * ROW_HEIGHT + 7, 1, "RESTART TO SWITCH");
++#endif
+ 			sprintf(buf, "%s %s", "ACCEPT TO RESTART NOW", "  BACK FOR LATER");
+ 		} else if (keep) {
+ 			Mess_SetRGB(182, 132, 36, 0);
+@@ -6814,6 +6933,18 @@ extern "C" void PC_GraphicsOptions(int a) {
+ 			sprintf(buf, "%s %s", "BORDERLESS USES THE", "DESKTOP RESOLUTION");
+ 		} else if (sel == GFX_WIDESCREEN) {
+ 			sprintf(buf, "%s %s", "MORE OF THE WORLD AT THE", "SIDES OF WIDE SCREENS");
++		} else if (sel == GFX_VITA_RES) {
++			sprintf(buf, "%s %s", "SMALLER SIZES RUN FASTER", "AFTER A RESTART");
++		} else if (sel == GFX_VITA_WIDESCREEN) {
++			sprintf(buf, "%s %s", "MORE OF THE WORLD AT THE", "SIDES AFTER A RESTART");
++		} else if (sel == GFX_VITA_SMOOTHING) {
++			sprintf(buf, "%s %s", "SMOOTH SCALING TO THE", "SCREEN AFTER A RESTART");
++		} else if (sel == GFX_VITA_FRAME_RATE) {
++			sprintf(buf, "%s %s", "LOCKED 30 KEEPS A STEADY", "PACE AFTER A RESTART");
++		} else if (sel == GFX_VITA_3D) {
++			sprintf(buf, "%s %s", "NATIVE OR THE PLAYSTATION", "WAY AFTER A RESTART");
++		} else if (sel == GFX_VITA_PGXP) {
++			sprintf(buf, "%s %s", "NO WOBBLE OR TEXTURE WARP", "AFTER A RESTART");
+ 		} else if (sel == GFX_DRAW_DISTANCE) {
+ 			sprintf(buf, "%s %s", "HOW FAR AWAY THE LEVEL", "AND ITS FOG ARE DRAWN");
+ 		} else if (sel == GFX_OBJECT_DISTANCE) {
+@@ -6828,12 +6959,20 @@ extern "C" void PC_GraphicsOptions(int a) {
+ 			sprintf(buf, "%s %s", "SHOWS EACH FRAME AT THE", "SCREENS REFRESH");
+ 		} else if (sel == GFX_DATA) {
+ 			sprintf(buf, "%s %s", "THE MODELS MUSIC AND SOUNDS", "OF EITHER VERSION");
+-		} else if (sel == GFX_APPLY && !SameSettings(&edit, &cur)) {
++		} else if (sel == GFX_APPLY && !(SameSettings(&edit, &cur) && SameVita(&vedit, &vcur))) {
+ 			sprintf(buf, "%s %s", "ACCEPT TO SWITCH", "");
+ 		} else {
+ 			buf[0] = 0;
+ 		}
+ 
++#ifdef __vita__
++		/* the Vita's rows as shown are not the ones in effect: say so */
++		if (!restart && !keep && !SameVita(&vedit, PC_VitaGfxGet())) {
++			Mess_SetRGB(182, 132, 36, 0);
++			Text(NAME_X, ROW_TOP + (rows + 1) * ROW_HEIGHT + 7, 1, "RESTART TO APPLY");
++		}
++#endif
++
+ 		Mess_SetRGB(122, 122, 122, 0);
+ 		Text(370, HINT_Y, 0, buf);
+ 		Mess_SetFontScale(base_scale);
+diff --git a/platform/pc/README.md b/platform/pc/README.md
+index c8c661d..982a518 100644
+--- a/platform/pc/README.md
++++ b/platform/pc/README.md
+@@ -281,6 +281,15 @@ How the Vita build differs:
+   depth from clip space instead of `gl_FragDepth`, and blending without dual-source outputs. It
+   draws at 1x (320x240) and scales to the 960x544 screen. No shadows or MSAA.
+   `THPS_GLES=1` builds it for Linux (with its own `THPS_BUILD_DIR`) to test it on a desktop.
++- Options > Graphics shows the Vita's own rows instead of the window, resolution, shadows,
++  antialiasing, VSync and game-files rows: RENDER RESOLUTION (512 X 240, 720 X 408, 960 X 544),
++  WIDESCREEN, SMOOTHING, FRAME RATE (60 or LOCKED 30) and 3D (NATIVE or PLAYSTATION), plus the
++  draw distance and fog rows. They are kept in Settings.ini's `[Vita]` section
++  (`RenderResolution = 960x544`, `Widescreen = On`, `Smoothing = On`, `FrameRate = 60`,
++  `Renderer3D = Native`: the defaults; an invalid value is the default) and read when the game
++  starts (`include/pc_vitagfx.h`), so a change takes effect after a restart (the menu offers
++  one). `THPS_VITA_RES=WxH`, `THPS_WIDESCREEN=0|1`, `THPS_FILTER=0|1`, `THPS_VITA_FPS=30|60` and
++  `THPS_RENDER3D=native|psx` override them. `[Video] Widescreen` follows `[Vita] Widescreen`.
+ 
+ ### The Dreamcast version's data
+ 
+diff --git a/platform/pc/include/pc/settings.h b/platform/pc/include/pc/settings.h
+index 8026f73..4fcc2ee 100644
+--- a/platform/pc/include/pc/settings.h
++++ b/platform/pc/include/pc/settings.h
+@@ -1,8 +1,11 @@
+ /* Settings.ini in the player's folder (Runtime::UserDir): one file, a section per subsystem. The
+- * controls (pc_input.cpp) and the display ([Video], pc_video.cpp) each read their own sections
+- * and write them back; this class owns the file itself. The C interface is pc_settings.h. */
++ * controls (pc_input.cpp), the display ([Video], pc_video.cpp) and the Vita's graphics ([Vita],
++ * pc_vitagfx.cpp) each read their own sections and write them back; this class owns the file
++ * itself. The C interface is pc_settings.h. */
+ #pragma once
+ 
++#include <stdio.h>
++
+ #include "pc/platform.h"
+ 
+ namespace pc {
+@@ -24,4 +27,12 @@ private:
+ 
+ extern Settings g_settings;
+ 
++/* Settings.ini's [Vita] section (src/pc_vitagfx.cpp, pc_vitagfx.h): the defaults, an entry (1 if
++ * the section is [Vita]), writing it (on the Vita only), and fixing the values for the run once
++ * the file was read (Load). */
++void VitaGfxDefaults();
++int VitaGfxSettingsLine(const char *section, const char *key, const char *value);
++void VitaGfxWriteSettings(FILE *f);
++void VitaGfxFreeze();
++
+ } // namespace pc
+diff --git a/platform/pc/include/pc_vitagfx.h b/platform/pc/include/pc_vitagfx.h
+index 06b0e5f..31f4112 100644
+--- a/platform/pc/include/pc_vitagfx.h
++++ b/platform/pc/include/pc_vitagfx.h
+@@ -1,21 +1,39 @@
+-/* The Vita graphics settings (src/pc_vitagfx.cpp). t20: from env.txt only; the GRAPHICS menu
+- * that edits them in Settings.ini comes later (its patch keeps this interface). */
+-#pragma once
++/* The PS Vita's graphics settings (src/pc_vitagfx.cpp): Settings.ini's [Vita] section, edited by
++ * Options > Graphics on the Vita (game/src/frontend.cpp). Read once per run: a change the menu
++ * saves takes effect when the game starts again. Compiled everywhere (elsewhere only the
++ * defaults and the environment matter; the section is written on the Vita only). */
++#ifndef PC_VITAGFX_H
++#define PC_VITAGFX_H
+ 
+ typedef struct PC_VitaGfx {
+-    int render_w, render_h; /* the screens drawn at most this size: 512x240, 720x408, 960x544 */
+-    int widescreen;         /* 16:9 gameplay (native 3D only) */
+-    int smoothing;          /* gameplay scaled up smoothly */
+-    int frame_rate;         /* 60, or 30: every other frame shown */
+-    int native3d;           /* the native 3D renderer, else the PS1 path */
++    int render_w, render_h; /* 3D/screen render size: 512x240, 720x408 or 960x544 (default 960x544) */
++    int widescreen;         /* 1 = 16:9 3D (default 1) */
++    int smoothing;          /* 1 = bilinear upscale of the picture (default 1) */
++    int frame_rate;         /* 60 or 30 (locked 30) (default 60) */
++    int native3d;           /* 1 = Native 3D renderer, 0 = PlayStation (PS1) path (default 1) */
++    int pgxp;               /* 1 = sub-pixel vertices and perspective-correct textures (default 1) */
+ } PC_VitaGfx;
+ 
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+-/* The settings for this run (read once): THPS_VITA_RES=WxH, THPS_WIDESCREEN=0|1, THPS_FILTER=0|1,
+- * THPS_VITA_FPS=30|60, THPS_RENDER3D=native|psx; defaults 960x544, on, on, 60, native. */
++
++/* The settings in effect for this run: Settings.ini's [Vita] section (defaults above), then
++ * env.txt/environment overrides: THPS_VITA_RES=WxH, THPS_WIDESCREEN=0|1, THPS_FILTER=0|1,
++ * THPS_VITA_FPS=30|60, THPS_RENDER3D=native|psx, THPS_PGXP=0|1. Valid after settings load; never NULL. */
+ const PC_VitaGfx *PC_VitaGfxGet(void);
++/* What the menu last saved (may differ from the in-effect values until a restart). */
++const PC_VitaGfx *PC_VitaGfxSaved(void);
++
++/* For the menu: the render sizes it offers (smallest first), and setting what Settings.ini
++ * keeps (written by the next save, PC_VideoSave; nothing changes before a restart). Invalid
++ * values become the defaults. */
++#define PC_VITAGFX_SIZES 3
++void PC_VitaGfxSize(int i, int *w, int *h);
++void PC_VitaGfxSetSaved(const PC_VitaGfx *g);
++
+ #ifdef __cplusplus
+ }
+ #endif
++
++#endif
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index ec5422b..bfb474b 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -259,10 +259,10 @@ GLuint ProgramLoad(const char *path, const char *vs, const char *fs)
+     if (fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, "THPSPRG1", 8) && h.n <= kProgNames &&
+         fread(locs, 4, h.n, f) == h.n && h.len && h.len < (8u << 20) &&
+         (data = malloc(h.len)) && fread(data, 1, h.len, f) == h.len) {
++        /* (t26 bound the attribute numbers here first: vitaGL's glBindAttribLocation needs the
++         * vertex shader attached and crashed on this empty program at every start after the
++         * first. The binary keeps them; the attribute check below rejects it if not) */
+         p = glCreateProgram();
+-#ifdef PC_GLES
+-        BindAttribs(p, vs);
+-#endif
+         glProgramBinary(p, (GLenum)h.format, data, (GLsizei)h.len);
+         GLint ok = 0;
+         glGetProgramiv(p, GL_LINK_STATUS, &ok);
+@@ -1054,12 +1054,12 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+         /* THPS_PGXP=0 (t20): both of the above off, the PS1's whole-pixel affine drawing for
+          * everything the native renderer doesn't draw (its own faces are float view-space
+          * positions, perspective-correct, either way) */
+-        const char *pg = getenv("THPS_PGXP");
+-        if (pg && atoi(pg) == 0)
++        /* (t27: the GRAPHICS menu's PGXP row, Settings.ini [Vita] PGXP; THPS_PGXP overrides) */
++        int pg = PC_VitaGfxGet()->pgxp;
++        if (!pg)
+             m_precise = m_perspective = 0;
+         fprintf(stderr, "[gl] PGXP: sub-pixel vertices %s, perspective-correct textures %s%s\n",
+-                m_precise ? "on" : "off", m_perspective ? "on" : "off",
+-                pg && atoi(pg) == 0 ? " (THPS_PGXP=0)" : "");
++                m_precise ? "on" : "off", m_perspective ? "on" : "off", !pg ? " (PGXP off)" : "");
+     }
+     g_precise.Enable(m_precise || m_perspective);
+     m_active = 1;
+diff --git a/platform/pc/src/pc_settings.cpp b/platform/pc/src/pc_settings.cpp
+index 2ca824f..e01b7df 100644
+--- a/platform/pc/src/pc_settings.cpp
++++ b/platform/pc/src/pc_settings.cpp
+@@ -34,6 +34,7 @@ bool Settings::Save() {
+     fputs("; Tony Hawk's Pro Skater (PC) settings. Options > Graphics edits the display,\n"
+           "; Options > Player 1/2 Controls the controls.\n",
+           f);
++    VitaGfxWriteSettings(f);
+     g_video.WriteSettings(f);
+     g_input.WriteSettings(f);
+     if (fclose(f) != 0 || !os::RenameOver(tmp, Path())) {
+@@ -56,9 +57,11 @@ void Settings::Load() {
+     m_loaded = true;
+     g_input.SettingsDefaults();
+     g_video.SettingsDefaults();
++    VitaGfxDefaults();
+     if (!ini.Open(Path())) {
+         if (Save())
+             PC_Log("settings: wrote the defaults to %s", Path());
++        VitaGfxFreeze();
+         return;
+     }
+     while (ini.Next(&section, &key, &value)) {
+@@ -67,11 +70,13 @@ void Settings::Load() {
+         if (!section[0])
+             continue;
+         if (!g_video.SettingsLine(section, key, value) &&
+-            !g_input.SettingsLine(section, key, value) && !warned) {
++            !g_input.SettingsLine(section, key, value) &&
++            !VitaGfxSettingsLine(section, key, value) && !warned) {
+             PC_Log("Settings.ini: unknown section [%s]", section);
+             warned = true;
+         }
+     }
++    VitaGfxFreeze();
+     PC_Log("settings: %s", Path());
+ }
+ 
+diff --git a/platform/pc/src/pc_video.cpp b/platform/pc/src/pc_video.cpp
+index ed852e6..ff86483 100644
+--- a/platform/pc/src/pc_video.cpp
++++ b/platform/pc/src/pc_video.cpp
+@@ -20,6 +20,7 @@
+ #include "pc_screen.h"
+ #include "pc_texstore.h"
+ #include "pc_video.h"
++#include "pc_vitagfx.h"
+ #include "pc/video.h"
+ #include "pc/gl_gpu.h"
+ #include "pc/screen.h"
+@@ -258,7 +259,12 @@ void Video::WriteSettings(FILE *f)
+         fprintf(f, "FullscreenResolution = %dx%d\n", m_set.full_w, m_set.full_h);
+     else
+         fputs("FullscreenResolution =\n", f);
++#ifdef __vita__
++    /* [Vita] Widescreen is the one in effect: this one follows what it keeps */
++    fprintf(f, "Widescreen = %s\n", PC_VitaGfxSaved()->widescreen ? "On" : "Off");
++#else
+     fprintf(f, "Widescreen = %s\n", m_set.widescreen ? "On" : "Off");
++#endif
+     if (m_set.draw_distance == PC_DISTANCE_FULL)
+         fputs("DrawDistance = Full\n", f);
+     else
+@@ -605,8 +611,13 @@ bool Video::InitGl(int scale)
+         ApplySwapInterval();
+         ApplyWindow();
+         SDL_GL_GetDrawableSize(m_window, &dw, &dh);
++#ifdef __vita__
++        /* [Vita] Widescreen (with THPS_WIDESCREEN), fixed for the run (pc_vitagfx.h) */
++        m_set.widescreen = PC_VitaGfxGet()->widescreen;
++#else
+         if (getenv("THPS_WIDESCREEN"))
+             m_set.widescreen = atoi(getenv("THPS_WIDESCREEN")) != 0;
++#endif
+         g_glGpu.SetWidescreen(m_set.widescreen);
+         if (g_glGpu.Init(fixed, dw, dh) == 0) {
+             if (getenv("THPS_MSAA"))
+diff --git a/platform/pc/src/pc_vitagfx.cpp b/platform/pc/src/pc_vitagfx.cpp
+index 97f748e..95022dd 100644
+--- a/platform/pc/src/pc_vitagfx.cpp
++++ b/platform/pc/src/pc_vitagfx.cpp
+@@ -1,50 +1,176 @@
+-/* The Vita graphics settings (pc_vitagfx.h): defaults and env.txt. */
++/* The PS Vita's graphics settings (pc_vitagfx.h): Settings.ini's [Vita] section and the
++ * environment's overrides, fixed for the run once the settings are loaded. */
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#include "pc/ini.h"
++#include "pc/platform.h"
++#include "pc/settings.h"
++#include "pc_runtime.h"
+ #include "pc_vitagfx.h"
+ 
++namespace pc {
++
+ namespace {
+ 
+-PC_VitaGfx s_gfx;
+-bool s_read = false;
++const PC_VitaGfx kDefaults = {960, 544, 1, 1, 60, 1, 1};
++const int kSizes[PC_VITAGFX_SIZES][2] = {{512, 240}, {720, 408}, {960, 544}};
++
++PC_VitaGfx s_saved = kDefaults;   /* Settings.ini's (the menu's) */
++PC_VitaGfx s_eff = kDefaults;     /* in effect: s_saved at load, then the environment */
++bool s_frozen = false;
++
++bool ValidSize(int w, int h) {
++    for (int i = 0; i < PC_VITAGFX_SIZES; i++)
++        if (kSizes[i][0] == w && kSizes[i][1] == h)
++            return true;
++    return false;
++}
++
++/* On/Off (1/0, yes/no, true/false); anything else: def */
++int OnOff(const char *v, int def) {
++    if (ini::Bool(v))
++        return 1;
++    if (!_stricmp(v, "0") || !_stricmp(v, "off") || !_stricmp(v, "no") || !_stricmp(v, "false"))
++        return 0;
++    return def;
++}
++
++PC_VitaGfx Valid(const PC_VitaGfx &g) {
++    PC_VitaGfx v = g;
++    if (!ValidSize(v.render_w, v.render_h)) {
++        v.render_w = kDefaults.render_w;
++        v.render_h = kDefaults.render_h;
++    }
++    v.widescreen = v.widescreen != 0;
++    v.smoothing = v.smoothing != 0;
++    if (v.frame_rate != 30 && v.frame_rate != 60)
++        v.frame_rate = kDefaults.frame_rate;
++    v.native3d = v.native3d != 0;
++    v.pgxp = v.pgxp != 0;
++    return v;
++}
++
++} // namespace
+ 
+-void Read()
+-{
+-    static const int sizes[3][2] = { { 512, 240 }, { 720, 408 }, { 960, 544 } };
++void VitaGfxDefaults() { s_saved = kDefaults; }
++
++int VitaGfxSettingsLine(const char *section, const char *key, const char *value) {
++    int w, h;
++    if (_stricmp(section, "Vita"))
++        return 0;
++    if (!_stricmp(key, "RenderResolution")) {
++        if (sscanf(value, "%d%*[xX]%d", &w, &h) == 2 && ValidSize(w, h)) {
++            s_saved.render_w = w;
++            s_saved.render_h = h;
++        } else {
++            s_saved.render_w = kDefaults.render_w;
++            s_saved.render_h = kDefaults.render_h;
++        }
++    } else if (!_stricmp(key, "Widescreen")) {
++        s_saved.widescreen = OnOff(value, kDefaults.widescreen);
++    } else if (!_stricmp(key, "Smoothing")) {
++        s_saved.smoothing = OnOff(value, kDefaults.smoothing);
++    } else if (!_stricmp(key, "FrameRate")) {
++        s_saved.frame_rate = atoi(value) == 30 ? 30 : atoi(value) == 60 ? 60 : kDefaults.frame_rate;
++    } else if (!_stricmp(key, "Renderer3D")) {
++        if (!_stricmp(value, "Native"))
++            s_saved.native3d = 1;
++        else if (!_stricmp(value, "PlayStation") || !_stricmp(value, "psx") ||
++                 !_stricmp(value, "PS1"))
++            s_saved.native3d = 0;
++        else
++            s_saved.native3d = kDefaults.native3d;
++    } else if (!_stricmp(key, "PGXP")) {
++        s_saved.pgxp = OnOff(value, kDefaults.pgxp);
++    } else {
++        PC_Log("Settings.ini: unknown setting \"%s\" in [Vita]", key);
++    }
++    return 1;
++}
++
++void VitaGfxWriteSettings(FILE *f) {
++#ifdef __vita__
++    fputs("\n; PS Vita graphics (Options > Graphics), read when the game starts.\n"
++          "; RenderResolution = 512x240, 720x408 or 960x544 (the screen's). Widescreen = On draws\n"
++          "; the 3D 16:9, Off 4:3. Smoothing = On scales the picture up smoothly. FrameRate = 60\n"
++          "; or 30 (locked). Renderer3D = Native or PlayStation (the PS1's 3D path). PGXP = On\n"
++          "; draws vertices between pixels and textures in perspective.\n",
++          f);
++    fprintf(f, "\n[Vita]\nRenderResolution = %dx%d\nWidescreen = %s\nSmoothing = %s\n"
++               "FrameRate = %d\nRenderer3D = %s\nPGXP = %s\n",
++            s_saved.render_w, s_saved.render_h, s_saved.widescreen ? "On" : "Off",
++            s_saved.smoothing ? "On" : "Off", s_saved.frame_rate,
++            s_saved.native3d ? "Native" : "PlayStation", s_saved.pgxp ? "On" : "Off");
++#else
++    (void)f;
++#endif
++}
++
++/* After Settings.ini was read: the values for this run, with the environment's overrides. */
++void VitaGfxFreeze() {
+     const char *e;
+     int w, h;
+-    /* t26: the screen's 960x544 again (t25: the GPU ~7 ms a frame at 720x408, t24-t25's
+-     * drawing; t23 had ~50 ms at 960x544); THPS_VITA_RES=720x408 for the lighter one */
+-    s_gfx = PC_VitaGfx{ 960, 544, 1, 1, 60, 1 };
+-    if ((e = getenv("THPS_VITA_RES")) && sscanf(e, "%dx%d", &w, &h) == 2) {
+-        for (int i = 0; i < 3; i++)
+-            if (w == sizes[i][0] && h == sizes[i][1]) {
+-                s_gfx.render_w = w;
+-                s_gfx.render_h = h;
+-            }
++    if (s_frozen)
++        return;
++    s_frozen = true;
++    s_eff = s_saved;
++    if ((e = getenv("THPS_VITA_RES"))) {
++        if (sscanf(e, "%d%*[xX]%d", &w, &h) == 2 && ValidSize(w, h)) {
++            s_eff.render_w = w;
++            s_eff.render_h = h;
++        } else {
++            PC_Log("vitagfx: THPS_VITA_RES=%s ignored (512x240, 720x408 or 960x544)", e);
++        }
+     }
+     if ((e = getenv("THPS_WIDESCREEN")))
+-        s_gfx.widescreen = atoi(e) != 0;
++        s_eff.widescreen = atoi(e) != 0;
+     if ((e = getenv("THPS_FILTER")))
+-        s_gfx.smoothing = e[0] != '0';
+-    if ((e = getenv("THPS_VITA_FPS")) && atoi(e) == 30)
+-        s_gfx.frame_rate = 30;
+-    if ((e = getenv("THPS_RENDER3D")))
+-        s_gfx.native3d = strcmp(e, "psx") != 0;
+-    fprintf(stderr, "[gfx] render %dx%d, widescreen %s, smoothing %s, %d fps, 3D %s\n",
+-            s_gfx.render_w, s_gfx.render_h, s_gfx.widescreen ? "on" : "off",
+-            s_gfx.smoothing ? "on" : "off", s_gfx.frame_rate, s_gfx.native3d ? "native" : "PS1");
++        s_eff.smoothing = e[0] != '0';
++    if ((e = getenv("THPS_VITA_FPS"))) {
++        if (atoi(e) == 30 || atoi(e) == 60)
++            s_eff.frame_rate = atoi(e);
++        else
++            PC_Log("vitagfx: THPS_VITA_FPS=%s ignored (30 or 60)", e);
++    }
++    if ((e = getenv("THPS_RENDER3D"))) {
++        if (!strcmp(e, "native"))
++            s_eff.native3d = 1;
++        else if (!strcmp(e, "psx"))
++            s_eff.native3d = 0;
++    }
++    if ((e = getenv("THPS_PGXP")))
++        s_eff.pgxp = atoi(e) != 0;
++#ifdef __vita__
++    fprintf(stderr, "[gfx] render %dx%d, widescreen %s, smoothing %s, %d fps, 3D %s, PGXP %s "
++                    "(Settings.ini [Vita], then env.txt)\n",
++            s_eff.render_w, s_eff.render_h, s_eff.widescreen ? "on" : "off",
++            s_eff.smoothing ? "on" : "off", s_eff.frame_rate,
++            s_eff.native3d ? "native" : "PlayStation", s_eff.pgxp ? "on" : "off");
++#endif
+ }
+ 
+-} // namespace
++} // namespace pc
+ 
+-extern "C" const PC_VitaGfx *PC_VitaGfxGet(void)
+-{
+-    if (!s_read) {
+-        s_read = true;
+-        Read();
+-    }
+-    return &s_gfx;
++const PC_VitaGfx *PC_VitaGfxGet(void) {
++    if (!pc::s_frozen)
++        pc::g_settings.Load();   /* (freezes; once loaded, a no-op) */
++    pc::VitaGfxFreeze();         /* (in case the settings were loaded some other way) */
++    return &pc::s_eff;
++}
++
++const PC_VitaGfx *PC_VitaGfxSaved(void) {
++    if (!pc::s_frozen)
++        pc::g_settings.Load();
++    return &pc::s_saved;
+ }
++
++void PC_VitaGfxSize(int i, int *w, int *h) {
++    if (i < 0 || i >= PC_VITAGFX_SIZES)
++        i = PC_VITAGFX_SIZES - 1;
++    *w = pc::kSizes[i][0];
++    *h = pc::kSizes[i][1];
++}
++
++void PC_VitaGfxSetSaved(const PC_VitaGfx *g) { pc::s_saved = pc::Valid(*g); }
+-- 
+2.53.0
+

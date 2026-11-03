@@ -1,0 +1,356 @@
+From 3e1d3fd24f7537c7ec991f06785b19857d581c2d Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Wed, 28 Oct 2026 08:55:03 +0300
+Subject: [PATCH] Vita: t17's draw shaders again, batching in programs of its
+ own compiled last; numbered source on a compile failure
+
+t20's one changed vertex shader (the draw program's, with the class select packed into u_dpass)
+failed in vitaGL's compiler with no log, and every compile after it failed too (copy and
+present, unchanged), so the renderer did not start. The draw program's shaders are t17's again,
+compiled first as before. GlGpu::BatchPrograms then builds LayerBatch's vertex shader from
+t17's text: a uniform u_sel and, at the end of main, plain nested ifs (no packed uniform, no &&
+or nested ?:) that move other classes' triangles outside the clip volume, and compiles it with
+the draw and fast fragment shaders, after every other program. If the compiler rejects it,
+batching is off (Renderer3D asks GlGpu::BatchOk) and the game draws as t17's native path; the
+log says "[gl] batch shader: ok" or "REJECTED ...". THPS_R3D_BATCH=0 doesn't compile them.
+
+A shader that fails to compile is logged with its source, lines numbered.
+---
+ platform/pc/include/pc/gl_gpu.h          |  22 ++++-
+ platform/pc/include/pc/gl_shaders_gles.h |  11 +--
+ platform/pc/src/pc_gpu_gl.cpp            | 115 ++++++++++++++++++++---
+ platform/pc/src/pc_render3d.cpp          |   4 +-
+ 4 files changed, 121 insertions(+), 31 deletions(-)
+
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index 8f8e065..57735b5 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -11,6 +11,7 @@
+ 
+ #include <stdint.h>
+ 
++#include <string>
+ #include <vector>
+ 
+ #ifdef PC_GLES
+@@ -191,6 +192,8 @@ class GlGpu {
+      * the classes present, bit 1 << cls (0 opaque, 1 semi-transparent, 2 subtractive). No HD
+      * textures (those faces keep LayerDraw). */
+     void LayerBatch(int first, int count, int cls, int why);
++    /* LayerBatch can draw (its programs compiled) */
++    bool BatchOk() const { return m_drawProgBatch != 0; }
+     void LayerEnd();
+     void HdForget(uint16_t h);
+     void TexturesChanging(int x, int y, int w, int h);
+@@ -263,7 +266,10 @@ class GlGpu {
+     void SetBlend(int pass);
+     /* the draw program's u_dpass (a float in ES 2) */
+ #ifdef PC_GLES
+-    void DPass(int d, int sel = 0) { glUniform1f(m_drawUDpass, (float)(d + 2 * sel)); }
++    void DPass(int d) { glUniform1f(m_drawUDpass, (float)d); }
++    /* the batch programs' u_sel (LayerBatch): 0 all faces, 1 opaque, 2 semi-transparent,
++     * 3 subtractive */
++    void Sel(int sel) { glUniform1f(m_drawUSel, (float)sel); }
+ #else
+     void DPass(int d) { glUniform1i(m_drawUDpass, d); }
+ #endif
+@@ -358,13 +364,21 @@ class GlGpu {
+     uint8_t *m_atlasPtr = nullptr;   /* the atlas's texels (m_atlasTex on the Vita), written in place */
+     /* the draw programs' uniforms; m_drawU* are the bound program's (UseDraw) */
+     struct DrawLocs {
+-        GLint pass, dpass, proj, target, shift, uvfix;
++        GLint pass, dpass, proj, target, shift, uvfix, sel;
+     };
+     GLuint m_drawProgFast = 0;
+     DrawLocs m_locSlow = {}, m_locFast = {};
++    /* t21: LayerBatch's programs, the draw program's with u_sel (compiled last, after every
++     * program t17 had: when vitaGL's compiler rejects them, batching is off and the rest works) */
++    GLuint m_drawProgBatch = 0, m_drawProgBatchFast = 0;
++    DrawLocs m_locBatch = {}, m_locBatchFast = {};
++    GLint m_drawUSel = -1;
++    std::string m_batchVs;
++    const char *m_fastFs = nullptr;
++    void BatchPrograms(const char *draw_fs, const char *fast_fs);
+     float m_proj[4] = {};
+-    int m_projSet = 0, m_projApplied[2] = {};
+-    void UseDraw(int fast);
++    int m_projSet = 0, m_projApplied[4] = {};
++    void UseDraw(int fast, int batch = 0);
+     CacheSlot m_slot[kCacheSlots] = {};
+     uint32_t m_frameNo = 1;
+     int m_lastSlot = -1;
+diff --git a/platform/pc/include/pc/gl_shaders_gles.h b/platform/pc/include/pc/gl_shaders_gles.h
+index c6fc72c..33e40c9 100644
+--- a/platform/pc/include/pc/gl_shaders_gles.h
++++ b/platform/pc/include/pc/gl_shaders_gles.h
+@@ -69,10 +69,6 @@ static const char *gl_draw_vs =
+     "    vec2 k = 2.0 / u_target.zw;\n"
+     "    bool view = bits(info, 14.0, 1.0) > 0.5, dflag = bits(info, 13.0, 1.0) > 0.5;\n"
+     "    bool sky = bits(info, 15.0, 1.0) > 0.5;\n"
+-    /* u_dpass = the depth pass (0, 1) + 2 x a class select (t20's batched layers,
+-     * GlGpu::LayerBatch): 0 all faces, 1 opaque only, 2 semi-transparent but not subtractive,
+-     * 3 subtractive; the others go outside the clip volume */
+-    "    float sel = floor((u_dpass + 0.5) / 2.0), dpass = u_dpass - 2.0 * sel;\n"
+     "    float w;\n"
+     "    if (view) {\n"
+     "        vec3 v = a_pos;\n"
+@@ -89,7 +85,7 @@ static const char *gl_draw_vs =
+      * linear); everything else at the near end, always passing. A layer's faces nearer than its
+      * near plane are clipped, as gl_ClipDistance did */
+     "    if (sky) gl_Position.z = gl_Position.w;\n"
+-    "    else if (view && dpass > 0.5) gl_Position.z = clipZ(w, 0.0);\n"
++    "    else if (view && u_dpass > 0.5) gl_Position.z = clipZ(w, 0.0);\n"
+     "    else if (view || dflag) gl_Position.z = clipZ(w, 1.0 / 256.0);\n"
+     "    else gl_Position.z = -0.9999 * gl_Position.w;\n"
+     "    v_color = a_color.rgb;\n"
+@@ -105,11 +101,6 @@ static const char *gl_draw_vs =
+     "    v_flags = vec4(bits(info, 11.0, 1.0), view ? 1.0 : 0.0, cached, u_shift);\n"
+     "    v_twin = a_twin;\n"
+     "    v_uvr = a_uvr;\n"
+-    "    if (sel > 0.5) {\n"
+-    "        float abr = bits(info, 5.0, 2.0);\n"
+-    "        float fcls = bits(info, 11.0, 1.0) < 0.5 ? 1.0 : (abr > 1.5 && abr < 2.5 ? 3.0 : 2.0);\n"
+-    "        if (abs(fcls - sel) > 0.5) gl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n"
+-    "    }\n"
+     "}\n";
+ 
+ /* THPS_GL_FLAT=1 (a measurement): the vertex colour only, no texture lookups and no discard. The
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index b187c2f..b93768c 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -114,6 +114,14 @@ GLuint Compile(GLenum type, const char *src)
+         glGetShaderInfoLog(s, sizeof log, NULL, log);
+         fprintf(stderr, "[gl] %s shader compile error:\n%s\n",
+                 type == GL_VERTEX_SHADER ? "vertex" : "fragment", log[0] ? log : "(no log)");
++        /* t21: its source, numbered, so that a failure is never blind */
++        int line = 1;
++        for (const char *q = src; *q && line <= 200; line++) {
++            const char *e = strchr(q, '\n');
++            int len = e ? (int)(e - q) : (int)strlen(q);
++            fprintf(stderr, "  %3d %.*s\n", line, len, q);
++            q = e ? e + 1 : q + len;
++        }
+         glDeleteShader(s);
+         return 0;
+     }
+@@ -810,7 +818,7 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+         m_lastSlot = -1;
+     }
+     m_locSlow = DrawLocs{m_drawUPass, m_drawUDpass, m_drawUProj, m_drawUTarget, m_drawUShift,
+-                         m_drawUUvfix};
++                         m_drawUUvfix, -1};
+     if (m_cacheOn && draw_fs == gl_draw_fs) {
+         static const char *const fast_fs[5] = { gl_draw_fast_fs, gl_draw_fast_fs1, gl_draw_fast_fs2,
+                                                 gl_draw_fast_fs3, gl_draw_fast_fs4 };
+@@ -821,6 +829,7 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+         if (var)
+             fprintf(stderr, "[gl] THPS_GL_FASTVAR=%d: fast program variant (a measurement)\n", var);
+         m_drawProgFast = Program(gl_draw_vs, fast_fs[var]);
++        m_fastFs = fast_fs[var];
+         if (m_drawProgFast) {
+             glUseProgram(m_drawProgFast);
+             glUniform1i(glGetUniformLocation(m_drawProgFast, "u_vram"), 0);
+@@ -831,10 +840,11 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+                                  glGetUniformLocation(m_drawProgFast, "u_proj"),
+                                  glGetUniformLocation(m_drawProgFast, "u_target"),
+                                  glGetUniformLocation(m_drawProgFast, "u_shift"),
+-                                 glGetUniformLocation(m_drawProgFast, "u_uvfix")};
++                                 glGetUniformLocation(m_drawProgFast, "u_uvfix"), -1};
+             glUseProgram(m_drawProg);
+         }
+     }
++    BatchPrograms(draw_fs, m_drawProgFast && draw_fs == gl_draw_fs ? m_fastFs : nullptr);
+     AtlasUniforms();
+     fprintf(stderr, "[gl] texture cache: %s%s\n",
+             m_cacheOn ? "on (128 pages of 256x256, THPS_GL_TEXCACHE=0 turns it off)" : "off",
+@@ -2426,7 +2436,7 @@ void GlGpu::LayerDraw(int first, int count, int cls, uint16_t hd, int depth, int
+     if (!m_projSet || memcmp(proj, m_proj, sizeof proj)) {
+         memcpy(m_proj, proj, sizeof proj);
+         m_projSet = 1;
+-        m_projApplied[0] = m_projApplied[1] = 0;
++        m_projApplied[0] = m_projApplied[1] = m_projApplied[2] = m_projApplied[3] = 0;
+     }
+     UseDraw(slow_tris == 0);
+     if (slow_tris == 0 && m_drawProgFast) {
+@@ -2534,10 +2544,10 @@ void GlGpu::LayerBatch(int first, int count, int cls, int why)
+     if (!m_projSet || memcmp(proj, m_proj, sizeof proj)) {
+         memcpy(m_proj, proj, sizeof proj);
+         m_projSet = 1;
+-        m_projApplied[0] = m_projApplied[1] = 0;
++        m_projApplied[0] = m_projApplied[1] = m_projApplied[2] = m_projApplied[3] = 0;
+     }
+-    UseDraw(slow_tris == 0);
+-    if (slow_tris == 0 && m_drawProgFast) {
++    UseDraw(slow_tris == 0, 1);
++    if (slow_tris == 0 && m_drawProgBatchFast) {
+         m_st.fast_batches++;
+         m_st.fast_tris += count / 3;
+     } else {
+@@ -2565,13 +2575,14 @@ void GlGpu::LayerBatch(int first, int count, int cls, int why)
+              * colour where it is within the tolerance of the nearest: a decal over its floor
+              * passes, and the later of the two (the PS1's order) is the one left */
+             SetBlend(0);
+-            DPass(1, 1);
++            Sel(1);
++            DPass(1);
+             glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+             glDepthMask(GL_TRUE);
+             glDrawArrays(GL_TRIANGLES, first, count);
+             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+             glDepthMask(GL_FALSE);
+-            DPass(0, 1);
++            DPass(0);
+             glDrawArrays(GL_TRIANGLES, first, count);
+             n += 2;
+         }
+@@ -2579,20 +2590,20 @@ void GlGpu::LayerBatch(int first, int count, int cls, int why)
+         if (cls & 2) {
+             /* semi-transparent faces after every opaque one, in their own order */
+             SetBlend(0);
+-            DPass(0, 2);
++            Sel(2);
+             glDrawArrays(GL_TRIANGLES, first, count);
+             n++;
+         }
+         if (cls & 4) {
+             /* subtractive (B-F): after the other semi-transparent ones */
+-            DPass(0, 3);
++            Sel(3);
+             SetBlend(1);
+             glDrawArrays(GL_TRIANGLES, first, count);
+             SetBlend(2);
+             glDrawArrays(GL_TRIANGLES, first, count);
+             n += 2;
+         }
+-        DPass(0);
++        Sel(0);
+         m_st.draws++;
+         m_st.gl_draws += n;
+     }
+@@ -3279,11 +3290,18 @@ void GlGpu::QuadAttribs(const float *v, int stride_floats, int uv)
+ 
+ /* the draw program for a batch (fast: every textured triangle has a slot), its uniforms in
+  * m_drawU*, and the layer projection it hasn't had yet */
+-void GlGpu::UseDraw(int fast)
++void GlGpu::UseDraw(int fast, int batch)
+ {
+     int f = fast && m_drawProgFast ? 1 : 0;
+-    glUseProgram(f ? m_drawProgFast : m_drawProg);
+-    const DrawLocs &l = f ? m_locFast : m_locSlow;
++    if (batch && m_drawProgBatch)
++        f = fast && m_drawProgBatchFast ? 3 : 2;
++    static const GLuint GlGpu::*const progs[4] = { &GlGpu::m_drawProg, &GlGpu::m_drawProgFast,
++                                                   &GlGpu::m_drawProgBatch,
++                                                   &GlGpu::m_drawProgBatchFast };
++    const DrawLocs *locs[4] = { &m_locSlow, &m_locFast, &m_locBatch, &m_locBatchFast };
++    glUseProgram(this->*progs[f]);
++    const DrawLocs &l = *locs[f];
++    m_drawUSel = l.sel;
+     m_drawUPass = l.pass;
+     m_drawUDpass = l.dpass;
+     m_drawUProj = l.proj;
+@@ -3352,9 +3370,76 @@ void GlGpu::SlotFill(CacheSlot &c, uint64_t key)
+     c.cw = depth == 0 ? 16 : depth == 1 ? 256 : 0;
+ }
+ 
++/* t21: the batch programs. Their vertex shader is the draw program's (t17's, which vitaGL's
++ * compiler takes) with a uniform u_sel and, at the end of main, a block in the plainest GLSL that
++ * moves the triangles of the other classes outside the clip volume. Compiled after every other
++ * program (t20's single changed shader failed on the Vita, with no log, and every compile after it
++ * failed too): if they fail, LayerBatch is off and the rest is as in t17. */
++void GlGpu::BatchPrograms(const char *draw_fs, const char *fast_fs)
++{
++    static const char decl[] = "uniform float u_dpass;\n";
++    static const char tail[] = "    v_uvr = a_uvr;\n}\n";
++    static const char sel[] =
++        "    v_uvr = a_uvr;\n"
++        "    if (u_sel > 0.5) {\n"
++        "        float fsemi = bits(info, 11.0, 1.0);\n"
++        "        float fabr = bits(info, 5.0, 2.0);\n"
++        "        float fcls = 1.0;\n"
++        "        if (fsemi > 0.5) {\n"
++        "            fcls = 2.0;\n"
++        "            if (fabr > 1.5) {\n"
++        "                if (fabr < 2.5) {\n"
++        "                    fcls = 3.0;\n"
++        "                }\n"
++        "            }\n"
++        "        }\n"
++        "        if (abs(fcls - u_sel) > 0.5) {\n"
++        "            gl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n"
++        "        }\n"
++        "    }\n"
++        "}\n";
++    const char *bt = getenv("THPS_R3D_BATCH");
++    if (bt && atoi(bt) == 0)
++        return;   /* (not even compiled) */
++    std::string vs = gl_draw_vs;
++    size_t d = vs.find(decl), t = vs.rfind(tail);
++    if (d == std::string::npos || t == std::string::npos || t + sizeof tail - 1 != vs.size()) {
++        fprintf(stderr, "[gl] batch shader: the draw shader has changed, batching off\n");
++        return;
++    }
++    vs.replace(t, sizeof tail - 1, sel);
++    vs.insert(d + sizeof decl - 1, "uniform float u_sel;\n");
++    m_batchVs = vs;
++    auto locs = [](GLuint p) {
++        return DrawLocs{glGetUniformLocation(p, "u_pass"), glGetUniformLocation(p, "u_dpass"),
++                        glGetUniformLocation(p, "u_proj"), glGetUniformLocation(p, "u_target"),
++                        glGetUniformLocation(p, "u_shift"), glGetUniformLocation(p, "u_uvfix"),
++                        glGetUniformLocation(p, "u_sel")};
++    };
++    m_drawProgBatch = Program(m_batchVs.c_str(), draw_fs);
++    if (m_drawProgBatch && fast_fs)
++        m_drawProgBatchFast = Program(m_batchVs.c_str(), fast_fs);
++    GLuint progs[2] = { m_drawProgBatch, m_drawProgBatchFast };
++    for (int i = 0; i < 2; i++) {
++        GLuint p = progs[i];
++        if (!p)
++            continue;
++        glUseProgram(p);
++        glUniform1i(glGetUniformLocation(p, "u_vram"), 0);
++        glUniform1i(glGetUniformLocation(p, "u_hd"), 1);
++        glUniform1i(glGetUniformLocation(p, "u_atlas"), kAtlasUnit);
++        (i ? m_locBatchFast : m_locBatch) = locs(p);
++        glUniform1f((i ? m_locBatchFast : m_locBatch).sel, 0.0f);
++    }
++    glUseProgram(m_drawProg);
++    fprintf(stderr, "[gl] batch shader: %s%s\n",
++            m_drawProgBatch ? "ok" : "REJECTED by the compiler, batching off (t17's draws)",
++            m_drawProgBatch && fast_fs && !m_drawProgBatchFast ? " (no fast variant)" : "");
++}
++
+ void GlGpu::AtlasUniforms()
+ {
+-    GLuint progs[2] = { m_drawProg, m_drawProgFast };
++    GLuint progs[4] = { m_drawProg, m_drawProgFast, m_drawProgBatch, m_drawProgBatchFast };
+     for (GLuint p : progs) {
+         if (!p)
+             continue;
+diff --git a/platform/pc/src/pc_render3d.cpp b/platform/pc/src/pc_render3d.cpp
+index 7596d63..a0def8c 100644
+--- a/platform/pc/src/pc_render3d.cpp
++++ b/platform/pc/src/pc_render3d.cpp
+@@ -1456,7 +1456,7 @@ void Renderer3D::Init(int gl)
+ #ifdef PC_GLES
+     {
+         const char *bt = getenv("THPS_R3D_BATCH");
+-        m_batch = !(bt && atoi(bt) == 0);
++        m_batch = !(bt && atoi(bt) == 0) && g_glGpu.BatchOk();   /* (its programs compiled) */
+     }
+ #endif
+     m_showStats = getenv("THPS_R3DSTATS") && atoi(getenv("THPS_R3DSTATS"));
+@@ -1468,7 +1468,7 @@ void Renderer3D::Init(int gl)
+         g_precise.Enable(true);
+ #ifdef __vita__
+     fprintf(stderr, "[r3d] 3D: %s%s\n", m_native ? "native" : "PS1",
+-            m_native ? (m_batch ? ", batched (THPS_R3D_BATCH=0: t17's draws)" : ", t17's draws (THPS_R3D_BATCH=0)") : "");
++            m_native ? (m_batch ? ", batched (THPS_R3D_BATCH=0: t17's draws)" : ", t17's draws (batching off)") : "");
+ #else
+     fprintf(stderr, "[r3d] 3D: %s\n", m_native ? "native" : "PS1 (THPS_RENDER3D=psx)");
+ #endif
+-- 
+2.53.0
+

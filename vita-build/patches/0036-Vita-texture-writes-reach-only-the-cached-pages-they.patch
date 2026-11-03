@@ -1,0 +1,240 @@
+From 831044df8ca737144987d6593a87cee31350b73c Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Sat, 31 Oct 2026 14:48:26 +0300
+Subject: [PATCH] Vita: texture writes reach only the cached pages they change:
+ same bytes skipped, exact rectangles, pages updated in place
+
+- t30 at 864x488 ran 50-60 fps most of the time, with stretches of 16-30 fps: 150-220 pages
+  decoded a second, ~27000 misses and as many invalidations in a session. Every write to the
+  texture store freed each cached page it reached, by 16x16 cells at the next Prepare: a palette
+  row took every page using any CLUT in those 16 rows, a small image every page (all its CLUTs)
+  at that place, whether or not the bytes had changed.
+- TextureStore::Upload compares first: the bytes already there change nothing
+  (THPS_GL_SAMEBYTES=0: written anyway).
+- The cache is told the exact rectangle right after the write (GlGpu::TexturesWritten;
+  THPS_GL_PRECISEINV=0: the cells at the next Prepare).
+- Texels written to a page drawn in the last 4 frames: the rows touched (8-row bands) are decoded
+  again in its slot, which stays valid (THPS_GL_PARTIAL=0: freed). A CLUT, a texture window, a
+  page wrapping at VRAM's edge, a write of 64 rows or more, or a page not drawn lately: freed as
+  before. The per-frame check against the store (CacheCheck, "stale") still watches for misses.
+- [gl] line: texture writes skipped as the same bytes, pages updated in place, freed. Boot line
+  "[gl] texture cache writes: ...".
+---
+ platform/pc/README.md           |  3 ++
+ platform/pc/include/pc/gl_gpu.h |  8 ++++
+ platform/pc/src/pc_gpu_gl.cpp   | 65 +++++++++++++++++++++++++++++++--
+ platform/pc/src/pc_texstore.cpp | 23 ++++++++++++
+ 4 files changed, 95 insertions(+), 4 deletions(-)
+
+diff --git a/platform/pc/README.md b/platform/pc/README.md
+index 633142a..0bbb987 100644
+--- a/platform/pc/README.md
++++ b/platform/pc/README.md
+@@ -576,6 +576,9 @@ window, `THPS_FAST`, `THPS_DETERMINISTIC`) never wait for a display.
+ | `THPS_GL_GPUTIME=1` | Vita, a measurement: each frame drawn to the end before the swap, the GPU time logged (`[gpu]`); slower |
+ | `THPS_GL_HALF=0` | OpenGL ES (Vita): the opaque no-discard program's colour maths in full precision (default t30: half, where the compiler takes it) |
+ | `THPS_DATA_BUCKETS=0` | Vita: Data's files stay where they are (default t30: moved into 64 subfolders bk00-bk63 at start, renames only; files are found either way); `=undo` moves them back; `THPS_DATA_BUCKETS_SECS=n` caps a start's work (default 60) |
++| `THPS_GL_SAMEBYTES=0` | texture writes of the bytes already there are done anyway (default t31: skipped) |
++| `THPS_GL_PRECISEINV=0` | a texture write reaches the cached pages by 16x16 cells at the next draw (default t31: its exact rectangle) |
++| `THPS_GL_PARTIAL=0` | cached pages a write reaches are freed (default t31: pages drawn lately have the written rows decoded again in place) |
+ | `THPS_FILE_DIRECT=0` | Vita: game files read with stdio as before t28 (default: sceIoRead in pieces of 1 MB, an open reads only the header) |
+ | `THPS_GL_DECODE_THREADS=n` | Vita: texture cache pages decoded by n threads on cores 1-3 with the game thread (default 3, 0 = the game thread alone) |
+ | `THPS_GL_NODISCARD=0` | OpenGL ES (Vita), batched 3D: no separate no-discard, no-blend program for opaque faces with no transparent texel under them |
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index 1990134..c93ed13 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -198,6 +198,10 @@ class GlGpu {
+     void LayerEnd();
+     void HdForget(uint16_t h);
+     void TexturesChanging(int x, int y, int w, int h);
++    /* t31: x, y, w, h of the store were just written (exact, not rounded to its 16x16 cells), or
++     * a write was skipped for being the bytes already there */
++    void TexturesWritten(int x, int y, int w, int h);
++    void TexturesSame() { m_st.cache_same++; }
+     void Blit(int x, int y, int w, int h, const uint16_t *src);
+     void Read(int x, int y, int w, int h, uint16_t *out);
+     void Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+@@ -247,6 +251,7 @@ class GlGpu {
+         int fast_batches, slow_batches, fast_tris, slow_tris, uncached_tris;
+         int store_cells, store_switches, store_copies, blit_pool, blit_copies;
+         int cache_stale, own_fixed;
++        int cache_same, cache_partial;  /* t31: writes skipped (same bytes), slots updated in place */
+         int gl_draws, layer_draws, split[PC_GL_SPLITS];
+         int layer_bufs, layer_client;   /* 3D layers drawn from a buffer; 3D draws not */
+         int layer_batches;              /* t20: 3D draws made by LayerBatch */
+@@ -430,6 +435,9 @@ private:
+     /* before: if given, the count before each triangle (n / 3 + 1 entries) */
+     int CacheVerts(GlVert *v, int n, uint32_t *before = nullptr);
+     void CacheInvalidate(int x, int y, int w, int h);
++    /* t31 (THPS_GL_PRECISEINV=0: by 16x16 cells at the next Prepare, which reached every CLUT in
++     * those 16 rows; THPS_GL_PARTIAL=0: no updates in place) */
++    bool m_preciseInv = true, m_partial = true;
+     void CacheRefresh();
+     /* row y of a slot's texels, decoded from the store into out (256 RGBA texels) */
+     void DecodeRow(const CacheSlot &c, int y, uint32_t *out);
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index 835ff0b..6a3da00 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -858,6 +858,14 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+     {
+         const char *tc = getenv("THPS_GL_TEXCACHE");
+         m_cacheOn = !(tc && tc[0] == '0');
++        const char *pi = getenv("THPS_GL_PRECISEINV"), *pa = getenv("THPS_GL_PARTIAL");
++        m_preciseInv = !(pi && pi[0] == '0');
++        m_partial = !(pa && pa[0] == '0');
++        fprintf(stderr, "[gl] texture cache writes: %s, %s, %s\n",
++                m_preciseInv ? "exact rectangles (THPS_GL_PRECISEINV=0: 16x16 cells)" : "16x16 cells",
++                m_partial ? "pages updated in place (THPS_GL_PARTIAL=0: freed)" : "pages freed",
++                getenv("THPS_GL_SAMEBYTES") && getenv("THPS_GL_SAMEBYTES")[0] == '0'
++                    ? "same bytes written" : "same bytes skipped (THPS_GL_SAMEBYTES=0: written)");
+         const char *dm = getenv("THPS_GL_DECODEMS");
+         m_decodeBudgetUs = (dm ? atoi(dm) : 25) * 1000LL;
+         const char *lv = getenv("THPS_GL_LAYERVBO");
+@@ -1170,7 +1178,7 @@ void GlGpu::UploadTexStore()
+                     m_cellGen[cy * CELLS_X + run]++;
+                 }
+                 m_st.tex_ups++;
+-                if (m_cacheOn)
++                if (m_cacheOn && !m_preciseInv)
+                     CacheInvalidate(cx * CELL, cy * CELL, (run - cx) * CELL, CELL);
+                 any = 1;
+                 cx = run;
+@@ -1202,7 +1210,7 @@ void GlGpu::UploadTexStore()
+             int x = cx * CELL, y = cy * CELL;
+             m_st.tex_ups++;
+ #ifdef PC_GLES
+-            if (m_cacheOn)
++            if (m_cacheOn && !m_preciseInv)
+                 CacheInvalidate(x, y, (run - cx) * CELL, CELL);
+ #endif
+ #ifdef PC_GLES
+@@ -1784,6 +1792,54 @@ void GlGpu::TexturesChanging(int x, int y, int w, int h)
+             m_drawn[cy][cx] = 0;
+ }
+ 
++/* t31: a write's exact rectangle against the cached pages. t30's dips in levels (16-30 fps, 150-220
++ * pages decoded a second) came from each small write throwing away every page it touched,
++ * rounded up to 16x16 cells: a palette row took every page using a CLUT in the same 16 rows.
++ * Texels written to a page drawn lately: its rows decoded again where it sits (8-row bands, as
++ * m_slotTransp), the slot and the layers' vertices stay good. A CLUT, a window, a page wrapping at
++ * VRAM's edge, a big write or a page not drawn lately: freed as before. */
++void GlGpu::TexturesWritten(int x, int y, int w, int h)
++{
++#ifdef PC_GLES
++    if (!m_active || !m_cacheOn || !m_preciseInv)
++        return;
++    for (int s = 0; s < kCacheSlots; s++) {
++        CacheSlot &c = m_slot[s];
++        if (!c.key)
++            continue;
++        bool texels = false;
++        if (y < c.y + 256 && c.y < y + h)
++            texels = (x < c.x + c.w && c.x < x + w) ||
++                     (x < c.x + c.w - VRAM_W && c.x - VRAM_W < x + w);
++        bool clut = c.cw && c.cy >= y && c.cy < y + h && x < c.cx + c.cw && c.cx < x + w;
++        if (!texels && !clut)
++            continue;
++#ifdef __vita__
++        int y0 = (y > c.y ? y - c.y : 0) & ~7, y1 = (y + h - 1 - c.y < 255 ? y + h - 1 - c.y : 255) | 7;
++        if (m_partial && !clut && (uint32_t)(c.key >> 32) == 0xffffu && c.x + c.w <= VRAM_W &&
++            y1 - y0 < 64 && m_frameNo - c.frame < 4) {
++            uint32_t row[256];
++            for (int b = y0 >> 3; b <= y1 >> 3; b++)
++                m_slotTransp[s][b] = 0;
++            for (int r = y0; r <= y1; r++) {
++                DecodeRow(c, r, row);
++                memcpy(AtlasRow(s, r), row, sizeof row);
++                TranspRow(s, r, row);
++            }
++            m_st.cache_partial++;
++            continue;
++        }
++#endif
++        m_st.cache_inval++;
++        m_cacheGen++;
++        c.key = 0;
++    }
++    m_lastSlot = -1;
++#else
++    (void)x, (void)y, (void)w, (void)h;
++#endif
++}
++
+ /* ---------------------------------------------------------------------------------------------
+  * HD textures (pc_dctex.h) */
+ 
+@@ -3499,7 +3555,8 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                         "GL draws %.0f a frame; 3D %.0f draws a frame (new draw for depth %d, "
+                         "class %d, texture %d, 2D between %d, layer end %d); 3D layers in a "
+                         "buffer %d, 3D draws not %d, batched %d; framebuffer binds %.0f a frame; opaque batched tris %d without discard, "
+-                        "%d with, %d colour runs (%d batches over 48)\n",
++                        "%d with, %d colour runs (%d batches over 48); texture writes: %d skipped as "
++                        "the same bytes, %d pages updated in place, %d freed\n",
+                 m_st.draws, m_st.readbacks, m_st.tex_ups, m_st.blits, m_st.cache_hits,
+                 m_st.cache_misses, m_st.cache_inval, m_st.cache_full, m_st.cache_deferred,
+                 m_st.cache_stale, m_st.fast_batches, m_st.fast_tris, m_st.slow_batches,
+@@ -3510,7 +3567,7 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                 m_st.split[PC_GL_SPLIT_TEXTURE], m_st.split[PC_GL_SPLIT_2D],
+                 m_st.split[PC_GL_SPLIT_END], m_st.layer_bufs, m_st.layer_client,
+                 m_st.layer_batches, s_fbBinds / 60.0, m_st.solid_tris, m_st.cut_tris, m_st.colour_runs,
+-                m_st.colour_unordered);
++                m_st.colour_unordered, m_st.cache_same, m_st.cache_partial, m_st.cache_inval);
+         s_fbBinds = 0;
+         m_st = Stats{};
+         m_st.on = 1;
+diff --git a/platform/pc/src/pc_texstore.cpp b/platform/pc/src/pc_texstore.cpp
+index 551c214..bc3b1fa 100644
+--- a/platform/pc/src/pc_texstore.cpp
++++ b/platform/pc/src/pc_texstore.cpp
+@@ -1,5 +1,6 @@
+ /* The texture store (pc_texstore.h): the texels at the game's coordinates, and which 16x16 cells
+  * changed since the renderer last uploaded them (pc_gpu_gl.cpp). */
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include "pc_texstore.h"
+@@ -40,10 +41,31 @@ void TextureStore::Upload(int x, int y, int w, int h, const void *src) {
+     int sw = w;
+     if (x < 0 || y < 0 || !Clip(x, y, w, h))
+         return;
++    /* t31: the game loads the same palettes and images again and again (t30's level dips: ~10
++     * cached pages thrown away a frame); bytes already there change nothing. THPS_GL_SAMEBYTES=0
++     * writes them anyway */
++    static int same = -1;
++    if (same < 0) {
++        const char *e = getenv("THPS_GL_SAMEBYTES");
++        same = !(e && e[0] == '0');
++    }
++    if (same) {
++        int j = 0;
++        while (j < h && !memcmp(&m_tex[y + j][x], s + j * sw, (size_t)w * 2))
++            j++;
++        if (j == h) {
++            for (int cy = y / kTexCell; cy <= (y + h - 1) / kTexCell; cy++)
++                for (int cx = x / kTexCell; cx <= (x + w - 1) / kTexCell; cx++)
++                    m_cell[cy][cx] |= kTexUsed;
++            g_glGpu.TexturesSame();
++            return;
++        }
++    }
+     g_glGpu.TexturesChanging(x, y, w, h);
+     for (int j = 0; j < h; j++)
+         memcpy(&m_tex[y + j][x], s + j * sw, (size_t)w * 2);
+     Mark(x, y, w, h);
++    g_glGpu.TexturesWritten(x, y, w, h);
+ }
+ 
+ void TextureStore::Read(int x, int y, int w, int h, void *dst) {
+@@ -64,6 +86,7 @@ void TextureStore::Fill(int x, int y, int w, int h, uint32_t rgb) {
+         for (int i = 0; i < w; i++)
+             m_tex[y + j][x + i] = c;
+     Mark(x, y, w, h);
++    g_glGpu.TexturesWritten(x, y, w, h);
+ }
+ 
+ }   // namespace pc
+-- 
+2.53.0
+

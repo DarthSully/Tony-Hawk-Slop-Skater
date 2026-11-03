@@ -1,0 +1,169 @@
+From 98609c03fb1034af1b328d55453d02de8167e9c2 Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Sat, 24 Oct 2026 12:51:15 +0300
+Subject: [PATCH] Vita: profile slots for GL submission and file reads; a stall
+ line (over 200 ms) and memory lines
+
+---
+ platform/pc/include/pc/platform.h | 16 ++++++++++++-
+ platform/pc/src/pc_fileio.cpp     |  7 +++++-
+ platform/pc/src/pc_gpu_gl.cpp     |  6 +++++
+ platform/pc/src/pc_vita.cpp       | 37 +++++++++++++++++++++++++++----
+ 4 files changed, 60 insertions(+), 6 deletions(-)
+
+diff --git a/platform/pc/include/pc/platform.h b/platform/pc/include/pc/platform.h
+index 8360329..77e113f 100644
+--- a/platform/pc/include/pc/platform.h
++++ b/platform/pc/include/pc/platform.h
+@@ -33,11 +33,25 @@
+ void PC_VitaLogOpen(void);
+ /* the `profile` switch (an empty PC_VITA_DIR/profile file): time spent per slot, logged once a
+  * second at the frame boundary (PC_VitaProfFrame) */
+-enum { PC_PROF_PRESENT, PC_PROF_SWAP, PC_PROF_READBACK, PC_PROF_MOVIE, PC_PROF_SLOTS };
++enum { PC_PROF_PRESENT, PC_PROF_SWAP, PC_PROF_READBACK, PC_PROF_MOVIE, PC_PROF_DRAW, PC_PROF_FILE,
++       PC_PROF_SLOTS };
+ extern int pc_vita_profile;
+ long long PC_VitaProfNow(void);
+ void PC_VitaProfAdd(int slot, long long us);
+ void PC_VitaProfFrame(void);
++#ifdef __cplusplus
++/* times the rest of the enclosing block into a slot */
++struct PC_VitaProfScope {
++    int slot;
++    long long t0;
++    explicit PC_VitaProfScope(int s) : slot(s), t0(pc_vita_profile ? PC_VitaProfNow() : 0) {}
++    ~PC_VitaProfScope() {
++        if (pc_vita_profile)
++            PC_VitaProfAdd(slot, PC_VitaProfNow() - t0);
++    }
++};
++#define PC_VITA_PROF_SCOPE(slot) PC_VitaProfScope pc_vita_prof_scope_(slot)
++#endif
+ #endif
+ #define PC_FSEEK fseeko
+ #define PC_FTELL ftello
+diff --git a/platform/pc/src/pc_fileio.cpp b/platform/pc/src/pc_fileio.cpp
+index 1c99efb..8075d00 100644
+--- a/platform/pc/src/pc_fileio.cpp
++++ b/platform/pc/src/pc_fileio.cpp
+@@ -173,7 +173,12 @@ void FileIo::Read(void *dest, int size) {
+ extern "C" {
+ 
+ int PC_FileOpen(const char *name) { return pc::g_fileIo.Open(name); }
+-void PC_FileRead(void *dest, int size) { pc::g_fileIo.Read(dest, size); }
++void PC_FileRead(void *dest, int size) {
++#ifdef __vita__
++    PC_VITA_PROF_SCOPE(PC_PROF_FILE);
++#endif
++    pc::g_fileIo.Read(dest, size);
++}
+ int PC_BmpLayoutSize(const void *bmp, int *lw, int *lh) { return pc::FileIo::BmpLayoutSize(bmp, lw, lh); }
+ 
+ }
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index 8c04916..36a1dce 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -893,6 +893,9 @@ void GlGpu::SetBlend(int pass)
+ 
+ void GlGpu::Flush()
+ {
++#ifdef __vita__
++    PC_VITA_PROF_SCOPE(PC_PROF_DRAW);
++#endif
+     Batch &b = m_batch;
+     if (!b.nv)
+         return;
+@@ -1441,6 +1444,9 @@ void GlGpu::LayerBegin(const GlLayerParams *lp, const GlVert *v, int nv)
+ 
+ void GlGpu::LayerDraw(int first, int count, int cls, uint16_t hd)
+ {
++#ifdef __vita__
++    PC_VITA_PROF_SCOPE(PC_PROF_DRAW);
++#endif
+     Layer &l = m_layer;
+     if (!l.active || count <= 0)
+         return;
+diff --git a/platform/pc/src/pc_vita.cpp b/platform/pc/src/pc_vita.cpp
+index 4a7d51f..d91e199 100644
+--- a/platform/pc/src/pc_vita.cpp
++++ b/platform/pc/src/pc_vita.cpp
+@@ -12,6 +12,8 @@
+ #include <psp2/kernel/clib.h>
+ #include <psp2/kernel/processmgr.h>
+ #include <psp2/power.h>
++#include <malloc.h>
++#include <vitaGL.h>
+ 
+ #include "pc/platform.h"
+ #include "pc_runtime.h"
+@@ -94,8 +96,8 @@ void PC_VitaLogOpen(void) {
+ int pc_vita_profile;
+ 
+ namespace {
+-long long g_profUs[PC_PROF_SLOTS];
+-int g_profCount[PC_PROF_SLOTS];
++long long g_profUs[PC_PROF_SLOTS], g_profFrameUs[PC_PROF_SLOTS];
++int g_profCount[PC_PROF_SLOTS], g_profFrameNo;
+ long long g_profStart, g_profFrameStart, g_profFrameMax;
+ int g_profFrames;
+ } // namespace
+@@ -105,6 +107,7 @@ long long PC_VitaProfNow(void) { return pc_vita_profile ? (long long)sceKernelGe
+ void PC_VitaProfAdd(int slot, long long us) {
+     if (pc_vita_profile && slot >= 0 && slot < PC_PROF_SLOTS) {
+         g_profUs[slot] += us;
++        g_profFrameUs[slot] += us;
+         g_profCount[slot]++;
+     }
+ }
+@@ -116,8 +119,24 @@ void PC_VitaProfFrame(void) {
+     if (!pc_vita_profile)
+         return;
+     long long now = (long long)sceKernelGetProcessTimeWide();
++    g_profFrameNo++;
+     if (g_profFrameStart && now - g_profFrameStart > g_profFrameMax)
+         g_profFrameMax = now - g_profFrameStart;
++    /* a frame over 200 ms: where its time went, and the memory left at that moment */
++    if (g_profFrameStart && now - g_profFrameStart > 200000) {
++        long long *f = g_profFrameUs;
++        double dt = (now - g_profFrameStart) / 1000.0;
++        double known = (f[PC_PROF_PRESENT] + f[PC_PROF_READBACK] + f[PC_PROF_MOVIE]) / 1000.0;
++        fprintf(stderr,
++                "[stall] frame %d: %.1f ms: present %.1f (swap %.1f), draw %.1f, file %.1f, "
++                "readback %.1f, other %.1f; vgl free ram %uK vram %uK phycont %uK, heap free %uK\n",
++                g_profFrameNo, dt, f[PC_PROF_PRESENT] / 1000.0, f[PC_PROF_SWAP] / 1000.0,
++                f[PC_PROF_DRAW] / 1000.0, f[PC_PROF_FILE] / 1000.0, f[PC_PROF_READBACK] / 1000.0,
++                dt - known > 0 ? dt - known : 0.0, (unsigned)(vglMemFree(VGL_MEM_RAM) >> 10),
++                (unsigned)(vglMemFree(VGL_MEM_VRAM) >> 10), (unsigned)(vglMemFree(VGL_MEM_PHYCONT) >> 10),
++                (unsigned)(mallinfo().fordblks >> 10));
++    }
++    memset(g_profFrameUs, 0, sizeof g_profFrameUs);
+     g_profFrameStart = now;
+     if (!g_profStart)
+         g_profStart = now;
+@@ -130,10 +149,20 @@ void PC_VitaProfFrame(void) {
+     double other = span / n - present - rb - movie;
+     fprintf(stderr,
+             "[prof] %.1f fps, frame %.1f ms (max %.1f): present %.1f (swap %.1f), readback %.1f "
+-            "(%d), movie %.1f (%d), other %.1f\n",
++            "(%d), movie %.1f (%d), other %.1f (draw %.1f, file %.1f)\n",
+             n * 1000.0 / span, span / n, g_profFrameMax / 1000.0, present,
+             swap, rb, g_profCount[PC_PROF_READBACK], movie, g_profCount[PC_PROF_MOVIE],
+-            other > 0 ? other : 0.0);
++            other > 0 ? other : 0.0, g_profUs[PC_PROF_DRAW] / 1000.0 / n,
++            g_profUs[PC_PROF_FILE] / 1000.0 / n);
++    /* every 10 s: what vitaGL's pools and newlib's heap have left */
++    static int s_memTick;
++    if (++s_memTick % 10 == 1) {
++        struct mallinfo mi = mallinfo();
++        fprintf(stderr, "[mem] vgl free ram %uK vram %uK phycont %uK; heap free %uK of %uK\n",
++                (unsigned)(vglMemFree(VGL_MEM_RAM) >> 10), (unsigned)(vglMemFree(VGL_MEM_VRAM) >> 10),
++                (unsigned)(vglMemFree(VGL_MEM_PHYCONT) >> 10), (unsigned)(mi.fordblks >> 10),
++                (unsigned)(mi.arena >> 10));
++    }
+     memset(g_profUs, 0, sizeof g_profUs);
+     memset(g_profCount, 0, sizeof g_profCount);
+     g_profFrames = 0;
+-- 
+2.53.0
+

@@ -1,0 +1,1153 @@
+From 58b16b4ac52ea7bf5f179730b40edaa738b3c923 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 21:41:35 +0000
+Subject: [PATCH 2/3] OpenGL ES 2 renderer (PC_GLES) for the Vita's vitaGL,
+ testable on Linux
+
+pc/gl_shaders_gles.h: the PS1 texture lookup (4/8-bit CLUT, 15-bit, texture
+window) in float arithmetic on a LUMINANCE_ALPHA texture store, the kept weight
+in alpha instead of dual-source blending, and depth from the vertex stage (a
+projective depth, linear in clip space) instead of gl_FragDepth. The backend's
+ES 2 differences are under PC_GLES: client-side vertex arrays, quad blits for
+glBlitFramebuffer, row packing for UNPACK_ROW_LENGTH, RGBA readbacks, screens at
+the PS1's resolution. THPS_GLES=1 builds it on Linux; against the 3.3 renderer
+at THPS_GL_SCALE=1 the attract-mode frames match to 0.03% of pixels.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01NwhU758snL1NnmSbmmwENz
+---
+ platform/pc/include/pc/gl_gpu.h          |  37 ++-
+ platform/pc/include/pc/gl_shaders_gles.h | 231 ++++++++++++++++++
+ platform/pc/src/glad_gl.c                |   3 +
+ platform/pc/src/pc_gpu_gl.cpp            | 286 +++++++++++++++++++++--
+ platform/pc/src/pc_video.cpp             |  16 ++
+ platform/pc/tools/link.py                |   7 +-
+ platform/pc/tools/toolchain.py           |   3 +
+ 7 files changed, 561 insertions(+), 22 deletions(-)
+ create mode 100644 platform/pc/include/pc/gl_shaders_gles.h
+
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index d8a3660..6b67830 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -1,5 +1,5 @@
+-/* The OpenGL 3.3 drawing backend (src/pc_gpu_gl.cpp). pc_draw.cpp parses the
+- * game's primitives and holds the drawing state; it hands polygons, rectangles, lines and fills
++/* The OpenGL 3.3 drawing backend (src/pc_gpu_gl.cpp; OpenGL ES 2 with PC_GLES). pc_draw.cpp parses
++ * the game's primitives and holds the drawing state; it hands polygons, rectangles, lines and fills
+  * here. They are drawn into render targets: the screens (display surfaces, see GlGpu::NoteScreen)
+  * at the size their picture is shown at, anything else at the PS1's resolution. Textures come from
+  * the texture store (pc/texture_store.h). The screens' pixels live only in the render targets: the
+@@ -11,7 +11,15 @@
+ 
+ #include <stdint.h>
+ 
++#include <vector>
++
++#ifdef PC_GLES
++/* OpenGL ES 2 (the PS Vita's vitaGL; THPS_GLES=1 on Linux): pc/gl_shaders_gles.h */
++#include <GLES2/gl2.h>
++#include <GLES2/gl2ext.h>
++#else
+ #include <glad/gl.h>
++#endif
+ 
+ /* Widescreen margin columns of the gameplay screens, for the game's view frustum (game/src/bit.cpp). */
+ extern "C" int pc_wide_pad;
+@@ -169,6 +177,12 @@ class GlGpu {
+     void Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                  const uint32_t *image, int iw, int ih);
+     uint32_t *ReadArea(int x, int y, int w, int h, int *out_w, int *out_h);
++#ifdef PC_GLES
++    /* A target's pixels fx0,fy0..fx1,fy1 (exclusive) to another framebuffer's tx0,ty0..tx1,ty1
++     * (to_w*to_h pixels), scaled (nearest): glBlitFramebuffer, which ES 2 lacks, as a quad. */
++    void BlitPixels(const RenderTarget *from, int fx0, int fy0, int fx1, int fy1, GLuint to_fbo,
++                    int to_w, int to_h, int tx0, int ty0, int tx1, int ty1);
++#endif
+ 
+   private:
+     /* the pending batch of emulated primitives (one triangle stream) */
+@@ -191,6 +205,9 @@ class GlGpu {
+         int wide;         /* the layer's drawing area is widened (GlLayerParams.wide) */
+         GlLayerParams lp;
+         GLuint vao, vbo;
++#ifdef PC_GLES
++        const GlVert *verts;   /* LayerBegin's, drawn from where they are (no buffers) */
++#endif
+     };
+ 
+     /* THPS_GLSTATS=1: per-second counts of draw calls, readbacks and uploads */
+@@ -210,6 +227,12 @@ class GlGpu {
+     void HdBind(uint16_t h);
+     /* batches */
+     void SetBlend(int pass);
++    /* the draw program's u_dpass (a float in ES 2) */
++#ifdef PC_GLES
++    void DPass(int d) { glUniform1f(m_drawUDpass, (float)d); }
++#else
++    void DPass(int d) { glUniform1i(m_drawUDpass, d); }
++#endif
+     void Flush();
+     void CheckTexture(const GlPrim *p, int umin, int vmin, int umax, int vmax);
+     GlVert *BeginPrim(const GlPrim *p, int nverts, int bx0, int by0, int bx1, int by1);
+@@ -252,6 +275,16 @@ class GlGpu {
+     GLint m_maxSamples = 0;
+     GLint m_maxTex = 0;
+     GLuint m_rbFbo = 0, m_rbTex = 0;       /* RGBA8 1024x512: readback */
++#ifdef PC_GLES
++    GLint m_presentUAlpha = 0;
++    std::vector<uint8_t> m_upload;         /* rows on their way to a texture (no UNPACK_ROW_LENGTH) */
++    /* ES 2 has no vertex array objects: a draw program's attributes from a client-side array
++     * (vitaGL copies those into its frame's memory) */
++    void DrawAttribs(const GlVert *v);
++    void QuadAttribs(const float *v, int stride_floats, int uv);
++    /* rows of w 16-bit pixels, `stride` apart, into the bound LUMINANCE_ALPHA texture at x, y */
++    void Upload16(int x, int y, int w, int h, const uint16_t *src, int stride);
++#endif
+     GLuint m_dispTex = 0;                  /* RGBA8 1024x512: pictures shown instead (movies) */
+     int m_filter = 0;
+     int m_precise = 0, m_perspective = 0;  /* THPS_GL_PRECISE, THPS_GL_PERSPECTIVE (default on) */
+diff --git a/platform/pc/include/pc/gl_shaders_gles.h b/platform/pc/include/pc/gl_shaders_gles.h
+new file mode 100644
+index 0000000..3d9452c
+--- /dev/null
++++ b/platform/pc/include/pc/gl_shaders_gles.h
+@@ -0,0 +1,231 @@
++/* GLSL ES 1.00 sources for the OpenGL ES 2 build of the GPU backend (PC_GLES: the PS Vita, through
++ * vitaGL's GLSL translator; Linux with THPS_GLES=1 for testing it on a desktop). The same drawing
++ * as gl_shaders.h, within what ES 2 and the Vita's GPU have:
++ *
++ * - The texture store and the CPU's pixels are LUMINANCE_ALPHA textures, not R16UI: a texel's
++ *   low byte in L, its high byte in A. Every texel lookup, CLUT index and texture window is float
++ *   arithmetic on whole numbers (exact in 32-bit floats), with no integer types or bit operators.
++ * - The vertex attributes are floats; the shader unpacks the info and CLUT words (texture page,
++ *   colour depth, blend mode, flags) in the vertex stage, into varyings that are the same at each
++ *   corner (no flat varyings in ES 2: the fragment stage rounds them).
++ * - No dual-source blending: the weight the old pixel keeps goes out in alpha, blended as
++ *   dst * (1 - src.a) + src; alpha itself is never written by drawing (its blend factors keep the
++ *   old value), so the mask bit is kept only for the CPU's pixels (GlGpu::Blit) and fills.
++ * - No gl_FragDepth: depth comes from the vertex stage, as a projective depth of view z (near =
++ *   the layer's near plane, which also clips as gl_ClipDistance did), monotonic like the linear
++ *   z / 2^20 it stands for. The colour pass's tolerance (u_dpass 0) is a relative one (clipZ).
++ * - The screens are drawn at the PS1's resolution (GlGpu::Init: fixed scale 1), so there is no
++ *   texture-coordinate fix (u_uvfix, derivatives) and the geometry moves by half a pixel.
++ * - Neither the Dreamcast's skater shadows nor filtered HD texture gradients (the Dreamcast data's
++ *   extras) are drawn; HD textures are sampled plainly. */
++#ifndef PC_GPU_GL_SHADERS_GLES_H
++#define PC_GPU_GL_SHADERS_GLES_H
++
++/* the far end of the projective depth: far beyond any level (linear depth reached 2^20) */
++#define PC_GLES_FAR "16777216.0"
++
++static const char *gl_draw_vs =
++    "#ifdef GL_ES\n"
++    "precision highp float;\n"
++    "#endif\n"
++    "attribute vec3 a_pos;\n"     /* x, y, w (perspective divisor) or view x, y, z */
++    "attribute vec4 a_color;\n"
++    "attribute vec2 a_uv;\n"
++    "attribute vec2 a_tex;\n"     /* clut word, info bits (see pc_gpu_gl.cpp) */
++    "attribute vec4 a_twin;\n"    /* texture window and_x, and_y, or_x, or_y */
++    "attribute vec4 a_uvr;\n"     /* texels the face spans: u, v min, max */
++    "varying vec3 v_color;\n"
++    "varying vec2 v_uv;\n"
++    "varying vec4 v_page;\n"      /* texture page x, y; CLUT x, y */
++    "varying vec4 v_mode;\n"      /* colour depth, blend mode, textured, raw */
++    "varying vec4 v_flags;\n"     /* semi-transparent, native 3D (view), -, - */
++    "varying vec4 v_twin;\n"
++    "varying vec4 v_uvr;\n"
++    "uniform float u_shift;\n"
++    "uniform float u_dpass;\n"
++    "uniform vec4 u_proj;\n"
++    "uniform vec4 u_target;\n"    /* the VRAM area drawn on: x, y, w, h */
++    /* n bits of v from bit lo (v a whole number below 2^24) */
++    "float bits(float v, float lo, float n) { return mod(floor(v / exp2(lo)), exp2(n)); }\n"
++    /* clip z for view depth w: a projective depth from the near plane to PC_GLES_FAR, its view
++     * z measured (1 - e) nearer. Linear in w, so clipping and interpolation are exact (e as well:
++     * z (A - C / (z (1 - e))) = A z - C / (1 - e)) */
++    "float clipZ(float w, float e) {\n"
++    "    float n = max(u_proj.w, 1.0), f = " PC_GLES_FAR ";\n"
++    "    return (f + n) / (f - n) * w - 2.0 * f * n / ((f - n) * (1.0 - e));\n"
++    "}\n"
++    "void main() {\n"
++    "    float info = a_tex.y;\n"
++    "    vec2 k = 2.0 / u_target.zw;\n"
++    "    bool view = bits(info, 14.0, 1.0) > 0.5, dflag = bits(info, 13.0, 1.0) > 0.5;\n"
++    "    bool sky = bits(info, 15.0, 1.0) > 0.5;\n"
++    "    float w;\n"
++    "    if (view) {\n"
++    "        vec3 v = a_pos;\n"
++    "        vec2 o = (u_proj.xy + u_shift - u_target.xy) * k - 1.0;\n"
++    "        gl_Position = vec4(o * v.z + u_proj.z * k * v.xy, 0.0, v.z);\n"
++    "        w = v.z;\n"
++    "    } else {\n"
++    "        vec2 p = (a_pos.xy + u_shift - u_target.xy) * k - 1.0;\n"
++    "        gl_Position = vec4(p, 0.0, 1.0) * a_pos.z;\n"
++    "        w = a_pos.z;\n"
++    "    }\n"
++    /* gl_shaders.h's gl_FragDepth: sky at the far end; native faces' true depth (u_dpass 1); the
++     * colour pass a little in front (1/256 of the depth: gl_shaders.h's 2 more units would not be
++     * linear); everything else at the near end, always passing. A layer's faces nearer than its
++     * near plane are clipped, as gl_ClipDistance did */
++    "    if (sky) gl_Position.z = gl_Position.w;\n"
++    "    else if (view && u_dpass > 0.5) gl_Position.z = clipZ(w, 0.0);\n"
++    "    else if (view || dflag) gl_Position.z = clipZ(w, 1.0 / 256.0);\n"
++    "    else gl_Position.z = -0.9999 * gl_Position.w;\n"
++    "    v_color = a_color.rgb;\n"
++    "    v_uv = a_uv;\n"
++    "    v_page = vec4(bits(info, 0.0, 4.0) * 64.0, bits(info, 4.0, 1.0) * 256.0,\n"
++    "                  bits(a_tex.x, 0.0, 6.0) * 16.0, bits(a_tex.x, 6.0, 9.0));\n"
++    "    v_mode = vec4(bits(info, 7.0, 2.0), bits(info, 5.0, 2.0), bits(info, 9.0, 1.0),\n"
++    "                  bits(info, 10.0, 1.0));\n"
++    "    v_flags = vec4(bits(info, 11.0, 1.0), view ? 1.0 : 0.0, 0.0, 0.0);\n"
++    "    v_twin = a_twin;\n"
++    "    v_uvr = a_uvr;\n"
++    "}\n";
++
++/* gl_FragColor: the colour, alpha = 1 - the weight the old pixel keeps (see above). B-F is drawn
++ * in a separate pass with a reverse-subtract equation: u_pass 1 draws only the opaque pixels, 2
++ * only the blended ones. */
++static const char *gl_draw_fs =
++    "#ifdef GL_ES\n"
++    "precision highp float;\n"
++    "#endif\n"
++    "varying vec3 v_color;\n"
++    "varying vec2 v_uv;\n"
++    "varying vec4 v_page;\n"
++    "varying vec4 v_mode;\n"
++    "varying vec4 v_flags;\n"
++    "varying vec4 v_twin;\n"
++    "varying vec4 v_uvr;\n"
++    "uniform sampler2D u_vram;\n"
++    "uniform sampler2D u_hd;\n"
++    "uniform float u_pass;\n"
++    /* the texture store's 16-bit texel at x, y (wrapping as VRAM does): its low and high bytes */
++    "vec2 vram(float x, float y) {\n"
++    "    vec4 t = texture2D(u_vram, (vec2(mod(x, 1024.0), mod(y, 512.0)) + 0.5) /\n"
++    "                               vec2(1024.0, 512.0));\n"
++    "    return floor(vec2(t.r, t.a) * 255.0 + 0.5);\n"
++    "}\n"
++    /* (u & a) | o of 8-bit whole numbers: the texture window */
++    "float window(float u, float a, float o) {\n"
++    "    if (a > 254.5 && o < 0.5) return u;\n"
++    "    float r = 0.0, p = 1.0;\n"
++    "    for (int i = 0; i < 8; i++) {\n"
++    "        float ub = mod(floor(u / p), 2.0), ab = mod(floor(a / p), 2.0),\n"
++    "              ob = mod(floor(o / p), 2.0);\n"
++    "        r += p * max(ub * ab, ob);\n"
++    "        p *= 2.0;\n"
++    "    }\n"
++    "    return r;\n"
++    "}\n"
++    "void main() {\n"
++    "    vec4 page = floor(v_page + 0.5), mode = floor(v_mode + 0.5);\n"
++    "    vec4 tw = floor(v_twin + 0.5), uvr = floor(v_uvr + 0.5);\n"
++    "    bool view = v_flags.y > 0.5;\n"
++    "    float depth = mode.x, abr = mode.y;\n"
++    /* texture coordinates at the pixel's corner, rounded to the nearest texel like the PS1 (at
++     * the PS1's resolution the geometry moved by half a pixel instead, gl_shaders.h) */
++    "    vec2 uv = v_uv + 0.5;\n"
++    "    if (view || uvr != vec4(0.0, 0.0, 255.0, 255.0))\n"
++    "        uv = clamp(uv, uvr.xy, uvr.zw + 0.999);\n"
++    "    bool semi = v_flags.x > 0.5;\n"
++    "    vec3 c = v_color;\n"
++    "    bool blend = semi;\n"
++    "    float hd_a = 1.0;\n"
++    "    if (mode.z > 0.5 && depth > 2.5) {\n"
++    "        vec4 t = texture2D(u_hd, v_uv / 256.0);\n"
++    "        if (t.a < 0.03) discard;\n"
++    "        c = mode.w > 0.5 ? t.rgb : min(t.rgb * v_color * (255.0 / 128.0), vec3(1.0));\n"
++    "        hd_a = t.a;\n"
++    "    } else if (mode.z > 0.5) {\n"
++    "        float u = window(mod(floor(uv.x), 256.0), tw.x, tw.z);\n"
++    "        float v = window(mod(floor(uv.y), 256.0), tw.y, tw.w);\n"
++    "        vec2 t;\n"
++    "        if (depth < 0.5) {\n"
++    "            vec2 w = vram(page.x + floor(u / 4.0), page.y + v);\n"
++    "            float q = mod(u, 4.0), b = q < 1.5 ? w.x : w.y;\n"
++    "            float i = mod(q, 2.0) < 0.5 ? mod(b, 16.0) : floor(b / 16.0);\n"
++    "            t = vram(page.z + i, page.w);\n"
++    "        } else if (depth < 1.5) {\n"
++    "            vec2 w = vram(page.x + floor(u / 2.0), page.y + v);\n"
++    "            t = vram(page.z + (mod(u, 2.0) < 0.5 ? w.x : w.y), page.w);\n"
++    "        } else {\n"
++    "            t = vram(page.x + u, page.y + v);\n"
++    "        }\n"
++    "        if (t.x + t.y < 0.5) discard;\n"
++    "        vec3 tc = vec3(mod(t.x, 32.0), floor(t.x / 32.0) + mod(t.y, 4.0) * 8.0,\n"
++    "                       mod(floor(t.y / 4.0), 32.0)) / 31.0;\n"
++    "        c = mode.w > 0.5 ? tc : min(tc * v_color * (255.0 / 128.0), vec3(1.0));\n"
++    "        blend = semi && t.y > 127.5;\n"
++    "    }\n"
++    "    if ((u_pass > 0.5 && u_pass < 1.5 && blend) || (u_pass > 1.5 && !blend)) discard;\n"
++    "    float keep = 0.0;\n"
++    "    if (blend) {\n"
++    "        if (abr < 0.5) { c *= 0.5; keep = 0.5; }\n"
++    "        else if (abr > 2.5) { c *= 0.25; keep = 1.0; }\n"
++    "        else keep = 1.0;\n"
++    "    }\n"
++    "    c *= hd_a;\n"
++    "    keep = hd_a * keep + 1.0 - hd_a;\n"
++    "    gl_FragColor = vec4(c, 1.0 - keep);\n"
++    "}\n";
++
++/* 16-bit pixels the CPU wrote (GlGpu::Blit) into a render target: the same LUMINANCE_ALPHA
++ * texture as the texture store's, their VRAM x, y at its 0, 0. */
++static const char *gl_copy_fs =
++    "#ifdef GL_ES\n"
++    "precision highp float;\n"
++    "#endif\n"
++    "uniform sampler2D u_vram;\n"
++    "uniform vec4 u_map;\n"         /* the target's VRAM x, y; pixels per texel */
++    "uniform vec2 u_src;\n"         /* the pixels' VRAM x, y */
++    "void main() {\n"
++    "    vec2 p = floor(gl_FragCoord.xy / u_map.zw) + u_map.xy - u_src;\n"
++    "    vec4 s = texture2D(u_vram, (p + 0.5) / vec2(1024.0, 512.0));\n"
++    "    vec2 t = floor(vec2(s.r, s.a) * 255.0 + 0.5);\n"
++    "    gl_FragColor = vec4(vec3(mod(t.x, 32.0), floor(t.x / 32.0) + mod(t.y, 4.0) * 8.0,\n"
++    "                             mod(floor(t.y / 4.0), 32.0)) / 31.0, t.y > 127.5 ? 1.0 : 0.0);\n"
++    "}\n";
++
++static const char *gl_copy_vs =
++    "#ifdef GL_ES\n"
++    "precision highp float;\n"
++    "#endif\n"
++    "attribute vec2 a_pos;\n"
++    "uniform vec4 u_target;\n"
++    "void main() {\n"
++    "    gl_Position = vec4((a_pos - u_target.xy) * 2.0 / u_target.zw - 1.0, 0.0, 1.0);\n"
++    "}\n";
++
++/* A texture's area onto the bound framebuffer (the window; a target's pixels onto another). */
++static const char *gl_present_vs =
++    "#ifdef GL_ES\n"
++    "precision highp float;\n"
++    "#endif\n"
++    "attribute vec2 a_pos;\n"
++    "attribute vec2 a_uv;\n"
++    "varying vec2 v_uv;\n"
++    "void main() {\n"
++    "    gl_Position = vec4(a_pos, 0.0, 1.0);\n"
++    "    v_uv = a_uv;\n"
++    "}\n";
++
++static const char *gl_present_fs =
++    "#ifdef GL_ES\n"
++    "precision highp float;\n"
++    "#endif\n"
++    "varying vec2 v_uv;\n"
++    "uniform sampler2D u_tex;\n"
++    "uniform float u_alpha;\n"      /* 1: copy alpha too (a target's pixels), 0: opaque */
++    "void main() {\n"
++    "    vec4 t = texture2D(u_tex, v_uv);\n"
++    "    gl_FragColor = vec4(t.rgb, u_alpha > 0.5 ? t.a : 1.0);\n"
++    "}\n";
++
++#endif
+diff --git a/platform/pc/src/glad_gl.c b/platform/pc/src/glad_gl.c
+index 069d5f2..1e9ab2c 100644
+--- a/platform/pc/src/glad_gl.c
++++ b/platform/pc/src/glad_gl.c
+@@ -1,6 +1,8 @@
+ /**
+  * SPDX-License-Identifier: (WTFPL OR CC0-1.0) AND Apache-2.0
+  */
++/* (the OpenGL ES 2 build, PC_GLES, calls its GL library directly) */
++#ifndef PC_GLES
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -8008,3 +8010,4 @@ int gladLoadGL( GLADloadfunc load) {
+ #ifdef __cplusplus
+ }
+ #endif
++#endif /* PC_GLES */
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index 6f1a7f3..c035fec 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -1,5 +1,7 @@
+ /* OpenGL 3.3 drawing backend; the interface and the render targets are described in
+- * pc_gpu_gl.h.
++ * pc_gpu_gl.h. With PC_GLES, OpenGL ES 2 (the PS Vita's vitaGL): what differs is under
++ * `#ifdef PC_GLES`, and pc/gl_shaders_gles.h says how the drawing itself does without ES 3's
++ * features.
+  *
+  * Primitives are batched into one triangle stream (lines become thin quads) and drawn with a
+  * shader that does the PS1 texture lookup (4/8-bit CLUT or 15-bit direct, texture window),
+@@ -15,7 +17,6 @@
+ 
+ #include <vector>
+ 
+-#include <glad/gl.h>
+ #define SDL_MAIN_HANDLED
+ #include <SDL.h>
+ 
+@@ -23,8 +24,12 @@
+ #include "pc_render3d.h"
+ #include "pc_runtime.h"
+ #include "pc_texstore.h"
+-#include "pc/gl_shaders.h"
+ #include "pc/gl_gpu.h"
++#ifdef PC_GLES
++#include "pc/gl_shaders_gles.h"
++#else
++#include "pc/gl_shaders.h"
++#endif
+ #include "pc/texture_store.h"
+ #include "pc/dc_textures.h"
+ #include "pc/precise.h"
+@@ -60,6 +65,13 @@ constexpr uint16_t I_DEPTH = PC_GL_I_DEPTH;
+ [[maybe_unused]] constexpr uint16_t I_SKY = PC_GL_I_SKY;
+ [[maybe_unused]] constexpr uint16_t I_HD = 0x0180;   /* colour depth 3: an HD texture (pc_dctex.h), clut = its handle */
+ 
++/* RGBA textures' internal format (ES 2: the format itself) */
++#ifdef PC_GLES
++constexpr GLint RGBA_IFMT = GL_RGBA;
++#else
++constexpr GLint RGBA_IFMT = GL_RGBA8;
++#endif
++
+ /* HiResImage's texture has the last handle (pc_dctex.cpp leaves it free). */
+ constexpr int HIRES_SLOT = MAX_HD - 1;
+ 
+@@ -91,6 +103,12 @@ GLuint Program(const char *vs, const char *fs)
+     GLint ok;
+     glAttachShader(p, v);
+     glAttachShader(p, f);
++#ifdef PC_GLES
++    /* ES 2 has no layout(location): one numbering for every program's attributes */
++    static const char *const attrs[] = { "a_pos", "a_color", "a_uv", "a_tex", "a_twin", "a_uvr" };
++    for (GLuint i = 0; i < 6; i++)
++        glBindAttribLocation(p, i, attrs[i]);
++#endif
+     glLinkProgram(p);
+     glDeleteShader(v);
+     glDeleteShader(f);
+@@ -110,6 +128,10 @@ GLuint Texture(GLint ifmt, int w, int h, GLenum fmt, GLenum type, GLint filter)
+     GLuint t;
+     glGenTextures(1, &t);
+     glBindTexture(GL_TEXTURE_2D, t);
++#ifdef PC_GLES
++    (void)ifmt;
++    ifmt = (GLint)fmt;   /* ES 2: the internal format is the format */
++#endif
+     glTexImage2D(GL_TEXTURE_2D, 0, ifmt, w, h, 0, fmt, type, NULL);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+@@ -138,6 +160,7 @@ void Span(float s, int origin, int a, int b, int *p0, int *p1)
+     *p1 = (int)ceilf((float)(b + 1 - origin) * s - 0.5f);
+ }
+ 
++#ifndef PC_GLES
+ /* The GVert layout, for the bound VAO and array buffer. */
+ void VertAttribs()
+ {
+@@ -154,6 +177,7 @@ void VertAttribs()
+     glEnableVertexAttribArray(5);
+     glVertexAttribIPointer(5, 4, GL_UNSIGNED_BYTE, sizeof(GVert), (void *)offsetof(GVert, uvr));
+ }
++#endif
+ 
+ /* Call fn(x0, y0, x1, y1) (inclusive) for each in-VRAM part of a rectangle that may wrap at the
+  * right and bottom edges. */
+@@ -255,7 +279,7 @@ bool ClipArea(int *x, int *y, int *w, int *h)
+ }
+ 
+ /* Copy a target's pixels of the VRAM area x, y, w, h into another target (nearest). */
+-void CopyArea(const Target *from, const Target *to, int x, int y, int w, int h)
++void CopyArea(GlGpu *gpu, const Target *from, const Target *to, int x, int y, int w, int h)
+ {
+     int fx0, fx1, fy0, fy1, tx0, tx1, ty0, ty1;
+     Span(from->sx, from->x, x, x + w - 1, &fx0, &fx1);
+@@ -263,9 +287,14 @@ void CopyArea(const Target *from, const Target *to, int x, int y, int w, int h)
+     Span(to->sx, to->x, x, x + w - 1, &tx0, &tx1);
+     Span(to->sy, to->y, y, y + h - 1, &ty0, &ty1);
+     from->Resolve();
++#ifdef PC_GLES
++    gpu->BlitPixels(from, fx0, fy0, fx1, fy1, to->fbo, to->pw, to->ph, tx0, ty0, tx1, ty1);
++#else
++    (void)gpu;
+     glBindFramebuffer(GL_READ_FRAMEBUFFER, from->fbo);
+     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, to->fbo);
+     glBlitFramebuffer(fx0, fy0, fx1, fy1, tx0, ty0, tx1, ty1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++#endif
+     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+     to->Written(tx0, ty0, tx1, ty1);
+ }
+@@ -302,11 +331,20 @@ bool RenderTarget::Create(int x_, int y_, int w_, int h_, int pad, int pw_, int
+     sx = (float)pw_ / (float)w;
+     sy = (float)ph_ / (float)h_;
+     samples = samples_ > 1 ? samples_ : 0;
+-    tex = Texture(GL_RGBA8, pw_, ph_, GL_RGBA, GL_UNSIGNED_BYTE, GL_NEAREST);
++    tex = Texture(RGBA_IFMT, pw_, ph_, GL_RGBA, GL_UNSIGNED_BYTE, GL_NEAREST);
+     fbo = Framebuffer(tex);
+     glGenRenderbuffers(1, &depth);
+     glBindRenderbuffer(GL_RENDERBUFFER, depth);
++#ifdef PC_GLES
++    /* no multisampling; 24-bit depth where there is (the projective depth needs it), else 16 */
++    samples = 0;
++    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8_OES, pw_, ph_);
++    if (glGetError() != GL_NO_ERROR)
++        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, pw_, ph_);
++#else
+     glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH_COMPONENT32F, pw_, ph_);
++#endif
++#ifndef PC_GLES
+     if (fbo && samples) {
+         glGenRenderbuffers(1, &ms_color);
+         glBindRenderbuffer(GL_RENDERBUFFER, ms_color);
+@@ -315,6 +353,7 @@ bool RenderTarget::Create(int x_, int y_, int w_, int h_, int pad, int pw_, int
+         glBindFramebuffer(GL_FRAMEBUFFER, ms_fbo);
+         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, ms_color);
+     }
++#endif
+     if (fbo) {
+         glBindFramebuffer(GL_FRAMEBUFFER, samples ? ms_fbo : fbo);
+         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth);
+@@ -344,10 +383,12 @@ void RenderTarget::Resolve() const
+     glDisable(GL_SCISSOR_TEST);
+     if (!stale)
+         return;
++#ifndef PC_GLES
+     glBindFramebuffer(GL_READ_FRAMEBUFFER, ms_fbo);
+     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+     glBlitFramebuffer(0, 0, pw, ph, 0, 0, pw, ph, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+     glBindFramebuffer(GL_FRAMEBUFFER, 0);
++#endif
+     stale = false;
+ }
+ 
+@@ -355,12 +396,16 @@ void RenderTarget::Written(int px0, int py0, int px1, int py1) const
+ {
+     if (!samples)
+         return;
++#ifndef PC_GLES
+     /* (each sample gets the pixel's value) */
+     glDisable(GL_SCISSOR_TEST);
+     glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ms_fbo);
+     glBlitFramebuffer(px0, py0, px1, py1, px0, py0, px1, py1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+     glBindFramebuffer(GL_FRAMEBUFFER, 0);
++#else
++    (void)px0, (void)py0, (void)px1, (void)py1;
++#endif
+ }
+ 
+ bool RenderTarget::Scissor(int x0, int y0, int x1, int y1, int wide) const
+@@ -451,12 +496,20 @@ bool GlGpu::AnyDrawn(int x0, int y0, int x1, int y1) const
+ 
+ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+ {
++#ifdef PC_GLES
++    /* the screens at the PS1's resolution, scaled when shown (pc/gl_shaders_gles.h) */
++    (void)fixed_scale;
++    fixed_scale = 1;
++    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &m_maxTex);
++    m_maxSamples = 0;
++#else
+     if (!gladLoadGL((GLADloadfunc)SDL_GL_GetProcAddress)) {
+         fprintf(stderr, "[gl] cannot load the OpenGL functions\n");
+         return -1;
+     }
+     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &m_maxTex);
+     glGetIntegerv(GL_MAX_SAMPLES, &m_maxSamples);
++#endif
+     m_fixedScale = fixed_scale > 0 ? fixed_scale : 0;
+     m_outW = out_w > 0 ? out_w : 640;
+     m_outH = out_h > 0 ? out_h : 480;
+@@ -491,8 +544,12 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+     glUniform1i(glGetUniformLocation(m_copyProg, "u_vram"), 0);
+     glUseProgram(m_presentProg);
+     glUniform1i(glGetUniformLocation(m_presentProg, "u_tex"), 0);
++#ifdef PC_GLES
++    m_presentUAlpha = glGetUniformLocation(m_presentProg, "u_alpha");
++#endif
+     glUseProgram(0);
+ 
++#ifndef PC_GLES
+     glGenVertexArrays(1, &m_vao);
+     glGenBuffers(1, &m_vbo);
+     glBindVertexArray(m_vao);
+@@ -522,13 +579,23 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+     glEnableVertexAttribArray(1);
+     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
+     glBindVertexArray(0);
++#endif
+ 
+     const char *f = getenv("THPS_FILTER");
++#ifdef PC_GLES
++    /* the PS1's resolution, scaled up to the screen: smooth unless asked (THPS_FILTER=0) */
++    m_filter = !f || f[0] != '0';
++    m_blit = Texture(GL_LUMINANCE_ALPHA, VRAM_W, VRAM_H, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE,
++                     GL_NEAREST);
++    m_texstore = Texture(GL_LUMINANCE_ALPHA, VRAM_W, VRAM_H, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE,
++                         GL_NEAREST);
++#else
+     m_filter = f && f[0] == '1';
+     m_blit = Texture(GL_R16UI, VRAM_W, VRAM_H, GL_RED_INTEGER, GL_UNSIGNED_SHORT, GL_NEAREST);
+     m_texstore = Texture(GL_R16UI, VRAM_W, VRAM_H, GL_RED_INTEGER, GL_UNSIGNED_SHORT, GL_NEAREST);
+-    m_rbTex = Texture(GL_RGBA8, VRAM_W, VRAM_H, GL_RGBA, GL_UNSIGNED_BYTE, GL_NEAREST);
+-    m_dispTex = Texture(GL_RGBA8, VRAM_W, VRAM_H, GL_RGBA, GL_UNSIGNED_BYTE,
++#endif
++    m_rbTex = Texture(RGBA_IFMT, VRAM_W, VRAM_H, GL_RGBA, GL_UNSIGNED_BYTE, GL_NEAREST);
++    m_dispTex = Texture(RGBA_IFMT, VRAM_W, VRAM_H, GL_RGBA, GL_UNSIGNED_BYTE,
+                         m_filter ? GL_LINEAR : GL_NEAREST);
+     m_rbFbo = Framebuffer(m_rbTex);
+     if (!m_base.Create(0, 0, VRAM_W, VRAM_H, 0, VRAM_W, VRAM_H, 0, m_maxTex) || !m_rbFbo) {
+@@ -565,17 +632,21 @@ void GlGpu::Shutdown()
+     glDeleteProgram(m_drawProg);
+     glDeleteProgram(m_copyProg);
+     glDeleteProgram(m_presentProg);
++    GLuint texs[4] = { m_blit, m_texstore, m_rbTex, m_dispTex };
++#ifndef PC_GLES
+     GLuint vaos[4] = { m_vao, m_copyVao, m_presentVao, m_layer.vao };
+     GLuint bufs[4] = { m_vbo, m_copyVbo, m_presentVbo, m_layer.vbo };
+-    GLuint texs[4] = { m_blit, m_texstore, m_rbTex, m_dispTex };
+     glDeleteVertexArrays(4, vaos);
+     glDeleteBuffers(4, bufs);
++#endif
+     glDeleteTextures(4, texs);
+     glDeleteFramebuffers(1, &m_rbFbo);
+     if (m_shadowState) {
+         glDeleteProgram(m_shadowProg);
++#ifndef PC_GLES
+         glDeleteVertexArrays(1, &m_shadowVao);
+         glDeleteBuffers(1, &m_shadowVbo);
++#endif
+         glDeleteTextures(1, &m_shadowBlob);
+         glDeleteTextures(kShadows, m_shadowTex);
+         glDeleteFramebuffers(kShadows, m_shadowFbo);
+@@ -610,20 +681,28 @@ void GlGpu::UploadTexStore()
+             if (!any) {
+                 any = 1;
+                 glBindTexture(GL_TEXTURE_2D, m_texstore);
++#ifndef PC_GLES
+                 glPixelStorei(GL_UNPACK_ROW_LENGTH, VRAM_W);
+                 glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
++#endif
+             }
+             int x = cx * CELL, y = cy * CELL;
+             m_st.tex_ups++;
++#ifdef PC_GLES
++            Upload16(x, y, (run - cx) * CELL, CELL, tex + y * VRAM_W + x, VRAM_W);
++#else
+             glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, (run - cx) * CELL, CELL, GL_RED_INTEGER,
+                             GL_UNSIGNED_SHORT, tex + y * VRAM_W + x);
++#endif
+             cx = run;
+         }
+     }
++#ifndef PC_GLES
+     if (any) {
+         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+         glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+     }
++#endif
+ }
+ 
+ /* Make the textures reflect every write so far. */
+@@ -658,10 +737,10 @@ void GlGpu::HdBind(uint16_t h)
+         glBindTexture(GL_TEXTURE_2D, m_hd[h]);
+         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+         if (g_dcTextures.Decode(h, &w, &ht, &rgba)) {
+-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, ht, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
++            glTexImage2D(GL_TEXTURE_2D, 0, RGBA_IFMT, w, ht, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+             free(rgba);
+         } else {
+-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, missing);
++            glTexImage2D(GL_TEXTURE_2D, 0, RGBA_IFMT, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, missing);
+         }
+         glGenerateMipmap(GL_TEXTURE_2D);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+@@ -690,7 +769,7 @@ void GlGpu::HiResImage(int x, int y, int w, int h, const uint16_t *src, int sw,
+     glActiveTexture(GL_TEXTURE1);
+     glBindTexture(GL_TEXTURE_2D, m_hd[HIRES_SLOT]);
+     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, sw, sh, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
++    glTexImage2D(GL_TEXTURE_2D, 0, RGBA_IFMT, sw, sh, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+     glGenerateMipmap(GL_TEXTURE_2D);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+@@ -740,6 +819,17 @@ void GlGpu::HdForget(uint16_t h)
+ void GlGpu::SetBlend(int pass)
+ {
+     glEnable(GL_BLEND);
++#ifdef PC_GLES
++    /* the kept weight is in the source's alpha; the target's alpha (the mask bit) stays */
++    if (pass == 2) {
++        glBlendEquationSeparate(GL_FUNC_REVERSE_SUBTRACT, GL_FUNC_ADD);
++        glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ZERO, GL_ONE);
++    } else {
++        glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
++        glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
++    }
++    glUniform1f(m_drawUPass, (float)pass);
++#else
+     if (pass == 2) {
+         glBlendEquationSeparate(GL_FUNC_REVERSE_SUBTRACT, GL_FUNC_ADD);
+         glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ZERO);
+@@ -748,6 +838,7 @@ void GlGpu::SetBlend(int pass)
+         glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC1_ALPHA, GL_ONE, GL_ZERO);
+     }
+     glUniform1i(m_drawUPass, pass);
++#endif
+ }
+ 
+ void GlGpu::Flush()
+@@ -768,10 +859,14 @@ void GlGpu::Flush()
+         HdBind(b.hd);
+     glActiveTexture(GL_TEXTURE0);
+     glBindTexture(GL_TEXTURE_2D, m_texstore);
++#ifdef PC_GLES
++    DrawAttribs(b.verts);
++#else
+     glBindVertexArray(m_vao);
+     glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
+     glBufferData(GL_ARRAY_BUFFER, sizeof b.verts, NULL, GL_STREAM_DRAW);
+     glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)b.nv * sizeof(GVert), b.verts);
++#endif
+     if (m_layer.active) {
+         /* inside a native 3D layer: test (don't write) the depth of projected primitives */
+         glEnable(GL_DEPTH_TEST);
+@@ -1133,6 +1228,9 @@ bool GlGpu::ShadowSetup()
+     if (m_shadowState)
+         return m_shadowState > 0;
+     m_shadowState = -1;
++#ifdef PC_GLES
++    return false;
++#else
+     m_shadowProg = Program(gl_shadow_vs, gl_shadow_fs);
+     if (!m_shadowProg)
+         return false;
+@@ -1154,13 +1252,13 @@ bool GlGpu::ShadowSetup()
+         PC_Log("gl: no shadow image");
+         return false;
+     }
+-    m_shadowBlob = Texture(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE, GL_LINEAR);
++    m_shadowBlob = Texture(RGBA_IFMT, w, h, GL_RGBA, GL_UNSIGNED_BYTE, GL_LINEAR);
+     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+     free(rgba);
+     for (int i = 0; i < kShadows; i++) {
+-        m_shadowTex[i] = Texture(GL_RGBA8, kShadowSize, kShadowSize, GL_RGBA, GL_UNSIGNED_BYTE,
++        m_shadowTex[i] = Texture(RGBA_IFMT, kShadowSize, kShadowSize, GL_RGBA, GL_UNSIGNED_BYTE,
+                                  GL_LINEAR);
+         m_shadowFbo[i] = Framebuffer(m_shadowTex[i]);
+         if (!m_shadowFbo[i]) {
+@@ -1173,17 +1271,26 @@ bool GlGpu::ShadowSetup()
+     }
+     m_shadowState = 1;
+     return true;
++#endif
+ }
+ 
+ /* The draw program's shadow uniforms for the layer's n shadows. */
+ void GlGpu::ShadowUniforms(int n)
+ {
++#ifndef PC_GLES
+     glUseProgram(m_drawProg);
+     glUniform1i(m_drawUShN, n);
++#else
++    (void)n;
++#endif
+ }
+ 
+ void GlGpu::LayerShadows(const GlShadow *s, int n)
+ {
++#ifdef PC_GLES
++    (void)s, (void)n;   /* not drawn (pc/gl_shaders_gles.h) */
++    return;
++#endif
+     if (n > kShadows)
+         n = kShadows;
+     if (n > 0 && !ShadowSetup())
+@@ -1192,6 +1299,7 @@ void GlGpu::LayerShadows(const GlShadow *s, int n)
+         ShadowUniforms(0);
+         return;
+     }
++#ifndef PC_GLES
+     Flush();
+     /* the blobs into each shadow's texture */
+     static float vb[GlShadow::kQuads * 6 * 4];
+@@ -1241,6 +1349,7 @@ void GlGpu::LayerShadows(const GlShadow *s, int n)
+     glUniform4fv(m_drawUShT, n, &T[0][0]);
+     glUniform4fv(m_drawUShH, n, &H[0][0]);
+     glUniform4fv(m_drawUShP, n, &P[0][0]);
++#endif
+ }
+ 
+ void GlGpu::LayerBegin(const GlLayerParams *lp, const GlVert *v, int nv)
+@@ -1256,11 +1365,19 @@ void GlGpu::LayerBegin(const GlLayerParams *lp, const GlVert *v, int nv)
+     if (l.clip[2] < l.clip[0] || l.clip[3] < l.clip[1])
+         return;
+     memcpy(l.mark, l.clip, sizeof l.mark);
++#ifdef PC_GLES
++    /* the layer's vertices stay the caller's until LayerEnd (pc_render3d.cpp) */
++    l.verts = v;
++    (void)nv;
++    glDepthMask(GL_TRUE);
++    glClearDepthf(1.0f);
++#else
+     glBindVertexArray(l.vao);
+     glBindBuffer(GL_ARRAY_BUFFER, l.vbo);
+     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)nv * sizeof(GVert), v, GL_STREAM_DRAW);
+     glDepthMask(GL_TRUE);
+     glClearDepth(1.0);
++#endif
+     Target *ts[MAX_SURFACES + 1];
+     int nt = LayerTargets(ts);
+     for (int i = 0; i < nt; i++) {
+@@ -1285,10 +1402,16 @@ void GlGpu::LayerDraw(int first, int count, int cls, uint16_t hd)
+     glUniform4f(m_drawUProj, l.lp.ofs_x + l.lp.ofx, l.lp.ofs_y + l.lp.ofy, l.lp.h, l.lp.hither);
+     glActiveTexture(GL_TEXTURE0);
+     glBindTexture(GL_TEXTURE_2D, m_texstore);
++#ifdef PC_GLES
++    DrawAttribs(l.verts);
++#else
+     glBindVertexArray(l.vao);
++#endif
+     glEnable(GL_DEPTH_TEST);
+     glDepthFunc(GL_LEQUAL);
++#ifndef PC_GLES
+     glEnable(GL_CLIP_DISTANCE0);
++#endif
+     Target *ts[MAX_SURFACES + 1];
+     int nt = LayerTargets(ts);
+     for (int i = 0; i < nt; i++) {
+@@ -1297,7 +1420,7 @@ void GlGpu::LayerDraw(int first, int count, int cls, uint16_t hd)
+             continue;
+         DrawUniforms(ts[i]);
+         glDepthMask(GL_FALSE);
+-        glUniform1i(m_drawUDpass, 0);
++        DPass(0);
+         if (cls == 2) {
+             SetBlend(1);
+             glDrawArrays(GL_TRIANGLES, first, count);
+@@ -1309,15 +1432,17 @@ void GlGpu::LayerDraw(int first, int count, int cls, uint16_t hd)
+         m_st.draws++;
+         if (cls == 0) {
+             /* opaque: now the true depth (see the shaders) */
+-            glUniform1i(m_drawUDpass, 1);
++            DPass(1);
+             glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+             glDepthMask(GL_TRUE);
+             glDrawArrays(GL_TRIANGLES, first, count);
+             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+-            glUniform1i(m_drawUDpass, 0);
++            DPass(0);
+         }
+     }
++#ifndef PC_GLES
+     glDisable(GL_CLIP_DISTANCE0);
++#endif
+     glDisable(GL_DEPTH_TEST);
+     glDepthMask(GL_TRUE);
+     glDisable(GL_SCISSOR_TEST);
+@@ -1355,7 +1480,15 @@ void GlGpu::ReadPixels(int x0, int y0, int x1, int y1, uint16_t *out)
+     Target *ts[MAX_SURFACES + 1];
+     int nt = TargetsFor(px, py, px + pw - 1, py + ph - 1, ts);
+     glDisable(GL_SCISSOR_TEST);
++#ifdef PC_GLES
++    if (nt == 1 && ts[0] == &m_base) {
++        /* only the base, which is at the PS1's resolution already: read it as it is */
++        glBindFramebuffer(GL_FRAMEBUFFER, m_base.fbo);
++        nt = 0;
++    }
++#else
+     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_rbFbo);
++#endif
+     for (int i = nt - 1; i >= 0; i--) {
+         const Target *t = ts[i];
+         int ax0 = px > t->rx ? px : t->rx, ay0 = py > t->y ? py : t->y;
+@@ -1367,11 +1500,19 @@ void GlGpu::ReadPixels(int x0, int y0, int x1, int y1, uint16_t *out)
+         Span(t->sx, t->x, ax0, ax1 - 1, &sx0, &sx1);
+         Span(t->sy, t->y, ay0, ay1 - 1, &sy0, &sy1);
+         t->Resolve();
++#ifdef PC_GLES
++        BlitPixels(t, sx0, sy0, sx1, sy1, m_rbFbo, VRAM_W, VRAM_H, ax0, ay0, ax1, ay1);
++        if (i == 0)
++            glBindFramebuffer(GL_FRAMEBUFFER, m_rbFbo);
++#else
+         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_rbFbo);
+         glBindFramebuffer(GL_READ_FRAMEBUFFER, t->fbo);
+         glBlitFramebuffer(sx0, sy0, sx1, sy1, ax0, ay0, ax1, ay1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++#endif
+     }
++#ifndef PC_GLES
+     glBindFramebuffer(GL_READ_FRAMEBUFFER, m_rbFbo);
++#endif
+     glPixelStorei(GL_PACK_ALIGNMENT, 4);
+     glReadPixels(px, py, pw, ph, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+     m_st.readbacks++;
+@@ -1414,20 +1555,28 @@ void GlGpu::Blit(int x, int y, int w, int h, const uint16_t *src)
+     }
+     Flush();   /* primitives already sent draw before these pixels arrive */
+     glBindTexture(GL_TEXTURE_2D, m_blit);
++#ifdef PC_GLES
++    Upload16(0, 0, w, h, src, sw);
++#else
+     glPixelStorei(GL_UNPACK_ROW_LENGTH, sw);
+     glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
+     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RED_INTEGER, GL_UNSIGNED_SHORT, src);
+     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++#endif
+     float x0 = (float)x, x1 = (float)(x + w), y0 = (float)y, y1 = (float)(y + h);
+     float q[12] = { x0, y0, x1, y0, x0, y1, x1, y0, x1, y1, x0, y1 };
+     glDisable(GL_BLEND);
+     glUseProgram(m_copyProg);
+     glActiveTexture(GL_TEXTURE0);
+     glBindTexture(GL_TEXTURE_2D, m_blit);
++#ifdef PC_GLES
++    QuadAttribs(q, 2, 0);
++#else
+     glBindVertexArray(m_copyVao);
+     glBindBuffer(GL_ARRAY_BUFFER, m_copyVbo);
+     glBufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_STREAM_DRAW);
++#endif
+     glUniform2f(m_copyUSrc, (float)x, (float)y);
+     Target *ts[MAX_SURFACES + 1];
+     int nt = TargetsFor(x, y, x + w - 1, y + h - 1, ts);
+@@ -1483,12 +1632,24 @@ uint32_t *GlGpu::ReadArea(int x, int y, int w, int h, int *out_w, int *out_h)
+     Flush();
+     Prepare();
+     t->Resolve();
++#ifdef PC_GLES
++    /* (ES 2 reads RGBA only: to the BGRA the callers take) */
++    glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
++    glPixelStorei(GL_PACK_ALIGNMENT, 4);
++    glReadPixels(px0, py0, sw, sh, GL_RGBA, GL_UNSIGNED_BYTE, out);
++    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    for (int i = 0; i < sw * sh; i++) {
++        uint32_t p = out[i];
++        out[i] = 0xff000000u | (p & 0xff) << 16 | (p & 0xff00) | (p >> 16 & 0xff);
++    }
++#else
+     glBindFramebuffer(GL_READ_FRAMEBUFFER, t->fbo);
+     glPixelStorei(GL_PACK_ALIGNMENT, 4);
+     glReadPixels(px0, py0, sw, sh, GL_BGRA, GL_UNSIGNED_BYTE, out);
+     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+     for (int i = 0; i < sw * sh; i++)
+         out[i] |= 0xff000000u;
++#endif
+     *out_w = sw;
+     *out_h = sh;
+     return out;
+@@ -1535,7 +1696,7 @@ void GlGpu::SurfaceSize(int w, int h, int pad, int *pw, int *ph) const
+ void GlGpu::SurfaceRetire(int i)
+ {
+     Target *t = &m_surf[i];
+-    CopyArea(t, &m_base, t->rx, t->y, t->rw, t->h);
++    CopyArea(this, t, &m_base, t->rx, t->y, t->rw, t->h);
+     t->Destroy();
+     memmove(&m_surf[i], &m_surf[i + 1], (size_t)(m_nsurf - i - 1) * sizeof(Target));
+     m_nsurf--;
+@@ -1553,7 +1714,7 @@ void GlGpu::SurfaceAdd(int x, int y, int w, int h)
+         fprintf(stderr, "[gl] no %dx%d surface for the screen at %d,%d\n", pw, ph, x, y);
+         return;
+     }
+-    CopyArea(&m_base, &m_surf[m_nsurf], x, y, w, h);
++    CopyArea(this, &m_base, &m_surf[m_nsurf], x, y, w, h);
+     m_nsurf++;
+     if (m_st.on)
+         fprintf(stderr, "[gl] surface for the screen at %d,%d %dx%d (+%d each side): %dx%d pixels\n",
+@@ -1676,7 +1837,21 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+             if (ih > VRAM_H)
+                 ih = VRAM_H;
+             glBindTexture(GL_TEXTURE_2D, m_dispTex);
++#ifdef PC_GLES
++            /* (BGRA to ES 2's RGBA) */
++            m_upload.resize((size_t)iw * ih * 4);
++            for (int i = 0; i < iw * ih; i++) {
++                uint32_t p = image[i];
++                m_upload[i * 4] = (uint8_t)(p >> 16);
++                m_upload[i * 4 + 1] = (uint8_t)(p >> 8);
++                m_upload[i * 4 + 2] = (uint8_t)p;
++                m_upload[i * 4 + 3] = 255;
++            }
++            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, iw, ih, GL_RGBA, GL_UNSIGNED_BYTE,
++                            m_upload.data());
++#else
+             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, iw, ih, GL_BGRA, GL_UNSIGNED_BYTE, image);
++#endif
+             u0 = 0;
+             v0 = 0;
+             u1 = (float)iw / VRAM_W;
+@@ -1704,9 +1879,14 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+         glViewport(pic[0], wh - pic[1] - pic[3], pic[2], pic[3]);
+         float q[16] = { -1, 1, u0, v0, 1, 1, u1, v0, -1, -1, u0, v1, 1, -1, u1, v1 };
+         glUseProgram(m_presentProg);
++#ifdef PC_GLES
++        glUniform1f(m_presentUAlpha, 0.0f);
++        QuadAttribs(q, 4, 1);
++#else
+         glBindVertexArray(m_presentVao);
+         glBindBuffer(GL_ARRAY_BUFFER, m_presentVbo);
+         glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof q, q);
++#endif
+         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+     }
+     SDL_GL_SwapWindow(win);
+@@ -1719,4 +1899,74 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+     }
+ }
+ 
++#ifdef PC_GLES
++/* ---------------------------------------------------------------------------------------------
++ * OpenGL ES 2 */
++
++void GlGpu::DrawAttribs(const GlVert *v)
++{
++    const char *b = (const char *)v;
++    glBindBuffer(GL_ARRAY_BUFFER, 0);
++    for (GLuint i = 0; i < 6; i++)
++        glEnableVertexAttribArray(i);
++    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(GVert), b + offsetof(GVert, x));
++    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GVert), b + offsetof(GVert, r));
++    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(GVert), b + offsetof(GVert, u));
++    /* the words as whole-number floats, which the shader unpacks */
++    glVertexAttribPointer(3, 2, GL_UNSIGNED_SHORT, GL_FALSE, sizeof(GVert), b + offsetof(GVert, clut));
++    glVertexAttribPointer(4, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(GVert), b + offsetof(GVert, tw));
++    glVertexAttribPointer(5, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(GVert), b + offsetof(GVert, uvr));
++}
++
++/* positions (attribute 0) and, with uv, texture coordinates (attribute 2) after them */
++void GlGpu::QuadAttribs(const float *v, int stride_floats, int uv)
++{
++    glBindBuffer(GL_ARRAY_BUFFER, 0);
++    for (GLuint i = 1; i < 6; i++)
++        glDisableVertexAttribArray(i);
++    glEnableVertexAttribArray(0);
++    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride_floats * (GLsizei)sizeof(float), v);
++    if (uv) {
++        glEnableVertexAttribArray(2);
++        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride_floats * (GLsizei)sizeof(float),
++                              v + 2);
++    }
++}
++
++void GlGpu::Upload16(int x, int y, int w, int h, const uint16_t *src, int stride)
++{
++    /* little-endian: each pixel's low byte becomes L, its high byte A */
++    m_upload.resize((size_t)w * h * 2);
++    for (int j = 0; j < h; j++)
++        memcpy(&m_upload[(size_t)j * w * 2], src + (size_t)j * stride, (size_t)w * 2);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
++    glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE,
++                    m_upload.data());
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++}
++
++void GlGpu::BlitPixels(const Target *from, int fx0, int fy0, int fx1, int fy1, GLuint to_fbo,
++                       int to_w, int to_h, int tx0, int ty0, int tx1, int ty1)
++{
++    float u0 = (float)fx0 / from->pw, u1 = (float)fx1 / from->pw;
++    float v0 = (float)fy0 / from->ph, v1 = (float)fy1 / from->ph;
++    float x0 = 2.0f * tx0 / to_w - 1, x1 = 2.0f * tx1 / to_w - 1;
++    float y0 = 2.0f * ty0 / to_h - 1, y1 = 2.0f * ty1 / to_h - 1;
++    float q[16] = { x0, y0, u0, v0, x1, y0, u1, v0, x0, y1, u0, v1, x1, y1, u1, v1 };
++    glBindFramebuffer(GL_FRAMEBUFFER, to_fbo);
++    glViewport(0, 0, to_w, to_h);
++    glDisable(GL_SCISSOR_TEST);
++    glDisable(GL_BLEND);
++    glDisable(GL_DEPTH_TEST);
++    glUseProgram(m_presentProg);
++    glUniform1f(m_presentUAlpha, 1.0f);
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, from->tex);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    QuadAttribs(q, 4, 1);
++    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++}
++#endif
++
+ }   // namespace pc
+diff --git a/platform/pc/src/pc_video.cpp b/platform/pc/src/pc_video.cpp
+index de261f5..f9be3fb 100644
+--- a/platform/pc/src/pc_video.cpp
++++ b/platform/pc/src/pc_video.cpp
+@@ -385,6 +385,10 @@ void Video::ApplyWindow()
+     int d = DisplayIndex();
+     if (!w || m_headless)
+         return;
++#ifdef __vita__
++    (void)d;
++    return;   /* one screen, one size */
++#endif
+     int full = (SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN) != 0;
+     switch (m_set.mode) {
+     case PC_VIDEO_WINDOWED:
+@@ -543,9 +547,21 @@ bool Video::InitGl(int scale)
+         m_set.win_w = w;
+         m_set.win_h = h;
+     }
++#ifdef PC_GLES
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
++#else
+     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
++#endif
++#ifdef __vita__
++    /* the whole screen, always */
++    w = 960;
++    h = 544;
++    m_set.mode = PC_VIDEO_FULLSCREEN;
++#endif
+     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+     m_window = SDL_CreateWindow("Tony Hawk's Pro Skater", SDL_WINDOWPOS_CENTERED,
+                                 SDL_WINDOWPOS_CENTERED, w, h,
+diff --git a/platform/pc/tools/link.py b/platform/pc/tools/link.py
+index 48dc5a9..85477bb 100644
+--- a/platform/pc/tools/link.py
++++ b/platform/pc/tools/link.py
+@@ -21,7 +21,8 @@ import zipfile
+ 
+ HERE = os.path.dirname(os.path.abspath(__file__))
+ sys.path.insert(0, HERE)
+-from toolchain import EXE_NAME, I386, MFLAG, SANITIZE, USCORE, VITA, VITA_FLAGS, VITASDK, WINDOWS, X64, tool  # noqa: E402
++from toolchain import (EXE_NAME, GLES, I386, MFLAG, SANITIZE, USCORE, VITA, VITA_FLAGS,  # noqa: E402
++                       VITASDK, WINDOWS, X64, tool)
+ PC = os.path.dirname(HERE)
+ ROOT = os.path.dirname(os.path.dirname(PC))
+ 
+@@ -469,6 +470,8 @@ def runtime_flags(toolbin):
+             (["-freg-struct-return"] if I386 else [])
+     if VITA:
+         rt_flags += VITA_FLAGS
++    if GLES:
++        rt_flags += ["-DPC_GLES=1"]
+     return rt_flags, sdl_libs
+ 
+ 
+@@ -665,7 +668,7 @@ def link(ctx, metas, out, toolbin, release=False, version=None):
+     else:
+         # SDL2 and the C library are the system's; OpenGL comes through SDL. Not position
+         # independent: the image sits at its default 0x08048000
+-        libs = sdl_libs + ["-lm", "-lpthread"]
++        libs = sdl_libs + (["-lGLESv2"] if GLES else []) + ["-lm", "-lpthread"]
+         # the runtime's C++ library is linked in (no libstdc++ version to match on the player's system)
+         ldflags = ["-no-pie", "-Wl,-z,noexecstack", "-static-libstdc++", "-static-libgcc"]
+     run([gxx, MFLAG] + VITA_FLAGS + ["-g", "@" + rsp, "-o", exe] + SANITIZE + ldflags +
+diff --git a/platform/pc/tools/toolchain.py b/platform/pc/tools/toolchain.py
+index be40b1b..2d53933 100644
+--- a/platform/pc/tools/toolchain.py
++++ b/platform/pc/tools/toolchain.py
+@@ -50,6 +50,9 @@ PTR = 8 if X64 else 4
+ # returned through the hidden pointer in r0, as egcs on MIPS does (AAPCS returns one of 4 bytes or
+ # less in r0), so the decomp's `T f(a)` and `void f(T *, a)` stay one call. Game code, its data and
+ # the runtime alike (build.py, link.py)
++# OpenGL ES 2 for the renderer (pc/gl_shaders_gles.h): the Vita's vitaGL, or THPS_GLES=1 on Linux
++# to try that renderer on a desktop (its own THPS_BUILD_DIR)
++GLES = VITA or bool(os.environ.get("THPS_GLES"))
+ VITA_FLAGS = ["-mfpu=neon", "-mfloat-abi=hard", "-mthumb", "-fpcc-struct-return",
+               "-DPC_VITA=1"] if VITA else []
+ 
+-- 
+2.43.0
+

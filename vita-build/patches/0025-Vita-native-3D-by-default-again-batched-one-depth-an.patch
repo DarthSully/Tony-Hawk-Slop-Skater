@@ -1,0 +1,555 @@
+From feb1b71e4669890b22dabc08ba6375ef5a738eae Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Wed, 28 Oct 2026 08:31:28 +0300
+Subject: [PATCH] Vita: native 3D by default again, batched (one depth and one
+ colour pass per run of opaque faces); 960x544 widescreen; render size,
+ smoothing, 30 fps and PGXP switches
+
+- Renderer3D::DrawUpto with THPS_R3D_BATCH (default on, ES only): every face up to the next 2D
+  primitive goes to GlGpu::LayerBatch as one vertex range. The opaque faces' true depth first
+  (colour masked), then their colour against it with the 1/256 decal tolerance (painter order
+  inside it, so decals over coplanar floors still win), then semi-transparent and subtractive
+  faces in their order. The draw vertex shader's u_dpass carries a class select (+2 x sel) that
+  moves the other classes' triangles outside the clip volume. Faces with an HD texture keep the
+  old draws. [gl] counts "batched".
+- The Vita's default 3D is the native renderer again (t17's PS1 path at 728x544: 27 fps and
+  affine warping); THPS_RENDER3D=psx is the PS1 path. Gameplay is 16:9 at 960x544 (WidePad)
+  unless THPS_WIDESCREEN=0.
+- pc_vitagfx.h: PC_VitaGfxGet(), the Vita graphics settings from env.txt (THPS_VITA_RES=WxH of
+  512x240/720x408/960x544, THPS_WIDESCREEN, THPS_FILTER, THPS_VITA_FPS=30|60, THPS_RENDER3D). The
+  GRAPHICS menu that will edit them in Settings.ini is a later patch.
+- GlGpu: surfaces sized within the render size (scaled up when shown); SMOOTHING applies to
+  gameplay screens only (menus stay smooth); [gl] start-up line with screen, render size,
+  widescreen, smoothing, fps.
+- FrameClock: locked 30 shows every other frame (the game still runs at 60).
+- THPS_PGXP=0: THPS_GL_PRECISE=0 + THPS_GL_PERSPECTIVE=0; [gl] PGXP line at start.
+- No render thread: every GL call is made inside the game's VSync callback while the OT is
+  walked, and readbacks feed the game synchronously; recording all of it is left for later.
+---
+ platform/pc/README.md                    |   4 +
+ platform/pc/include/pc/frame_clock.h     |   1 +
+ platform/pc/include/pc/gl_gpu.h          |  10 +-
+ platform/pc/include/pc/gl_shaders_gles.h |  11 +-
+ platform/pc/include/pc/render3d.h        |   1 +
+ platform/pc/include/pc_vitagfx.h         |  21 ++++
+ platform/pc/src/pc_frame.cpp             |   8 +-
+ platform/pc/src/pc_gpu_gl.cpp            | 151 ++++++++++++++++++++++-
+ platform/pc/src/pc_render3d.cpp          |  34 ++++-
+ platform/pc/src/pc_vitagfx.cpp           |  48 +++++++
+ 10 files changed, 280 insertions(+), 9 deletions(-)
+ create mode 100644 platform/pc/include/pc_vitagfx.h
+ create mode 100644 platform/pc/src/pc_vitagfx.cpp
+
+diff --git a/platform/pc/README.md b/platform/pc/README.md
+index df0df0f..cf848c9 100644
+--- a/platform/pc/README.md
++++ b/platform/pc/README.md
+@@ -558,6 +558,10 @@ window, `THPS_FAST`, `THPS_DETERMINISTIC`) never wait for a display.
+ | `THPS_GL_PRECISE=0` | OpenGL: draw 3D polygons at the PS1's whole-pixel positions (default: sub-pixel, from the projections) |
+ | `THPS_GL_PERSPECTIVE=0` | OpenGL: affine texturing like the PS1 (default: perspective-correct) |
+ | `THPS_RENDER3D=psx` | OpenGL: draw the world and models through the PS1 path (default `native`, see Graphics) |
++| `THPS_PGXP=0` | OpenGL: both of the above off (`THPS_GL_PRECISE=0 THPS_GL_PERSPECTIVE=0`) |
++| `THPS_R3D_BATCH=0` | OpenGL ES (Vita): a native 3D layer's faces drawn in the PS1's order, split where they overlap (before t20); default: each run of faces between 2D primitives in one depth pass and one colour pass for the opaque faces, then the semi-transparent ones in order |
++| `THPS_VITA_RES=WxH` | Vita: screens drawn at most 512x240, 720x408 or 960x544 (default), scaled up to the screen |
++| `THPS_VITA_FPS=30` | Vita: every other frame shown (the game still runs at 60) |
+ | `THPS_R3DSTATS=1` | once a second: native 3D faces, culled faces, draws, and calls left to the retail code |
+ | `THPS_R3D_VERIFY=1` | check the native renderer's float vertices and back-face tests against retail's integers |
+ | `THPS_R3D_NEARDROP=1` | drop faces crossing the near plane that the PS1 dropped (default: OpenGL clips them) |
+diff --git a/platform/pc/include/pc/frame_clock.h b/platform/pc/include/pc/frame_clock.h
+index a023f05..8146d9f 100644
+--- a/platform/pc/include/pc/frame_clock.h
++++ b/platform/pc/include/pc/frame_clock.h
+@@ -33,6 +33,7 @@ private:
+     int64_t m_freq = 0, m_next = 0;
+     bool m_inHandler = false;
+     bool m_unthrottled = false;
++    bool m_lock30 = false;   /* t20: GRAPHICS > FRAME RATE locked 30 */
+     /* THPS_DETERMINISTIC=1: a virtual clock instead of the wall clock, so automated runs (scripted
+      * input, frame dumps) behave the same every time. Each poll advances it 1 ms. */
+     bool m_deterministic = false;
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index 763fe4e..8f8e065 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -185,6 +185,12 @@ class GlGpu {
+     void LayerArea(int ofs_x, int ofs_y, const int clip[4], int wide);
+     /* depth 0: nothing after it in the layer tests depth (no depth pass); why: PC_GL_SPLIT_* */
+     void LayerDraw(int first, int count, int cls, uint16_t hd, int depth = 1, int why = 0);
++    /* t20 (THPS_R3D_BATCH, ES only): faces first..first+count of the layer at once, trusting the
++     * depth buffer: the opaque ones' true depth, then their colour against it (the decal
++     * tolerance, painter order within it), then the semi-transparent ones in their order. cls:
++     * the classes present, bit 1 << cls (0 opaque, 1 semi-transparent, 2 subtractive). No HD
++     * textures (those faces keep LayerDraw). */
++    void LayerBatch(int first, int count, int cls, int why);
+     void LayerEnd();
+     void HdForget(uint16_t h);
+     void TexturesChanging(int x, int y, int w, int h);
+@@ -238,6 +244,7 @@ class GlGpu {
+         int cache_stale, own_fixed;
+         int gl_draws, layer_draws, split[PC_GL_SPLITS];
+         int layer_bufs, layer_client;   /* 3D layers drawn from a buffer; 3D draws not */
++        int layer_batches;              /* t20: 3D draws made by LayerBatch */
+     };
+ 
+     /* targets */
+@@ -256,7 +263,7 @@ class GlGpu {
+     void SetBlend(int pass);
+     /* the draw program's u_dpass (a float in ES 2) */
+ #ifdef PC_GLES
+-    void DPass(int d) { glUniform1f(m_drawUDpass, (float)d); }
++    void DPass(int d, int sel = 0) { glUniform1f(m_drawUDpass, (float)(d + 2 * sel)); }
+ #else
+     void DPass(int d) { glUniform1i(m_drawUDpass, d); }
+ #endif
+@@ -285,6 +292,7 @@ class GlGpu {
+     void SetOutputSize(int w, int h);
+ 
+     int m_active = 0;
++    int m_renderW = 0, m_renderH = 0, m_smoothGame = 1;   /* t20: GRAPHICS (pc_vitagfx.h) */
+     GLuint m_drawProg = 0, m_copyProg = 0, m_presentProg = 0;
+     GLint m_drawUPass = 0, m_drawUDpass = 0, m_drawUProj = 0, m_drawUTarget = 0,
+           m_drawUShift = 0, m_drawUUvfix = 0, m_copyUTarget = 0, m_copyUMap = 0, m_copyUSrc = 0;
+diff --git a/platform/pc/include/pc/gl_shaders_gles.h b/platform/pc/include/pc/gl_shaders_gles.h
+index 33e40c9..c6fc72c 100644
+--- a/platform/pc/include/pc/gl_shaders_gles.h
++++ b/platform/pc/include/pc/gl_shaders_gles.h
+@@ -69,6 +69,10 @@ static const char *gl_draw_vs =
+     "    vec2 k = 2.0 / u_target.zw;\n"
+     "    bool view = bits(info, 14.0, 1.0) > 0.5, dflag = bits(info, 13.0, 1.0) > 0.5;\n"
+     "    bool sky = bits(info, 15.0, 1.0) > 0.5;\n"
++    /* u_dpass = the depth pass (0, 1) + 2 x a class select (t20's batched layers,
++     * GlGpu::LayerBatch): 0 all faces, 1 opaque only, 2 semi-transparent but not subtractive,
++     * 3 subtractive; the others go outside the clip volume */
++    "    float sel = floor((u_dpass + 0.5) / 2.0), dpass = u_dpass - 2.0 * sel;\n"
+     "    float w;\n"
+     "    if (view) {\n"
+     "        vec3 v = a_pos;\n"
+@@ -85,7 +89,7 @@ static const char *gl_draw_vs =
+      * linear); everything else at the near end, always passing. A layer's faces nearer than its
+      * near plane are clipped, as gl_ClipDistance did */
+     "    if (sky) gl_Position.z = gl_Position.w;\n"
+-    "    else if (view && u_dpass > 0.5) gl_Position.z = clipZ(w, 0.0);\n"
++    "    else if (view && dpass > 0.5) gl_Position.z = clipZ(w, 0.0);\n"
+     "    else if (view || dflag) gl_Position.z = clipZ(w, 1.0 / 256.0);\n"
+     "    else gl_Position.z = -0.9999 * gl_Position.w;\n"
+     "    v_color = a_color.rgb;\n"
+@@ -101,6 +105,11 @@ static const char *gl_draw_vs =
+     "    v_flags = vec4(bits(info, 11.0, 1.0), view ? 1.0 : 0.0, cached, u_shift);\n"
+     "    v_twin = a_twin;\n"
+     "    v_uvr = a_uvr;\n"
++    "    if (sel > 0.5) {\n"
++    "        float abr = bits(info, 5.0, 2.0);\n"
++    "        float fcls = bits(info, 11.0, 1.0) < 0.5 ? 1.0 : (abr > 1.5 && abr < 2.5 ? 3.0 : 2.0);\n"
++    "        if (abs(fcls - sel) > 0.5) gl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n"
++    "    }\n"
+     "}\n";
+ 
+ /* THPS_GL_FLAT=1 (a measurement): the vertex colour only, no texture lookups and no discard. The
+diff --git a/platform/pc/include/pc/render3d.h b/platform/pc/include/pc/render3d.h
+index a485ad1..802bb97 100644
+--- a/platform/pc/include/pc/render3d.h
++++ b/platform/pc/include/pc/render3d.h
+@@ -122,6 +122,7 @@ private:
+     /* options (environment, Init) */
+     bool m_native = false, m_verify = false, m_showStats = false, m_nearDrop = false;
+     bool m_retailFade = false, m_nclip = false;
++    bool m_batch = false;   /* THPS_R3D_BATCH (t20, ES only): DrawUpto's faces in one LayerBatch */
+     Stats m_st = {};
+     /* DrawUpto's screen grid: 16x16 cells over 1024x512 of a layer's projection, each with the
+      * nearest depth of the opaque faces of the current draw that cover it (generation m_gridCur) */
+diff --git a/platform/pc/include/pc_vitagfx.h b/platform/pc/include/pc_vitagfx.h
+new file mode 100644
+index 0000000..06b0e5f
+--- /dev/null
++++ b/platform/pc/include/pc_vitagfx.h
+@@ -0,0 +1,21 @@
++/* The Vita graphics settings (src/pc_vitagfx.cpp). t20: from env.txt only; the GRAPHICS menu
++ * that edits them in Settings.ini comes later (its patch keeps this interface). */
++#pragma once
++
++typedef struct PC_VitaGfx {
++    int render_w, render_h; /* the screens drawn at most this size: 512x240, 720x408, 960x544 */
++    int widescreen;         /* 16:9 gameplay (native 3D only) */
++    int smoothing;          /* gameplay scaled up smoothly */
++    int frame_rate;         /* 60, or 30: every other frame shown */
++    int native3d;           /* the native 3D renderer, else the PS1 path */
++} PC_VitaGfx;
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++/* The settings for this run (read once): THPS_VITA_RES=WxH, THPS_WIDESCREEN=0|1, THPS_FILTER=0|1,
++ * THPS_VITA_FPS=30|60, THPS_RENDER3D=native|psx; defaults 960x544, on, on, 60, native. */
++const PC_VitaGfx *PC_VitaGfxGet(void);
++#ifdef __cplusplus
++}
++#endif
+diff --git a/platform/pc/src/pc_frame.cpp b/platform/pc/src/pc_frame.cpp
+index b83e3e8..8a3af48 100644
+--- a/platform/pc/src/pc_frame.cpp
++++ b/platform/pc/src/pc_frame.cpp
+@@ -9,6 +9,7 @@
+ #include "pc_frame.h"
+ #include "pc_draw.h"
+ #include "pc_video.h"
++#include "pc_vitagfx.h"
+ #include "pc_render3d.h"
+ #include "pc_runtime.h"
+ #include "pc_stream.h"
+@@ -39,6 +40,9 @@ void FrameClock::Init() {
+         m_freq = os::ClockFreq();
+     m_next = Now();
+     m_unthrottled = getenv("THPS_FAST") && atoi(getenv("THPS_FAST"));
++#ifdef __vita__
++    m_lock30 = PC_VitaGfxGet()->frame_rate == 30;
++#endif
+ }
+ 
+ /* One frame: input, streaming, the game's frame handler, then show the display area (the game
+@@ -64,7 +68,9 @@ void FrameClock::RunFrame(bool present) {
+         m_handler();
+         m_inHandler = false;
+     }
+-    if (present || !g_video.VSyncActive())
++    /* GRAPHICS > FRAME RATE locked 30 (t20, THPS_VITA_FPS=30): every other frame shown; the
++     * game still runs at 60 */
++    if ((present || !g_video.VSyncActive()) && !(m_lock30 && (m_frames & 1)))
+         g_video.Present();
+     pc_heartbeat = pc_heartbeat + 1;
+     g_input.PumpEvents();
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index bbcfb6d..b187c2f 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -24,6 +24,7 @@
+ #include "pc_render3d.h"
+ #include "pc_runtime.h"
+ #include "pc_texstore.h"
++#include "pc_vitagfx.h"
+ #include "pc/gl_gpu.h"
+ #ifdef PC_GLES
+ #include "pc/gl_shaders_gles.h"
+@@ -719,6 +720,20 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+     m_fixedScale = fixed_scale > 0 ? fixed_scale : 0;
+     m_outW = out_w > 0 ? out_w : 640;
+     m_outH = out_h > 0 ? out_h : 480;
++#ifdef __vita__
++    {
++        const PC_VitaGfx *g = PC_VitaGfxGet();
++        m_renderW = g->render_w;
++        m_renderH = g->render_h;
++        m_smoothGame = g->smoothing;
++        m_widescreen = g->widescreen;   /* GRAPHICS > WIDESCREEN (THPS_WIDESCREEN) */
++        fprintf(stderr, "[gl] screen %dx%d, render %dx%d%s, widescreen %s, smoothing %s, %d fps\n",
++                m_outW, m_outH, m_fixedScale ? 512 * m_fixedScale : m_renderW,
++                m_fixedScale ? 240 * m_fixedScale : m_renderH,
++                m_fixedScale ? " (THPS_GL_SCALE)" : "", m_widescreen ? "on" : "off",
++                m_smoothGame ? "on" : "off", g->frame_rate);
++    }
++#endif
+     m_nsurf = 0;
+ 
+ #ifdef PC_GLES
+@@ -935,6 +950,17 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+     m_st.on = getenv("THPS_GLSTATS") && atoi(getenv("THPS_GLSTATS"));
+     m_precise = !getenv("THPS_GL_PRECISE") || atoi(getenv("THPS_GL_PRECISE"));
+     m_perspective = !getenv("THPS_GL_PERSPECTIVE") || atoi(getenv("THPS_GL_PERSPECTIVE"));
++    {
++        /* THPS_PGXP=0 (t20): both of the above off, the PS1's whole-pixel affine drawing for
++         * everything the native renderer doesn't draw (its own faces are float view-space
++         * positions, perspective-correct, either way) */
++        const char *pg = getenv("THPS_PGXP");
++        if (pg && atoi(pg) == 0)
++            m_precise = m_perspective = 0;
++        fprintf(stderr, "[gl] PGXP: sub-pixel vertices %s, perspective-correct textures %s%s\n",
++                m_precise ? "on" : "off", m_perspective ? "on" : "off",
++                pg && atoi(pg) == 0 ? " (THPS_PGXP=0)" : "");
++    }
+     g_precise.Enable(m_precise || m_perspective);
+     m_active = 1;
+     g_renderer3d.Init(1);
+@@ -2472,6 +2498,111 @@ void GlGpu::LayerDraw(int first, int count, int cls, uint16_t hd, int depth, int
+     glDisable(GL_BLEND);
+ }
+ 
++void GlGpu::LayerBatch(int first, int count, int cls, int why)
++{
++#ifndef PC_GLES
++    /* desktop GL: the draws as before, one class at a time is not what this is for */
++    (void)first, (void)count, (void)cls, (void)why;
++#else
++#ifdef __vita__
++    PC_VITA_PROF_SCOPE(PC_PROF_DRAW);
++#endif
++    Layer &l = m_layer;
++    if (!l.active || count <= 0)
++        return;
++    m_st.layer_draws++;
++    m_st.layer_batches++;
++    if (why >= 0 && why < PC_GL_SPLITS)
++        m_st.split[why]++;
++    Flush();
++    Prepare();
++    int slow_tris = 1;
++    GLuint buf = l.buf;
++    if (m_cacheOn && l.verts == m_layerConv) {
++        if (l.conv_gen == m_cacheGen && first % 3 == 0 && count % 3 == 0) {
++            slow_tris = (int)(m_slowBefore[(first + count) / 3] - m_slowBefore[first / 3]);
++        } else {
++            memcpy(m_layerConv + first, l.src + first, (size_t)count * sizeof(GVert));
++            slow_tris = CacheVerts(m_layerConv + first, count);
++            buf = 0;
++        }
++    }
++    if (!buf)
++        m_st.layer_client++;
++    float proj[4] = { (float)l.lp.ofs_x + l.lp.ofx, (float)l.lp.ofs_y + l.lp.ofy, l.lp.h,
++                      l.lp.hither };
++    if (!m_projSet || memcmp(proj, m_proj, sizeof proj)) {
++        memcpy(m_proj, proj, sizeof proj);
++        m_projSet = 1;
++        m_projApplied[0] = m_projApplied[1] = 0;
++    }
++    UseDraw(slow_tris == 0);
++    if (slow_tris == 0 && m_drawProgFast) {
++        m_st.fast_batches++;
++        m_st.fast_tris += count / 3;
++    } else {
++        m_st.slow_batches++;
++        m_st.slow_tris += count / 3;
++        m_st.uncached_tris += m_cacheOn ? slow_tris : 0;
++    }
++    BindStore();
++    if (!buf)
++        DrawAttribs(l.verts);
++    else if (m_attrBuf != buf)
++        DrawAttribsFrom(buf, nullptr);
++    glEnable(GL_DEPTH_TEST);
++    glDepthFunc(GL_LEQUAL);
++    Target *ts[MAX_SURFACES + 1];
++    int nt = LayerTargets(ts);
++    for (int i = 0; i < nt; i++) {
++        ts[i]->Use();
++        if (!ts[i]->Scissor(l.clip[0], l.clip[1], l.clip[2], l.clip[3], l.wide))
++            continue;
++        DrawUniforms(ts[i]);
++        int n = 0;
++        if (cls & 1) {
++            /* the opaque faces' true depth (texels the shader discards write none), then their
++             * colour where it is within the tolerance of the nearest: a decal over its floor
++             * passes, and the later of the two (the PS1's order) is the one left */
++            SetBlend(0);
++            DPass(1, 1);
++            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
++            glDepthMask(GL_TRUE);
++            glDrawArrays(GL_TRIANGLES, first, count);
++            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++            glDepthMask(GL_FALSE);
++            DPass(0, 1);
++            glDrawArrays(GL_TRIANGLES, first, count);
++            n += 2;
++        }
++        glDepthMask(GL_FALSE);
++        if (cls & 2) {
++            /* semi-transparent faces after every opaque one, in their own order */
++            SetBlend(0);
++            DPass(0, 2);
++            glDrawArrays(GL_TRIANGLES, first, count);
++            n++;
++        }
++        if (cls & 4) {
++            /* subtractive (B-F): after the other semi-transparent ones */
++            DPass(0, 3);
++            SetBlend(1);
++            glDrawArrays(GL_TRIANGLES, first, count);
++            SetBlend(2);
++            glDrawArrays(GL_TRIANGLES, first, count);
++            n += 2;
++        }
++        DPass(0);
++        m_st.draws++;
++        m_st.gl_draws += n;
++    }
++    glDisable(GL_DEPTH_TEST);
++    glDepthMask(GL_TRUE);
++    glDisable(GL_SCISSOR_TEST);
++    glDisable(GL_BLEND);
++#endif
++}
++
+ void GlGpu::LayerEnd()
+ {
+     Layer &l = m_layer;
+@@ -2804,6 +2935,16 @@ void GlGpu::SurfaceSize(int w, int h, int pad, int *pw, int *ph) const
+         PictureRect(w + 2 * pad, w, r);
+         *pw = r[2];
+         *ph = r[3];
++#ifdef __vita__
++        /* GRAPHICS > RENDER RESOLUTION (t20): the screen drawn at that share of the window's
++         * pixels, scaled up when shown */
++        if (m_renderW > 0 && m_renderH > 0 && (m_renderW < m_outW || m_renderH < m_outH)) {
++            *pw = ((*pw * m_renderW / m_outW) + 4) & ~7;
++            *ph = *ph * m_renderH / m_outH;
++            *pw = *pw < 8 ? 8 : *pw;
++            *ph = *ph < 8 ? 8 : *ph;
++        }
++#endif
+     }
+ }
+ 
+@@ -3021,6 +3162,11 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+             /* a surface the window's size is copied pixel for pixel */
+             int exact = px1 - px0 == pic[2] && py1 - py0 == pic[3];
+             int smooth = m_filter || (t != &m_base && !m_fixedScale);
++#ifdef __vita__
++            /* GRAPHICS > SMOOTHING: gameplay (512x240 screens); menus stay smooth */
++            if (t != &m_base && t->rw == 512 && t->h == 240)
++                smooth = m_smoothGame;
++#endif
+             GLint filter = !exact && smooth ? GL_LINEAR : GL_NEAREST;
+             glBindTexture(GL_TEXTURE_2D, t->tex);
+             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+@@ -3071,7 +3217,7 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                         "blits %d in place, %d copied by vitaGL; %d descriptors pointed back; "
+                         "GL draws %.0f a frame; 3D %.0f draws a frame (new draw for depth %d, "
+                         "class %d, texture %d, 2D between %d, layer end %d); 3D layers in a "
+-                        "buffer %d, 3D draws not %d\n",
++                        "buffer %d, 3D draws not %d, batched %d\n",
+                 m_st.draws, m_st.readbacks, m_st.tex_ups, m_st.blits, m_st.cache_hits,
+                 m_st.cache_misses, m_st.cache_inval, m_st.cache_full, m_st.cache_deferred,
+                 m_st.cache_stale, m_st.fast_batches, m_st.fast_tris, m_st.slow_batches,
+@@ -3080,7 +3226,8 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                 m_st.own_fixed, m_st.gl_draws / 60.0, m_st.layer_draws / 60.0,
+                 m_st.split[PC_GL_SPLIT_DEPTH], m_st.split[PC_GL_SPLIT_CLASS],
+                 m_st.split[PC_GL_SPLIT_TEXTURE], m_st.split[PC_GL_SPLIT_2D],
+-                m_st.split[PC_GL_SPLIT_END], m_st.layer_bufs, m_st.layer_client);
++                m_st.split[PC_GL_SPLIT_END], m_st.layer_bufs, m_st.layer_client,
++                m_st.layer_batches);
+         m_st = Stats{};
+         m_st.on = 1;
+     }
+diff --git a/platform/pc/src/pc_render3d.cpp b/platform/pc/src/pc_render3d.cpp
+index 7dc39bd..7596d63 100644
+--- a/platform/pc/src/pc_render3d.cpp
++++ b/platform/pc/src/pc_render3d.cpp
+@@ -54,6 +54,7 @@
+ #include "pc_render3d.h"
+ #include "pc_runtime.h"
+ #include "pc_video.h"
++#include "pc_vitagfx.h"
+ #include "pc/precise.h"
+ #include "pc/render3d.h"
+ #include "pc/draw.h"
+@@ -1249,6 +1250,23 @@ void Renderer3D::DrawUpto(uint32_t bucket, int last)
+         int ox, oy, clip[4], wide = g_otDrawer.State(&ox, &oy, clip);
+         g_glGpu.LayerArea(ox, oy, clip, wide);
+     }
++    if (m_batch && i < b->nf && b->sf[i].bucket >= bucket) {
++        /* t20: every face up to here at once, the depth buffer sorting the opaque ones (see
++         * GlGpu::LayerBatch); the ones with an HD texture keep the draws below */
++        int j = i, cls = 0, hd = 0;
++        for (; j < b->nf && b->sf[j].bucket >= bucket; j++) {
++            cls |= 1 << b->sf[j].cls;
++            hd |= b->sf[j].hd;
++        }
++        if (!hd) {
++            int first = (int)b->sf[i].first;
++            int count = (int)(b->sf[j - 1].first + b->sf[j - 1].nv) - first;
++            g_glGpu.LayerBatch(first, count, cls, j < b->nf ? PC_GL_SPLIT_2D : PC_GL_SPLIT_END);
++            m_st.draws++;
++            b->next = j;
++            return;
++        }
++    }
+     while (i < b->nf && b->sf[i].bucket >= bucket) {
+         int cls = b->sf[i].cls, first = (int)b->sf[i].first, count = 0, j = i;
+         int why = PC_GL_SPLIT_END;
+@@ -1428,11 +1446,18 @@ void Renderer3D::Init(int gl)
+ {
+     const char *e = getenv("THPS_RENDER3D");
+ #ifdef __vita__
+-    /* the PS1 path at the screen's resolution unless asked: the native renderer's draws cost
+-     * the Vita's CPU more than the PS1 path does (t15, t16) */
+-    m_native = gl && e && strcmp(e, "native") == 0;
++    /* t20: native again (t17's PS1 path at 728x544 ran 27 fps, warping its textures), its
++     * faces batched; GRAPHICS > 3D or THPS_RENDER3D=psx|native (pc_vitagfx.h) */
++    m_native = gl && PC_VitaGfxGet()->native3d;
++    (void)e;
+ #else
+     m_native = gl && !(e && strcmp(e, "psx") == 0);
++#endif
++#ifdef PC_GLES
++    {
++        const char *bt = getenv("THPS_R3D_BATCH");
++        m_batch = !(bt && atoi(bt) == 0);
++    }
+ #endif
+     m_showStats = getenv("THPS_R3DSTATS") && atoi(getenv("THPS_R3DSTATS"));
+     m_verify = getenv("THPS_R3D_VERIFY") && atoi(getenv("THPS_R3D_VERIFY"));
+@@ -1442,7 +1467,8 @@ void Renderer3D::Init(int gl)
+     if (m_native)
+         g_precise.Enable(true);
+ #ifdef __vita__
+-    fprintf(stderr, "[r3d] 3D: %s\n", m_native ? "native (THPS_RENDER3D=native)" : "PS1 (default)");
++    fprintf(stderr, "[r3d] 3D: %s%s\n", m_native ? "native" : "PS1",
++            m_native ? (m_batch ? ", batched (THPS_R3D_BATCH=0: t17's draws)" : ", t17's draws (THPS_R3D_BATCH=0)") : "");
+ #else
+     fprintf(stderr, "[r3d] 3D: %s\n", m_native ? "native" : "PS1 (THPS_RENDER3D=psx)");
+ #endif
+diff --git a/platform/pc/src/pc_vitagfx.cpp b/platform/pc/src/pc_vitagfx.cpp
+new file mode 100644
+index 0000000..c24b61b
+--- /dev/null
++++ b/platform/pc/src/pc_vitagfx.cpp
+@@ -0,0 +1,48 @@
++/* The Vita graphics settings (pc_vitagfx.h): defaults and env.txt. */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "pc_vitagfx.h"
++
++namespace {
++
++PC_VitaGfx s_gfx;
++bool s_read = false;
++
++void Read()
++{
++    static const int sizes[3][2] = { { 512, 240 }, { 720, 408 }, { 960, 544 } };
++    const char *e;
++    int w, h;
++    s_gfx = PC_VitaGfx{ 960, 544, 1, 1, 60, 1 };
++    if ((e = getenv("THPS_VITA_RES")) && sscanf(e, "%dx%d", &w, &h) == 2) {
++        for (int i = 0; i < 3; i++)
++            if (w == sizes[i][0] && h == sizes[i][1]) {
++                s_gfx.render_w = w;
++                s_gfx.render_h = h;
++            }
++    }
++    if ((e = getenv("THPS_WIDESCREEN")))
++        s_gfx.widescreen = atoi(e) != 0;
++    if ((e = getenv("THPS_FILTER")))
++        s_gfx.smoothing = e[0] != '0';
++    if ((e = getenv("THPS_VITA_FPS")) && atoi(e) == 30)
++        s_gfx.frame_rate = 30;
++    if ((e = getenv("THPS_RENDER3D")))
++        s_gfx.native3d = strcmp(e, "psx") != 0;
++    fprintf(stderr, "[gfx] render %dx%d, widescreen %s, smoothing %s, %d fps, 3D %s\n",
++            s_gfx.render_w, s_gfx.render_h, s_gfx.widescreen ? "on" : "off",
++            s_gfx.smoothing ? "on" : "off", s_gfx.frame_rate, s_gfx.native3d ? "native" : "PS1");
++}
++
++} // namespace
++
++extern "C" const PC_VitaGfx *PC_VitaGfxGet(void)
++{
++    if (!s_read) {
++        s_read = true;
++        Read();
++    }
++    return &s_gfx;
++}
+-- 
+2.53.0
+

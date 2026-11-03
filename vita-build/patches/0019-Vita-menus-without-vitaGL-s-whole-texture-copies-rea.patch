@@ -1,0 +1,665 @@
+From b37911fdcb5c2548e7d6808a3dadb9dc3c01ba78 Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Mon, 26 Oct 2026 14:09:01 +0300
+Subject: [PATCH] Vita: menus without vitaGL's whole-texture copies, readbacks
+ from the right rows, a capped decode burst, the [present] line
+
+The menus' slow frames: a blit, a texture store write or a movie picture right after a draw made
+vitaGL copy the whole texture first (glTexSubImage2D on a texture drawn in the last 4 frames: 1-2
+MB read from GPU memory). Those textures are now written in place: the texture store keeps up to
+8 copies, each with a write generation per 16x16 cell, and a write after a draw goes to a copy no
+draw of the last 4 frames used, which takes only the cells it lacks; blits and movie pictures take
+a free texture of a pool (6 and 5). With none free it is vitaGL's copy again; THPS_GL_INPLACE=0
+goes back to vitaGL's copies everywhere (an A/B switch).
+
+The menus' black boxes and stale strips: vitaGL's glReadPixels on a framebuffer object reads rows
+from height - y - h (the wrong end for any partial read) and waits for the GPU only when that
+framebuffer is being drawn. ReadPixels and ReadArea now glFinish and read the base target's
+texels directly (row y is VRAM row y). The frontend reads the screen once (EraseSprite,
+SlicedImage, the options screens' saved background) and blits it back every frame.
+
+The copy shader finds its texel from an interpolated VRAM position, not gl_FragCoord. At most 8
+new texture-cache pages are decoded a frame (a level's first frame wanted 89: 0.77 s); the rest
+keep the emulated lookup a frame or two. With the profile, a [present] line every second splits a
+present (flush, prepare, movie picture, swap, the rest) and times texture store writes, blits and
+readbacks anywhere; [stall] adds upload and blit; [gl] counts cells written in place, new copies,
+vitaGL copies, pooled blits and deferred decodes.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ platform/pc/include/pc/gl_gpu.h          |  38 ++-
+ platform/pc/include/pc/gl_shaders_gles.h |  13 +-
+ platform/pc/include/pc/platform.h        |   5 +-
+ platform/pc/src/pc_gpu_gl.cpp            | 329 +++++++++++++++++++++--
+ platform/pc/src/pc_vita.cpp              |  12 +-
+ 5 files changed, 360 insertions(+), 37 deletions(-)
+
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index 96b85e4..677a3be 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -220,8 +220,9 @@ class GlGpu {
+     /* THPS_GLSTATS=1: per-second counts of draw calls, readbacks and uploads */
+     struct Stats {
+         int on, draws, readbacks, tex_ups, blits, frames;
+-        int cache_hits, cache_misses, cache_inval, cache_full;
++        int cache_hits, cache_misses, cache_inval, cache_full, cache_deferred;
+         int fast_batches, slow_batches, fast_tris, slow_tris, uncached_tris;
++        int store_cells, store_switches, store_copies, blit_pool, blit_copies;
+     };
+ 
+     /* targets */
+@@ -233,6 +234,8 @@ class GlGpu {
+     /* textures */
+     void UploadTexStore();
+     void Prepare();
++    /* the texture store's texture on unit 0, for a draw */
++    void BindStore();
+     void HdBind(uint16_t h);
+     /* batches */
+     void SetBlend(int pass);
+@@ -309,6 +312,11 @@ class GlGpu {
+         int cx, cy, cw;      /* its CLUT (cw 0: 15-bit, none) */
+     };
+     static constexpr int kCacheSlots = 128, kAtlasW = 4096, kAtlasH = 2048, kAtlasUnit = 4;
++    /* new pages decoded a frame at most; the rest keep the emulated lookup a frame or two (a
++     * level's first frame wanted 89 at once: 0.77 s) */
++    static constexpr int kDecodesPerFrame = 8;
++    uint32_t m_decodeFrame = 0;
++    int m_decodesLeft = 0;
+     int m_cacheOn = 0;
+     GLuint m_atlas = 0;
+     uint8_t *m_atlasPtr = nullptr;   /* the atlas's texels (vglGetTexDataPointer), written in place */
+@@ -332,6 +340,34 @@ class GlGpu {
+     int CacheVerts(GlVert *v, int n);
+     void CacheInvalidate(int x, int y, int w, int h);
+     void CacheRefresh();
++#ifdef __vita__
++    /* vitaGL copies a whole texture before writing one that a draw of the last 4 frames used
++     * (glTexSubImage2D): 1 MB for the store or a blit, from memory the CPU reads slowly. The
++     * textures written while frames are drawn are written in place instead, each time into a
++     * texture no such draw used. The store keeps up to kStoreVersions copies, each knowing which
++     * of the store's 16x16 cells it has (a write generation per cell): a write after a draw goes to
++     * a free copy, which takes the cells it lacks. The CPU's blits and the movies' pictures each take
++     * a free texture of a pool. With none free, it is vitaGL's copy again. */
++    static constexpr int kStoreVersions = 8, kBlitPool = 6, kImagePool = 5;
++    struct InPlace {
++        GLuint tex;
++        uint8_t *ptr;    /* its texels (vglGetTexDataPointer): linear rows of align(w, 8) texels */
++        uint32_t used;   /* m_frameNo when last drawn with (0: never) */
++        int w, h;
++    };
++    InPlace m_store[kStoreVersions] = {};   /* [0] is m_texstore */
++    uint32_t m_storeGen[kStoreVersions][CELLS_Y * CELLS_X] = {};
++    uint32_t m_cellGen[CELLS_Y * CELLS_X] = {};
++    int m_inPlace = 1;   /* THPS_GL_INPLACE=0: vitaGL's copies, as before t12 */
++    int m_nstore = 0, m_storeCur = 0, m_storeDrawn = 0;
++    InPlace m_blitPool[kBlitPool] = {};
++    InPlace m_imagePool[kImagePool] = {};
++    uint8_t *m_basePtr = nullptr;   /* the base target's texels: row y is VRAM row y */
++    /* a free texture of a pool (no draw of the last 4 frames used it), w x h of fmt, made the first
++     * time; -1 when none is */
++    int PoolTake(InPlace *pool, int n, int w, int h, GLenum fmt);
++    void StoreSync();
++#endif
+ #endif
+     GLuint m_dispTex = 0;                  /* RGBA8 1024x512: pictures shown instead (movies) */
+     int m_filter = 0;
+diff --git a/platform/pc/include/pc/gl_shaders_gles.h b/platform/pc/include/pc/gl_shaders_gles.h
+index 0bfed00..4edd02d 100644
+--- a/platform/pc/include/pc/gl_shaders_gles.h
++++ b/platform/pc/include/pc/gl_shaders_gles.h
+@@ -586,17 +586,17 @@ static const char *gl_draw_fast_fs4 =
+     "}\n";
+ 
+ /* 16-bit pixels the CPU wrote (GlGpu::Blit) into a render target: the same LUMINANCE_ALPHA
+- * texture as the texture store's, their VRAM x, y at its 0, 0. */
++ * texture as the texture store's, their VRAM x, y at its 0, 0. Each pixel's texel is found from its
++ * VRAM position, interpolated from the quad's corners, not from gl_FragCoord (vitaGL's is the GPU's
++ * window position, so it hangs on how vitaGL turns render targets over). */
+ static const char *gl_copy_fs =
+     "#ifdef GL_ES\n"
+     "precision highp float;\n"
+     "#endif\n"
+     "uniform sampler2D u_vram;\n"
+-    "uniform vec4 u_map;\n"         /* the target's VRAM x, y; pixels per texel */
+-    "uniform vec2 u_src;\n"         /* the pixels' VRAM x, y */
++    "varying vec2 v_src;\n"         /* the pixel's VRAM position less the pixels' x, y */
+     "void main() {\n"
+-    "    vec2 p = floor(gl_FragCoord.xy / u_map.zw) + u_map.xy - u_src;\n"
+-    "    vec4 sx = texture2D(u_vram, (p + 0.5) / vec2(1024.0, 512.0));\n"
++    "    vec4 sx = texture2D(u_vram, (floor(v_src) + 0.5) / vec2(1024.0, 512.0));\n"
+     "    vec2 tx = floor(vec2(sx.r, sx.a) * 255.0 + 0.5);\n"
+     "    gl_FragColor = vec4(vec3(mod(tx.x, 32.0), floor(tx.x / 32.0) + mod(tx.y, 4.0) * 8.0,\n"
+     "                             mod(floor(tx.y / 4.0), 32.0)) / 31.0, tx.y > 127.5 ? 1.0 : 0.0);\n"
+@@ -608,8 +608,11 @@ static const char *gl_copy_vs =
+     "#endif\n"
+     "attribute vec2 a_pos;\n"
+     "uniform vec4 u_target;\n"
++    "uniform vec2 u_src;\n"         /* the pixels' VRAM x, y */
++    "varying vec2 v_src;\n"
+     "void main() {\n"
+     "    gl_Position = vec4((a_pos - u_target.xy) * 2.0 / u_target.zw - 1.0, 0.0, 1.0);\n"
++    "    v_src = a_pos - u_src;\n"
+     "}\n";
+ 
+ /* A texture's area onto the bound framebuffer (the window; a target's pixels onto another). */
+diff --git a/platform/pc/include/pc/platform.h b/platform/pc/include/pc/platform.h
+index 4b9fa79..d4ccef0 100644
+--- a/platform/pc/include/pc/platform.h
++++ b/platform/pc/include/pc/platform.h
+@@ -34,7 +34,10 @@ void PC_VitaLogOpen(void);
+ /* the `profile` switch (an empty PC_VITA_DIR/profile file): time spent per slot, logged once a
+  * second at the frame boundary (PC_VitaProfFrame) */
+ enum { PC_PROF_PRESENT, PC_PROF_SWAP, PC_PROF_READBACK, PC_PROF_MOVIE, PC_PROF_DRAW, PC_PROF_FILE,
+-       PC_PROF_SNDLOCK, PC_PROF_VBLANK, PC_PROF_STREAM, PC_PROF_SLEEP, PC_PROF_DECODE, PC_PROF_SLOTS };
++       PC_PROF_SNDLOCK, PC_PROF_VBLANK, PC_PROF_STREAM, PC_PROF_SLEEP, PC_PROF_DECODE,
++       /* the texture store's writes, the CPU's blits, a movie's picture; inside a present, its flush
++        * of the last primitives and its Prepare (the [present] line) */
++       PC_PROF_UPLOAD, PC_PROF_BLIT, PC_PROF_IMAGE, PC_PROF_PFLUSH, PC_PROF_PPREP, PC_PROF_SLOTS };
+ extern int pc_vita_profile;
+ long long PC_VitaProfNow(void);
+ void PC_VitaProfAdd(int slot, long long us);
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index 531e7fe..cc5d26f 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -699,6 +699,21 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+                      GL_NEAREST);
+     m_texstore = Texture(GL_LUMINANCE_ALPHA, VRAM_W, VRAM_H, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE,
+                          GL_NEAREST);
++#ifdef __vita__
++    /* the store's first copy (StoreSync): it has none of the cells yet */
++    m_store[0] = InPlace{m_texstore, (uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D), 0, VRAM_W, VRAM_H};
++    {
++        const char *ip = getenv("THPS_GL_INPLACE");
++        m_inPlace = !(ip && ip[0] == '0');
++    }
++    m_nstore = m_inPlace && m_store[0].ptr ? 1 : 0;
++    m_storeCur = 0;
++    m_storeDrawn = 0;
++    for (int i = 0; i < CELLS_Y * CELLS_X; i++)
++        m_cellGen[i] = 1;
++    fprintf(stderr, "[gl] textures written in place: %s\n",
++            m_nstore ? "on (THPS_GL_INPLACE=0 turns it off)" : "off (vitaGL copies them)");
++#endif
+ #else
+     m_filter = f && f[0] == '1';
+     m_blit = Texture(GL_R16UI, VRAM_W, VRAM_H, GL_RED_INTEGER, GL_UNSIGNED_SHORT, GL_NEAREST);
+@@ -712,6 +727,11 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+         fprintf(stderr, "[gl] framebuffer setup failed\n");
+         return -1;
+     }
++#ifdef __vita__
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, m_base.tex);
++    m_basePtr = (uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
++#endif
+     if (glGetError() != GL_NO_ERROR) {
+         fprintf(stderr, "[gl] setup failed\n");
+         return -1;
+@@ -750,6 +770,21 @@ void GlGpu::Shutdown()
+     glDeleteBuffers(4, bufs);
+ #endif
+     glDeleteTextures(4, texs);
++#ifdef __vita__
++    for (int i = 1; i < m_nstore; i++)
++        glDeleteTextures(1, &m_store[i].tex);
++    for (InPlace &t : m_blitPool)
++        if (t.tex)
++            glDeleteTextures(1, &t.tex);
++    for (InPlace &t : m_imagePool)
++        if (t.tex)
++            glDeleteTextures(1, &t.tex);
++    memset(m_store, 0, sizeof m_store);
++    memset(m_blitPool, 0, sizeof m_blitPool);
++    memset(m_imagePool, 0, sizeof m_imagePool);
++    m_nstore = 0;
++    m_basePtr = nullptr;
++#endif
+     glDeleteFramebuffers(1, &m_rbFbo);
+     if (m_shadowState) {
+         glDeleteProgram(m_shadowProg);
+@@ -778,6 +813,33 @@ void GlGpu::UploadTexStore()
+     const uint16_t *tex = g_textureStore.Data();
+     uint8_t *cell = g_textureStore.Cells();
+     int any = 0;
++#ifdef __vita__
++    if (m_nstore) {
++        /* each written cell a new generation, then into a copy no draw in flight reads */
++        for (int cy = 0; cy < CELLS_Y; cy++) {
++            uint8_t *row = cell + cy * CELLS_X;
++            for (int cx = 0; cx < CELLS_X;) {
++                if (!(row[cx] & kTexDirty)) {
++                    cx++;
++                    continue;
++                }
++                int run = cx;
++                for (; run < CELLS_X && (row[run] & kTexDirty); run++) {
++                    row[run] &= (uint8_t)~kTexDirty;
++                    m_cellGen[cy * CELLS_X + run]++;
++                }
++                m_st.tex_ups++;
++                if (m_cacheOn)
++                    CacheInvalidate(cx * CELL, cy * CELL, (run - cx) * CELL, CELL);
++                any = 1;
++                cx = run;
++            }
++        }
++        if (any)
++            StoreSync();
++        return;
++    }
++#endif
+     for (int cy = 0; cy < CELLS_Y; cy++) {
+         uint8_t *row = cell + cy * CELLS_X;
+         for (int cx = 0; cx < CELLS_X;) {
+@@ -829,6 +891,115 @@ void GlGpu::Prepare()
+ #endif
+ }
+ 
++void GlGpu::BindStore()
++{
++    glActiveTexture(GL_TEXTURE0);
++#ifdef __vita__
++    if (m_nstore) {
++        m_store[m_storeCur].used = m_frameNo;
++        m_storeDrawn = 1;
++        glBindTexture(GL_TEXTURE_2D, m_store[m_storeCur].tex);
++        return;
++    }
++#endif
++    glBindTexture(GL_TEXTURE_2D, m_texstore);
++}
++
++#ifdef __vita__
++/* The cells written since into a copy of the store's texture no draw in flight reads: the current
++ * one until a draw uses it, then a free one (made up to kStoreVersions), which takes every cell it
++ * lacks; with none free, the current one through glTexSubImage2D, which vitaGL copies first. */
++void GlGpu::StoreSync()
++{
++    long long prof_t0 = PC_VitaProfNow();
++    const uint16_t *tex = g_textureStore.Data();
++    int k = m_storeCur;
++    if (m_storeDrawn) {
++        k = -1;
++        for (int i = 0; i < m_nstore && k < 0; i++)
++            if (i != m_storeCur && (!m_store[i].used || m_frameNo - m_store[i].used > 4))
++                k = i;
++        if (k < 0 && m_nstore < kStoreVersions) {
++            InPlace &n = m_store[m_nstore];
++            glActiveTexture(GL_TEXTURE0);
++            n.tex = Texture(GL_LUMINANCE_ALPHA, VRAM_W, VRAM_H, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE,
++                            GL_NEAREST);
++            n.ptr = (uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
++            n.w = VRAM_W;
++            n.h = VRAM_H;
++            n.used = 0;
++            if (n.ptr) {
++                memset(m_storeGen[m_nstore], 0, sizeof m_storeGen[m_nstore]);
++                k = m_nstore++;
++            } else {
++                glDeleteTextures(1, &n.tex);
++                n = InPlace{};
++            }
++        }
++        if (k >= 0) {
++            m_storeCur = k;
++            m_storeDrawn = 0;
++            m_st.store_switches++;
++        }
++    }
++    int cur = k >= 0 ? k : m_storeCur;
++    uint8_t *texels = m_store[cur].ptr;
++    uint32_t *gen = m_storeGen[cur];
++    if (k < 0) {
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, m_store[cur].tex);
++    }
++    for (int cy = 0; cy < CELLS_Y; cy++) {
++        uint32_t *g = gen + cy * CELLS_X;
++        const uint32_t *now = m_cellGen + cy * CELLS_X;
++        for (int cx = 0; cx < CELLS_X;) {
++            if (g[cx] == now[cx]) {
++                cx++;
++                continue;
++            }
++            int run = cx;
++            for (; run < CELLS_X && g[run] != now[run]; run++)
++                g[run] = now[run];
++            int x = cx * CELL, y = cy * CELL, w = (run - cx) * CELL;
++            if (k < 0)
++                Upload16(x, y, w, CELL, tex + (size_t)y * VRAM_W + x, VRAM_W);
++            else
++                for (int j = y; j < y + CELL; j++)   /* L the low byte, A the high: as stored */
++                    memcpy(texels + ((size_t)j * VRAM_W + x) * 2, tex + (size_t)j * VRAM_W + x,
++                           (size_t)w * 2);
++            m_st.store_cells += run - cx;
++            cx = run;
++        }
++    }
++    if (k < 0) {
++        /* vitaGL wrote a copy: the texels moved, and no draw has used the copy yet */
++        m_store[cur].ptr = (uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
++        m_storeDrawn = 0;
++        m_st.store_copies++;
++    }
++    PC_VitaProfAdd(PC_PROF_UPLOAD, PC_VitaProfNow() - prof_t0);
++}
++
++int GlGpu::PoolTake(InPlace *pool, int n, int w, int h, GLenum fmt)
++{
++    for (int i = 0; i < n; i++) {
++        InPlace &t = pool[i];
++        if (!t.tex) {
++            glActiveTexture(GL_TEXTURE0);
++            t.tex = Texture((GLint)fmt, w, h, fmt, GL_UNSIGNED_BYTE, GL_NEAREST);
++            t.ptr = (uint8_t *)vglGetTexDataPointer(GL_TEXTURE_2D);
++            t.w = w;
++            t.h = h;
++            t.used = 0;
++            return t.ptr ? i : -1;
++        }
++        if (t.ptr && t.w == w && t.h == h && (!t.used || m_frameNo - t.used > 4))
++            return i;
++    }
++    return -1;
++}
++#endif
++
+ void GlGpu::TexturesChanging(int x, int y, int w, int h)
+ {
+     if (!m_active)
+@@ -996,8 +1167,7 @@ void GlGpu::Flush()
+ #endif
+     if (b.hd)
+         HdBind(b.hd);
+-    glActiveTexture(GL_TEXTURE0);
+-    glBindTexture(GL_TEXTURE_2D, m_texstore);
++    BindStore();
+ #ifdef PC_GLES
+     DrawAttribs(b.verts);
+ #else
+@@ -1567,8 +1737,7 @@ void GlGpu::LayerDraw(int first, int count, int cls, uint16_t hd)
+     if (hd)
+         HdBind(hd);
+     glUniform4f(m_drawUProj, l.lp.ofs_x + l.lp.ofx, l.lp.ofs_y + l.lp.ofy, l.lp.h, l.lp.hither);
+-    glActiveTexture(GL_TEXTURE0);
+-    glBindTexture(GL_TEXTURE_2D, m_texstore);
++    BindStore();
+ #ifdef PC_GLES
+     DrawAttribs(l.verts);
+ #else
+@@ -1646,6 +1815,29 @@ void GlGpu::ReadPixels(int x0, int y0, int x1, int y1, uint16_t *out)
+     /* the base, then the surfaces over it */
+     Target *ts[MAX_SURFACES + 1];
+     int nt = TargetsFor(px, py, px + pw - 1, py + ph - 1, ts);
++#ifdef __vita__
++    if (nt == 1 && ts[0] == &m_base && m_basePtr) {
++        /* vitaGL's glReadPixels takes a framebuffer object's rows from the far end (y as height -
++         * y - h) and waits for the GPU only when that framebuffer is the one being drawn: here all
++         * drawing is finished first, and the base's texels are read where they are (row y is VRAM
++         * row y, as the screens show), a row at a time into cached memory */
++        long long prof_t0 = PC_VitaProfNow();
++        glFinish();
++        int w = x1 - x0 + 1;
++        for (int y = y0; y <= y1; y++) {
++            memcpy(buf, m_basePtr + ((size_t)y * VRAM_W + x0) * 4, (size_t)w * 4);
++            uint16_t *d = out + (size_t)(y - y0) * w;
++            for (int i = 0; i < w; i++) {
++                const uint8_t *s = buf + i * 4;
++                d[i] = (uint16_t)(m_to5[s[0]] | m_to5[s[1]] << 5 | m_to5[s[2]] << 10 |
++                                  (s[3] >= 128 ? 0x8000 : 0));
++            }
++        }
++        PC_VitaProfAdd(PC_PROF_READBACK, PC_VitaProfNow() - prof_t0);
++        m_st.readbacks++;
++        return;
++    }
++#endif
+     glDisable(GL_SCISSOR_TEST);
+ #ifdef PC_GLES
+     if (nt == 1 && ts[0] == &m_base) {
+@@ -1727,6 +1919,25 @@ void GlGpu::Blit(int x, int y, int w, int h, const uint16_t *src)
+         src += (size_t)(y - oy) * sw + (x - ox);
+     }
+     Flush();   /* primitives already sent draw before these pixels arrive */
++    GLuint pixels = m_blit;
++#ifdef __vita__
++    long long prof_t0 = PC_VitaProfNow();
++    int bp = m_inPlace ? PoolTake(m_blitPool, kBlitPool, VRAM_W, VRAM_H, GL_LUMINANCE_ALPHA) : -1;
++    if (bp >= 0) {
++        /* in place, into a texture no draw in flight reads (L the low byte, A the high) */
++        InPlace &b = m_blitPool[bp];
++        for (int j = 0; j < h; j++)
++            memcpy(b.ptr + (size_t)j * VRAM_W * 2, src + (size_t)j * sw, (size_t)w * 2);
++        b.used = m_frameNo;
++        pixels = b.tex;
++        m_st.blit_pool++;
++    } else {
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, m_blit);
++        Upload16(0, 0, w, h, src, sw);
++        m_st.blit_copies++;
++    }
++#else
+     glBindTexture(GL_TEXTURE_2D, m_blit);
+ #ifdef PC_GLES
+     Upload16(0, 0, w, h, src, sw);
+@@ -1736,13 +1947,14 @@ void GlGpu::Blit(int x, int y, int w, int h, const uint16_t *src)
+     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RED_INTEGER, GL_UNSIGNED_SHORT, src);
+     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++#endif
+ #endif
+     float x0 = (float)x, x1 = (float)(x + w), y0 = (float)y, y1 = (float)(y + h);
+     float q[12] = { x0, y0, x1, y0, x0, y1, x1, y0, x1, y1, x0, y1 };
+     glDisable(GL_BLEND);
+     glUseProgram(m_copyProg);
+     glActiveTexture(GL_TEXTURE0);
+-    glBindTexture(GL_TEXTURE_2D, m_blit);
++    glBindTexture(GL_TEXTURE_2D, pixels);
+ #ifdef PC_GLES
+     QuadAttribs(q, 2, 0);
+ #else
+@@ -1759,11 +1971,15 @@ void GlGpu::Blit(int x, int y, int w, int h, const uint16_t *src)
+         if (!t->Scissor(x, y, x + w - 1, y + h - 1, 0))
+             continue;
+         glUniform4f(m_copyUTarget, (float)t->x, (float)t->y, (float)t->w, (float)t->h);
+-        glUniform4f(m_copyUMap, (float)t->x, (float)t->y, t->sx, t->sy);
++        if (m_copyUMap >= 0)   /* (the ES 2 shader has none) */
++            glUniform4f(m_copyUMap, (float)t->x, (float)t->y, t->sx, t->sy);
+         glDrawArrays(GL_TRIANGLES, 0, 6);
+     }
+     glDisable(GL_SCISSOR_TEST);
+     m_st.blits++;
++#ifdef __vita__
++    PC_VitaProfAdd(PC_PROF_BLIT, PC_VitaProfNow() - prof_t0);
++#endif
+ }
+ 
+ /* The display surface holding all of a VRAM area, or NULL. */
+@@ -1811,7 +2027,14 @@ uint32_t *GlGpu::ReadArea(int x, int y, int w, int h, int *out_w, int *out_h)
+     glPixelStorei(GL_PACK_ALIGNMENT, 4);
+ #ifdef __vita__
+     long long prof_t0 = PC_VitaProfNow();
+-    glReadPixels(px0, py0, sw, sh, GL_RGBA, GL_UNSIGNED_BYTE, out);
++    if (t == &m_base && m_basePtr) {
++        /* as ReadPixels: vitaGL's glReadPixels would take the rows from the far end */
++        glFinish();
++        for (int j = 0; j < sh; j++)
++            memcpy(out + (size_t)j * sw, m_basePtr + ((size_t)(py0 + j) * VRAM_W + px0) * 4,
++                   (size_t)sw * 4);
++    } else
++        glReadPixels(px0, py0, sw, sh, GL_RGBA, GL_UNSIGNED_BYTE, out);
+     PC_VitaProfAdd(PC_PROF_READBACK, PC_VitaProfNow() - prof_t0);
+ #else
+     glReadPixels(px0, py0, sw, sh, GL_RGBA, GL_UNSIGNED_BYTE, out);
+@@ -1994,12 +2217,19 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+     long long prof_t0 = PC_VitaProfNow();
+ #endif
+     Flush();
++#ifdef __vita__
++    long long prof_tf = PC_VitaProfNow();
++    PC_VitaProfAdd(PC_PROF_PFLUSH, prof_tf - prof_t0);
++#endif
+ 
+     int ww, wh, pic[4];
+     SDL_GL_GetDrawableSize(win, &ww, &wh);
+     SetOutputSize(ww, wh);
+     PictureRect(1, 1, pic);   /* 4:3 (movies) */
+     Prepare();
++#ifdef __vita__
++    PC_VitaProfAdd(PC_PROF_PPREP, PC_VitaProfNow() - prof_tf);
++#endif
+     for (int i = 0; i < m_nsurf; i++)
+         m_surf[i].Resolve();
+     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+@@ -2018,26 +2248,55 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                 iw = VRAM_W;
+             if (ih > VRAM_H)
+                 ih = VRAM_H;
+-            glBindTexture(GL_TEXTURE_2D, m_dispTex);
+-#ifdef PC_GLES
+-            /* (BGRA to ES 2's RGBA) */
+-            m_upload.resize((size_t)iw * ih * 4);
+-            for (int i = 0; i < iw * ih; i++) {
+-                uint32_t p = image[i];
+-                m_upload[i * 4] = (uint8_t)(p >> 16);
+-                m_upload[i * 4 + 1] = (uint8_t)(p >> 8);
+-                m_upload[i * 4 + 2] = (uint8_t)p;
+-                m_upload[i * 4 + 3] = 255;
+-            }
+-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, iw, ih, GL_RGBA, GL_UNSIGNED_BYTE,
+-                            m_upload.data());
+-#else
+-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, iw, ih, GL_BGRA, GL_UNSIGNED_BYTE, image);
+-#endif
+             u0 = 0;
+             v0 = 0;
+             u1 = (float)iw / VRAM_W;
+             v1 = (float)ih / VRAM_H;
++#ifdef __vita__
++            long long prof_ti = PC_VitaProfNow();
++            int ip = m_inPlace ? PoolTake(m_imagePool, kImagePool, iw, ih, GL_RGBA) : -1;
++            if (ip >= 0) {
++                /* in place, into a texture of the picture's size no draw in flight reads (RGBA rows
++                 * of align(iw, 8) texels) */
++                InPlace &d = m_imagePool[ip];
++                size_t stride = (size_t)(iw + 7) / 8 * 8;
++                for (int j = 0; j < ih; j++) {
++                    uint32_t *o = (uint32_t *)d.ptr + (size_t)j * stride;
++                    const uint32_t *s = image + (size_t)j * iw;
++                    for (int i = 0; i < iw; i++) {
++                        uint32_t c = s[i];
++                        o[i] = 0xff000000u | (c >> 16 & 0xff) | (c & 0xff00) | (c & 0xff) << 16;
++                    }
++                }
++                d.used = m_frameNo;
++                glBindTexture(GL_TEXTURE_2D, d.tex);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, m_filter ? GL_LINEAR : GL_NEAREST);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, m_filter ? GL_LINEAR : GL_NEAREST);
++                u1 = 1.0f;
++                v1 = 1.0f;
++            } else
++#endif
++            {
++                glBindTexture(GL_TEXTURE_2D, m_dispTex);
++#ifdef PC_GLES
++                /* (BGRA to ES 2's RGBA) */
++                m_upload.resize((size_t)iw * ih * 4);
++                for (int i = 0; i < iw * ih; i++) {
++                    uint32_t p = image[i];
++                    m_upload[i * 4] = (uint8_t)(p >> 16);
++                    m_upload[i * 4 + 1] = (uint8_t)(p >> 8);
++                    m_upload[i * 4 + 2] = (uint8_t)p;
++                    m_upload[i * 4 + 3] = 255;
++                }
++                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, iw, ih, GL_RGBA, GL_UNSIGNED_BYTE,
++                                m_upload.data());
++#else
++                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, iw, ih, GL_BGRA, GL_UNSIGNED_BYTE, image);
++#endif
++            }
++#ifdef __vita__
++            PC_VitaProfAdd(PC_PROF_IMAGE, PC_VitaProfNow() - prof_ti);
++#endif
+         } else {
+             int rw = w;
+             const Target *t = ShownArea(&x, &w, y, h);
+@@ -2088,13 +2347,16 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+ #endif
+     if (m_st.on && ++m_st.frames == 60) {
+         fprintf(stderr, "[gl] last 60 frames: %d draw calls, %d readbacks, %d texture uploads, "
+-                        "%d blits; texture cache %d hits, %d misses, %d invalidated, %d full; fast "
+-                        "program %d batches/%d tris, slow %d batches/%d tris (%d textured tris "
+-                        "without a slot); %d texture windows seen\n",
++                        "%d blits; texture cache %d hits, %d misses, %d invalidated, %d full, %d "
++                        "deferred; fast program %d batches/%d tris, slow %d batches/%d tris (%d "
++                        "textured tris without a slot); %d texture windows seen; texture store %d "
++                        "cells written in place, %d new copies, %d copied by vitaGL; blits %d in "
++                        "place, %d copied by vitaGL\n",
+                 m_st.draws, m_st.readbacks, m_st.tex_ups, m_st.blits, m_st.cache_hits,
+-                m_st.cache_misses, m_st.cache_inval, m_st.cache_full, m_st.fast_batches,
+-                m_st.fast_tris, m_st.slow_batches, m_st.slow_tris, m_st.uncached_tris,
+-                (int)m_windows.size());
++                m_st.cache_misses, m_st.cache_inval, m_st.cache_full, m_st.cache_deferred,
++                m_st.fast_batches, m_st.fast_tris, m_st.slow_batches, m_st.slow_tris,
++                m_st.uncached_tris, (int)m_windows.size(), m_st.store_cells, m_st.store_switches,
++                m_st.store_copies, m_st.blit_pool, m_st.blit_copies);
+         m_st = Stats{};
+         m_st.on = 1;
+     }
+@@ -2179,6 +2441,15 @@ int GlGpu::CacheSlotFor(uint64_t key)
+         m_st.cache_full++;
+         return -1;
+     }
++    if (m_decodeFrame != m_frameNo) {
++        m_decodeFrame = m_frameNo;
++        m_decodesLeft = kDecodesPerFrame;
++    }
++    if (m_decodesLeft <= 0) {
++        m_st.cache_deferred++;
++        return -1;
++    }
++    m_decodesLeft--;
+     CacheSlot &c = m_slot[victim];
+     int depth = (int)(key >> 1) & 3;
+     uint32_t clut = (uint32_t)(key >> 8) & 0x7fff;
+diff --git a/platform/pc/src/pc_vita.cpp b/platform/pc/src/pc_vita.cpp
+index 9a3edc7..4781b66 100644
+--- a/platform/pc/src/pc_vita.cpp
++++ b/platform/pc/src/pc_vita.cpp
+@@ -410,11 +410,12 @@ void PC_VitaProfFrame(void) {
+         fprintf(stderr,
+                 "[stall] frame %d: %.1f ms: present %.1f (swap %.1f), draw %.1f, file %.1f, "
+                 "readback %.1f, other %.1f; sndlock %.1f, vblank %.1f, stream %.1f, sleep %.1f, "
+-                "mix max %.1f; waits from%s; vgl free ram %uK, heap free %uK\n",
++                "upload %.1f, blit %.1f, mix max %.1f; waits from%s; vgl free ram %uK, heap free %uK\n",
+                 g_profFrameNo, dt, f[PC_PROF_PRESENT] / 1000.0, f[PC_PROF_SWAP] / 1000.0,
+                 f[PC_PROF_DRAW] / 1000.0, f[PC_PROF_FILE] / 1000.0, f[PC_PROF_READBACK] / 1000.0,
+                 dt - known > 0 ? dt - known : 0.0, f[PC_PROF_SNDLOCK] / 1000.0,
+                 f[PC_PROF_VBLANK] / 1000.0, f[PC_PROF_STREAM] / 1000.0, f[PC_PROF_SLEEP] / 1000.0,
++                f[PC_PROF_UPLOAD] / 1000.0, f[PC_PROF_BLIT] / 1000.0,
+                 g_mixMax / 1000.0, g_ncallers ? who : " (none)",
+                 (unsigned)(vglMemFree(VGL_MEM_RAM) >> 10), (unsigned)(mallinfo().fordblks >> 10));
+         char top[3][160];
+@@ -458,6 +459,15 @@ void PC_VitaProfFrame(void) {
+             g_profUs[PC_PROF_FILE] / 1000.0 / n, g_profUs[PC_PROF_SNDLOCK] / 1000.0 / n,
+             g_profUs[PC_PROF_VBLANK] / 1000.0 / n, g_profUs[PC_PROF_SLEEP] / 1000.0 / n,
+             g_profUs[PC_PROF_DECODE] / 1000.0 / n, g_profCount[PC_PROF_DECODE], g_mixCount, g_mixCount ? g_mixSum / 1000.0 / g_mixCount : 0.0, g_mixMax / 1000.0);
++    /* where a present's time goes, and the GPU-side writes and reads anywhere (per frame, ms) */
++    double pflush = g_profUs[PC_PROF_PFLUSH] / 1000.0 / n, pprep = g_profUs[PC_PROF_PPREP] / 1000.0 / n,
++           image = g_profUs[PC_PROF_IMAGE] / 1000.0 / n, rest = present - pflush - pprep - image - swap;
++    fprintf(stderr,
++            "[present] per frame: flush %.1f, prepare %.1f, movie picture %.1f, swap %.1f, the rest "
++            "%.1f; anywhere: texture store writes %.1f (%d), blits %.1f (%d), readbacks %.1f (%d)\n",
++            pflush, pprep, image, swap, rest > 0 ? rest : 0.0, g_profUs[PC_PROF_UPLOAD] / 1000.0 / n,
++            g_profCount[PC_PROF_UPLOAD], g_profUs[PC_PROF_BLIT] / 1000.0 / n, g_profCount[PC_PROF_BLIT],
++            rb, g_profCount[PC_PROF_READBACK]);
+     g_mixSum = g_mixMax = 0;
+     g_mixCount = 0;
+     /* every 10 s: what vitaGL's pools and newlib's heap have left */
+-- 
+2.53.0
+

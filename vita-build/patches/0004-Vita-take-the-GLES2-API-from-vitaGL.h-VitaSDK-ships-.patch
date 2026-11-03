@@ -1,0 +1,33 @@
+From e1d87b7806cc37e14c91a679c578fdc373a5598c Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Sat, 24 Oct 2026 01:15:02 +0300
+Subject: [PATCH] Vita: take the GLES2 API from vitaGL.h (VitaSDK ships no
+ GLES2/ headers)
+
+---
+ platform/pc/include/pc/gl_gpu.h | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index 6b67830..241d6fb 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -15,8 +15,15 @@
+ 
+ #ifdef PC_GLES
+ /* OpenGL ES 2 (the PS Vita's vitaGL; THPS_GLES=1 on Linux): pc/gl_shaders_gles.h */
++#ifdef PC_VITA
++#include <vitaGL.h> /* VitaSDK's vitaGL declares the GLES2 API itself */
++#ifndef GL_DEPTH24_STENCIL8_OES
++#define GL_DEPTH24_STENCIL8_OES GL_DEPTH24_STENCIL8
++#endif
++#else
+ #include <GLES2/gl2.h>
+ #include <GLES2/gl2ext.h>
++#endif
+ #else
+ #include <glad/gl.h>
+ #endif
+-- 
+2.53.0
+

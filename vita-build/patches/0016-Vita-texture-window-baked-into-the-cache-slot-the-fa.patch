@@ -1,0 +1,143 @@
+From 0c658eed8c260380445af9107d2afeed529649d7 Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Sat, 24 Oct 2026 22:09:25 +0300
+Subject: [PATCH] Vita: texture window baked into the cache slot; the fast
+ program has no per-pixel window loop
+
+---
+ platform/pc/include/pc/gl_gpu.h          |  7 ++++--
+ platform/pc/include/pc/gl_shaders_gles.h |  7 +++---
+ platform/pc/src/pc_gpu_gl.cpp            | 29 +++++++++++++++++-------
+ 3 files changed, 30 insertions(+), 13 deletions(-)
+
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index 4fb0172..96b85e4 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -300,7 +300,9 @@ class GlGpu {
+      * word never has bit 15). Slots used this frame are never given to another page; a write to
+      * a slot's texels or CLUT re-decodes it before the next draw. */
+     struct CacheSlot {
+-        uint32_t key;        /* 0: free; 1 | depth << 1 | page x << 3 | page y << 7 | clut << 8 */
++        uint64_t key;        /* 0: free; 1 | depth << 1 | page x << 3 | page y << 7 | clut << 8,
++                                and the texture window's and x | and y << 8 | or x << 16 | or y << 24
++                                in the high word */
+         uint32_t frame;      /* the frame it was last drawn with */
+         int dirty;           /* its texels or CLUT were written */
+         int x, y, w;         /* its texels in VRAM (halfwords) */
+@@ -323,8 +325,9 @@ class GlGpu {
+     uint32_t m_frameNo = 1;
+     int m_lastSlot = -1;
+     std::vector<uint32_t> m_decode;
++    std::vector<uint32_t> m_windows;   /* the texture windows seen (the stats line counts them) */
+     GlVert m_layerConv[MAX_VERTS];   /* a layer's vertices with their slots (LayerBegin's are const) */
+-    int CacheSlotFor(uint32_t key);
++    int CacheSlotFor(uint64_t key);
+     void CacheDecode(int s);
+     int CacheVerts(GlVert *v, int n);
+     void CacheInvalidate(int x, int y, int w, int h);
+diff --git a/platform/pc/include/pc/gl_shaders_gles.h b/platform/pc/include/pc/gl_shaders_gles.h
+index 5040a44..0bfed00 100644
+--- a/platform/pc/include/pc/gl_shaders_gles.h
++++ b/platform/pc/include/pc/gl_shaders_gles.h
+@@ -213,7 +213,8 @@ static const char *gl_draw_fs =
+     "}\n";
+ 
+ /* THPS_GL_TEXCACHE: gl_draw_fs without the emulated texture lookup, for batches whose textured
+- * triangles all have a cache slot (GlGpu::UseDraw) */
++ * triangles all have a cache slot (GlGpu::UseDraw). No texture window either: the slot was decoded
++ * through it (GlGpu::CacheDecode). */
+ static const char *gl_draw_fast_fs =
+     "#ifdef GL_ES\n"
+     "precision highp float;\n"
+@@ -269,8 +270,8 @@ static const char *gl_draw_fast_fs =
+     "        hd_a = tx.a;\n"
+     /* a cached texture page: its texel, decoded (a: 0 transparent, 0.5 STP set, 1 opaque) */
+     "    } else if (mode.z > 0.5 && v_flags.z > 0.5) {\n"
+-    "        float u = window(pmod(floor(uv.x), 256.0), tw.x, tw.z);\n"
+-    "        float v = window(pmod(floor(uv.y), 256.0), tw.y, tw.w);\n"
++    "        float u = pmod(floor(uv.x), 256.0);\n"
++    "        float v = pmod(floor(uv.y), 256.0);\n"
+     "        vec4 ta = texture2D(u_atlas, (page.zw + vec2(u, v) + 0.5) / vec2(4096.0, 2048.0));\n"
+     "        if (ta.a < 0.25) discard;\n"
+     "        c = mode.w > 0.5 ? ta.rgb : min(ta.rgb * v_color * (255.0 / 128.0), vec3(1.0));\n"
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index d687c29..531e7fe 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -2090,10 +2090,11 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+         fprintf(stderr, "[gl] last 60 frames: %d draw calls, %d readbacks, %d texture uploads, "
+                         "%d blits; texture cache %d hits, %d misses, %d invalidated, %d full; fast "
+                         "program %d batches/%d tris, slow %d batches/%d tris (%d textured tris "
+-                        "without a slot)\n",
++                        "without a slot); %d texture windows seen\n",
+                 m_st.draws, m_st.readbacks, m_st.tex_ups, m_st.blits, m_st.cache_hits,
+                 m_st.cache_misses, m_st.cache_inval, m_st.cache_full, m_st.fast_batches,
+-                m_st.fast_tris, m_st.slow_batches, m_st.slow_tris, m_st.uncached_tris);
++                m_st.fast_tris, m_st.slow_batches, m_st.slow_tris, m_st.uncached_tris,
++                (int)m_windows.size());
+         m_st = Stats{};
+         m_st.on = 1;
+     }
+@@ -2154,7 +2155,7 @@ void GlGpu::UseDraw(int fast)
+ 
+ /* the slot holding a page (key: CacheSlot.key), decoding it on a miss; -1 when every slot is
+  * in use this frame (the triangle keeps the emulated lookup) */
+-int GlGpu::CacheSlotFor(uint32_t key)
++int GlGpu::CacheSlotFor(uint64_t key)
+ {
+     int s = m_lastSlot;
+     if (s >= 0 && m_slot[s].key == key) {
+@@ -2180,7 +2181,7 @@ int GlGpu::CacheSlotFor(uint32_t key)
+     }
+     CacheSlot &c = m_slot[victim];
+     int depth = (int)(key >> 1) & 3;
+-    uint32_t clut = key >> 8;
++    uint32_t clut = (uint32_t)(key >> 8) & 0x7fff;
+     c.key = key;
+     c.frame = m_frameNo;
+     c.dirty = 0;
+@@ -2205,15 +2206,18 @@ void GlGpu::CacheDecode(int s)
+     const CacheSlot &c = m_slot[s];
+     const uint16_t *tex = g_textureStore.Data();
+     int depth = (int)(c.key >> 1) & 3;
++    uint32_t win = (uint32_t)(c.key >> 32);
++    int and_x = win & 255, and_y = (win >> 8) & 255, or_x = (win >> 16) & 255, or_y = (win >> 24) & 255;
+     uint32_t *out = m_decode.data();
+     for (int y = 0; y < 256; y++) {
+ #ifdef __vita__
+         /* straight into the slot's row of the atlas */
+         out = (uint32_t *)(m_atlasPtr + ((size_t)((s / 16) * 256 + y) * kAtlasW + (s % 16) * 256) * 4);
+ #endif
+-        const uint16_t *row = tex + ((c.y + y) & (VRAM_H - 1)) * VRAM_W;
++        const uint16_t *row = tex + ((c.y + ((y & and_y) | or_y)) & (VRAM_H - 1)) * VRAM_W;
+         const uint16_t *clut = tex + c.cy * VRAM_W;
+-        for (int x = 0; x < 256; x++) {
++        for (int xs = 0; xs < 256; xs++) {
++            int x = (xs & and_x) | or_x;
+             uint16_t p;
+             if (depth == 0) {
+                 uint16_t w = row[(c.x + (x >> 2)) & (VRAM_W - 1)];
+@@ -2258,8 +2262,17 @@ int GlGpu::CacheVerts(GlVert *v, int n)
+         if (depth == 3)
+             continue;   /* HD textures have their own */
+         uint32_t clut = depth == 2 ? 0 : (uint32_t)(v[i].clut & 0x7fff);
+-        uint32_t key = 1u | depth << 1 | (uint32_t)(info & 15) << 3 | (uint32_t)((info >> 4) & 1) << 7 |
+-                       clut << 8;
++        uint32_t win = (uint32_t)v[i].tw[0] | (uint32_t)v[i].tw[1] << 8 | (uint32_t)v[i].tw[2] << 16 |
++                       (uint32_t)v[i].tw[3] << 24;
++        uint64_t key = (1u | depth << 1 | (uint32_t)(info & 15) << 3 | (uint32_t)((info >> 4) & 1) << 7 |
++                        clut << 8) | (uint64_t)win << 32;
++        if (win != 0xffffu) {
++            size_t k;
++            for (k = 0; k < m_windows.size() && m_windows[k] != win; k++) {
++            }
++            if (k == m_windows.size() && m_windows.size() < 256)
++                m_windows.push_back(win);
++        }
+         int s = CacheSlotFor(key);
+         if (s < 0) {
+             slow++;
+-- 
+2.53.0
+

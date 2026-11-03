@@ -1,0 +1,186 @@
+From f8182bb8efce7445f512eff0527f5cd6cb3cde01 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 23:03:12 +0000
+Subject: [PATCH 7/7] Vita: shaders vitaGL's GLSL translator accepts; no
+ glDeleteShader(0)
+
+The translator defines s and t as swizzle macros (vram()'s texel t
+became a second y) and makes vector != component-wise: rename the
+variables, use any(notEqual()). Compile failures name the stage and
+don't delete shader 0 (vitaGL crashes on it); the log says which
+programs built; the Vita's fatal message points at the log.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01NwhU758snL1NnmSbmmwENz
+---
+ platform/pc/include/pc/gl_shaders_gles.h | 44 +++++++++++++-----------
+ platform/pc/src/pc_gpu_gl.cpp            | 15 +++++---
+ platform/pc/src/pc_video.cpp             |  6 ++++
+ 3 files changed, 40 insertions(+), 25 deletions(-)
+
+diff --git a/platform/pc/include/pc/gl_shaders_gles.h b/platform/pc/include/pc/gl_shaders_gles.h
+index 3d9452c..1fed83c 100644
+--- a/platform/pc/include/pc/gl_shaders_gles.h
++++ b/platform/pc/include/pc/gl_shaders_gles.h
+@@ -16,6 +16,8 @@
+  *   z / 2^20 it stands for. The colour pass's tolerance (u_dpass 0) is a relative one (clipZ).
+  * - The screens are drawn at the PS1's resolution (GlGpu::Init: fixed scale 1), so there is no
+  *   texture-coordinate fix (u_uvfix, derivatives) and the geometry moves by half a pixel.
++ * - vitaGL's translator (GLSL to Cg) defines s, t, st, ts, ss and tt as swizzle macros and makes
++ *   vector comparisons component-wise: no variables by those names, and notEqual/any for vectors.
+  * - Neither the Dreamcast's skater shadows nor filtered HD texture gradients (the Dreamcast data's
+  *   extras) are drawn; HD textures are sampled plainly. */
+ #ifndef PC_GPU_GL_SHADERS_GLES_H
+@@ -108,9 +110,9 @@ static const char *gl_draw_fs =
+     "uniform float u_pass;\n"
+     /* the texture store's 16-bit texel at x, y (wrapping as VRAM does): its low and high bytes */
+     "vec2 vram(float x, float y) {\n"
+-    "    vec4 t = texture2D(u_vram, (vec2(mod(x, 1024.0), mod(y, 512.0)) + 0.5) /\n"
++    "    vec4 tx = texture2D(u_vram, (vec2(mod(x, 1024.0), mod(y, 512.0)) + 0.5) /\n"
+     "                               vec2(1024.0, 512.0));\n"
+-    "    return floor(vec2(t.r, t.a) * 255.0 + 0.5);\n"
++    "    return floor(vec2(tx.r, tx.a) * 255.0 + 0.5);\n"
+     "}\n"
+     /* (u & a) | o of 8-bit whole numbers: the texture window */
+     "float window(float u, float a, float o) {\n"
+@@ -132,37 +134,37 @@ static const char *gl_draw_fs =
+     /* texture coordinates at the pixel's corner, rounded to the nearest texel like the PS1 (at
+      * the PS1's resolution the geometry moved by half a pixel instead, gl_shaders.h) */
+     "    vec2 uv = v_uv + 0.5;\n"
+-    "    if (view || uvr != vec4(0.0, 0.0, 255.0, 255.0))\n"
++    "    if (view || any(notEqual(uvr, vec4(0.0, 0.0, 255.0, 255.0))))\n"
+     "        uv = clamp(uv, uvr.xy, uvr.zw + 0.999);\n"
+     "    bool semi = v_flags.x > 0.5;\n"
+     "    vec3 c = v_color;\n"
+     "    bool blend = semi;\n"
+     "    float hd_a = 1.0;\n"
+     "    if (mode.z > 0.5 && depth > 2.5) {\n"
+-    "        vec4 t = texture2D(u_hd, v_uv / 256.0);\n"
+-    "        if (t.a < 0.03) discard;\n"
+-    "        c = mode.w > 0.5 ? t.rgb : min(t.rgb * v_color * (255.0 / 128.0), vec3(1.0));\n"
+-    "        hd_a = t.a;\n"
++    "        vec4 tx = texture2D(u_hd, v_uv / 256.0);\n"
++    "        if (tx.a < 0.03) discard;\n"
++    "        c = mode.w > 0.5 ? tx.rgb : min(tx.rgb * v_color * (255.0 / 128.0), vec3(1.0));\n"
++    "        hd_a = tx.a;\n"
+     "    } else if (mode.z > 0.5) {\n"
+     "        float u = window(mod(floor(uv.x), 256.0), tw.x, tw.z);\n"
+     "        float v = window(mod(floor(uv.y), 256.0), tw.y, tw.w);\n"
+-    "        vec2 t;\n"
++    "        vec2 tx;\n"
+     "        if (depth < 0.5) {\n"
+     "            vec2 w = vram(page.x + floor(u / 4.0), page.y + v);\n"
+     "            float q = mod(u, 4.0), b = q < 1.5 ? w.x : w.y;\n"
+     "            float i = mod(q, 2.0) < 0.5 ? mod(b, 16.0) : floor(b / 16.0);\n"
+-    "            t = vram(page.z + i, page.w);\n"
++    "            tx = vram(page.z + i, page.w);\n"
+     "        } else if (depth < 1.5) {\n"
+     "            vec2 w = vram(page.x + floor(u / 2.0), page.y + v);\n"
+-    "            t = vram(page.z + (mod(u, 2.0) < 0.5 ? w.x : w.y), page.w);\n"
++    "            tx = vram(page.z + (mod(u, 2.0) < 0.5 ? w.x : w.y), page.w);\n"
+     "        } else {\n"
+-    "            t = vram(page.x + u, page.y + v);\n"
++    "            tx = vram(page.x + u, page.y + v);\n"
+     "        }\n"
+-    "        if (t.x + t.y < 0.5) discard;\n"
+-    "        vec3 tc = vec3(mod(t.x, 32.0), floor(t.x / 32.0) + mod(t.y, 4.0) * 8.0,\n"
+-    "                       mod(floor(t.y / 4.0), 32.0)) / 31.0;\n"
++    "        if (tx.x + tx.y < 0.5) discard;\n"
++    "        vec3 tc = vec3(mod(tx.x, 32.0), floor(tx.x / 32.0) + mod(tx.y, 4.0) * 8.0,\n"
++    "                       mod(floor(tx.y / 4.0), 32.0)) / 31.0;\n"
+     "        c = mode.w > 0.5 ? tc : min(tc * v_color * (255.0 / 128.0), vec3(1.0));\n"
+-    "        blend = semi && t.y > 127.5;\n"
++    "        blend = semi && tx.y > 127.5;\n"
+     "    }\n"
+     "    if ((u_pass > 0.5 && u_pass < 1.5 && blend) || (u_pass > 1.5 && !blend)) discard;\n"
+     "    float keep = 0.0;\n"
+@@ -187,10 +189,10 @@ static const char *gl_copy_fs =
+     "uniform vec2 u_src;\n"         /* the pixels' VRAM x, y */
+     "void main() {\n"
+     "    vec2 p = floor(gl_FragCoord.xy / u_map.zw) + u_map.xy - u_src;\n"
+-    "    vec4 s = texture2D(u_vram, (p + 0.5) / vec2(1024.0, 512.0));\n"
+-    "    vec2 t = floor(vec2(s.r, s.a) * 255.0 + 0.5);\n"
+-    "    gl_FragColor = vec4(vec3(mod(t.x, 32.0), floor(t.x / 32.0) + mod(t.y, 4.0) * 8.0,\n"
+-    "                             mod(floor(t.y / 4.0), 32.0)) / 31.0, t.y > 127.5 ? 1.0 : 0.0);\n"
++    "    vec4 sx = texture2D(u_vram, (p + 0.5) / vec2(1024.0, 512.0));\n"
++    "    vec2 tx = floor(vec2(sx.r, sx.a) * 255.0 + 0.5);\n"
++    "    gl_FragColor = vec4(vec3(mod(tx.x, 32.0), floor(tx.x / 32.0) + mod(tx.y, 4.0) * 8.0,\n"
++    "                             mod(floor(tx.y / 4.0), 32.0)) / 31.0, tx.y > 127.5 ? 1.0 : 0.0);\n"
+     "}\n";
+ 
+ static const char *gl_copy_vs =
+@@ -224,8 +226,8 @@ static const char *gl_present_fs =
+     "uniform sampler2D u_tex;\n"
+     "uniform float u_alpha;\n"      /* 1: copy alpha too (a target's pixels), 0: opaque */
+     "void main() {\n"
+-    "    vec4 t = texture2D(u_tex, v_uv);\n"
+-    "    gl_FragColor = vec4(t.rgb, u_alpha > 0.5 ? t.a : 1.0);\n"
++    "    vec4 tx = texture2D(u_tex, v_uv);\n"
++    "    gl_FragColor = vec4(tx.rgb, u_alpha > 0.5 ? tx.a : 1.0);\n"
+     "}\n";
+ 
+ #endif
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index 8931b5b..c4652ca 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -100,9 +100,11 @@ GLuint Compile(GLenum type, const char *src)
+ #endif
+     glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+     if (!ok) {
+-        char log[2048];
++        /* (vitaGL fills the log only when built with HAVE_SHARK_LOG) */
++        char log[2048] = "";
+         glGetShaderInfoLog(s, sizeof log, NULL, log);
+-        fprintf(stderr, "[gl] shader compile error:\n%s\n", log);
++        fprintf(stderr, "[gl] %s shader compile error:\n%s\n",
++                type == GL_VERTEX_SHADER ? "vertex" : "fragment", log[0] ? log : "(no log)");
+         glDeleteShader(s);
+         return 0;
+     }
+@@ -115,8 +117,11 @@ GLuint Program(const char *vs, const char *fs)
+            f = Compile(GL_FRAGMENT_SHADER, fs);
+     GLint ok;
+     if (!v || !f) {
+-        glDeleteShader(v);
+-        glDeleteShader(f);
++        /* (vitaGL's glDeleteShader takes no 0) */
++        if (v)
++            glDeleteShader(v);
++        if (f)
++            glDeleteShader(f);
+         glDeleteProgram(p);
+         return 0;
+     }
+@@ -548,6 +553,8 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+     m_drawProg = Program(gl_draw_vs, gl_draw_fs);
+     m_copyProg = Program(gl_copy_vs, gl_copy_fs);
+     m_presentProg = Program(gl_present_vs, gl_present_fs);
++    fprintf(stderr, "[gl] shaders: draw %s, copy %s, present %s\n", m_drawProg ? "ok" : "FAILED",
++            m_copyProg ? "ok" : "FAILED", m_presentProg ? "ok" : "FAILED");
+     if (!m_drawProg || !m_copyProg || !m_presentProg)
+         return -1;
+     m_drawUPass = glGetUniformLocation(m_drawProg, "u_pass");
+diff --git a/platform/pc/src/pc_video.cpp b/platform/pc/src/pc_video.cpp
+index f9be3fb..ab10965 100644
+--- a/platform/pc/src/pc_video.cpp
++++ b/platform/pc/src/pc_video.cpp
+@@ -614,9 +614,15 @@ void Video::Init(int scale)
+     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
+         PC_Fatal("Cannot open a window (SDL: %s).", SDL_GetError());
+     m_videoInited = true;
++#ifdef __vita__
++    if (!InitGl(scale))
++        PC_Fatal("The renderer did not start (SDL: %s). ux0:data/THPS/thps.log says which "
++                 "shader failed.", SDL_GetError());
++#else
+     if (!InitGl(scale))
+         PC_Fatal("Tony Hawk's Pro Skater needs a graphics card with OpenGL 3.3 (%s). Updating "
+                  "the graphics driver may help.", SDL_GetError());
++#endif
+ }
+ 
+ void Video::Shutdown()
+-- 
+2.43.0
+

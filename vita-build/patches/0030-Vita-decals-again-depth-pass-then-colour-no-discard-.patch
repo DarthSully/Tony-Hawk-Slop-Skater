@@ -1,0 +1,418 @@
+From 9d3cf0e8be245fabe475002184e4dcb81b026379 Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Wed, 28 Oct 2026 10:52:04 +0300
+Subject: [PATCH] Vita: decals again (depth pass then colour, no-discard
+ program in both, PS1 order kept), texture decoding on 3 more cores
+
+- t24 drew batched opaque faces in one pass and decals flickered (skatepark graffiti, lighting):
+  without the depth pass a decal and the surface under it tie. The depth pass is back (t20-t23's
+  depth then colour within 1/256), with t24's no-discard program in both passes for the faces
+  that can take it. The colour pass draws the opaque faces in the PS1's order across the two
+  programs (runs of one program, up to 48; [gl] line: colour runs), so the later of a decal and
+  its floor is still the one left. THPS_R3D_PREPASS=0: t24's one pass. THPS_R3D_ZNUDGE=1 (a
+  trial): one pass with each opaque view-space face of a layer scaled nearer by up to 1/256 of
+  its depth in the PS1's order (same pixels, nearer depth). Boot line: "[r3d] opaque batches".
+- Texture cache pages are decoded by the game thread and up to 3 threads on cores 1-3 (bands of
+  rows; core 3 needs CapUnlocker, else cores 1-2), waited for before the page is drawn. t24's
+  level start decoded 117 pages in 921 ms on the game thread. THPS_GL_DECODE_THREADS=n (0: the
+  game thread alone); boot line "[gl] texture decode threads".
+---
+ platform/pc/README.md           |   4 +-
+ platform/pc/include/pc/gl_gpu.h |  17 ++-
+ platform/pc/src/pc_gpu_gl.cpp   | 253 ++++++++++++++++++++++++++------
+ 3 files changed, 225 insertions(+), 49 deletions(-)
+
+diff --git a/platform/pc/README.md b/platform/pc/README.md
+index 953226b..6afa206 100644
+--- a/platform/pc/README.md
++++ b/platform/pc/README.md
+@@ -562,7 +562,9 @@ window, `THPS_FAST`, `THPS_DETERMINISTIC`) never wait for a display.
+ | `THPS_PGXP=0` | OpenGL: both of the above off (`THPS_GL_PRECISE=0 THPS_GL_PERSPECTIVE=0`) |
+ | `THPS_R3D_BATCH=0` | OpenGL ES (Vita): a native 3D layer's faces drawn in the PS1's order, split where they overlap (before t20); default: each run of faces between 2D primitives in one depth pass and one colour pass for the opaque faces, then the semi-transparent ones in order |
+ | `THPS_VITA_RES=WxH` | Vita: screens drawn at most 512x240, 720x408 (default, t24) or 960x544, scaled up to the screen |
+-| `THPS_R3D_PREPASS=1` | OpenGL ES (Vita), batched 3D: the opaque faces depth first, then colour with the decal tolerance (t20-t23); default: one pass at the true depth |
++| `THPS_R3D_PREPASS=0` | OpenGL ES (Vita), batched 3D: opaque faces in one pass at the true depth (t24; decals can flicker); default (t25): depth first, then colour with the decal tolerance, the no-discard program in both where it can |
++| `THPS_R3D_ZNUDGE=1` | OpenGL ES (Vita), batched 3D, a trial: one pass, each opaque face of a layer moved nearer by up to 1/256 of its depth in the PS1's order |
++| `THPS_GL_DECODE_THREADS=n` | Vita: texture cache pages decoded by n threads on cores 1-3 with the game thread (default 3, 0 = the game thread alone) |
+ | `THPS_GL_NODISCARD=0` | OpenGL ES (Vita), batched 3D: no separate no-discard, no-blend program for opaque faces with no transparent texel under them |
+ | `THPS_GL_WARMFRAMES=n` | OpenGL ES: frames after a stretch without 3D (loading screens, menus) that decode every texture page they draw, uncapped (default 30, 0 off) |
+ | `THPS_VITA_FPS=30` | Vita: every other frame shown (the game still runs at 60) |
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index c5aa240..1a59e62 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -251,6 +251,7 @@ class GlGpu {
+         int layer_bufs, layer_client;   /* 3D layers drawn from a buffer; 3D draws not */
+         int layer_batches;              /* t20: 3D draws made by LayerBatch */
+         int solid_tris, cut_tris;       /* t24: LayerBatch opaque triangles without / with discard */
++        int colour_runs;                /* t25: program runs of the opaque colour passes */
+     };
+ 
+     /* targets */
+@@ -383,11 +384,25 @@ class GlGpu {
+      * faces no texel of which is transparent: the GPU can then skip hidden pixels */
+     GLuint m_drawProgSolid = 0;
+     DrawLocs m_locSolid = {};
+-    bool m_prepass = false;       /* THPS_R3D_PREPASS=1: t20-t23 opaque depth pass, then colour */
++    /* t25: the batched opaque faces' depth pass, then their colour within the decal tolerance,
++     * the no-discard program in both where it can (default; THPS_R3D_PREPASS=0 or
++     * THPS_R3D_ZNUDGE=1: t24's single pass) */
++    bool m_prepass = true;
++    /* t25 (THPS_R3D_ZNUDGE=1, a trial): single pass, each opaque view-space face of a layer moved
++     * nearer by up to 1/256 of its depth in the PS1's order (later = nearer) */
++    bool m_zNudge = false;
++    /* t25: the opaque faces of a batch in the PS1's order, in runs of one program (3 solid, 0
++     * with discard): the colour pass keeps the order (a decal over its floor is the later) */
++    std::vector<uint16_t> m_batchOrd;
++    std::vector<int> m_batchSeg;   /* start index in m_batchOrd << 2 | list */
+     /* t24: per slot, 32 rows of 32 bits: an 8x8 cell of texels holds a transparent one */
+     uint32_t m_slotTransp[128][32] = {};
+     bool TriSolid(const GlVert *v) const;
+     void TranspRow(int s, int y, const uint32_t *row);
++public:
++    /* t25: rows y0..y1-1 of slot s decoded into the atlas (a decode thread's share) */
++    void DecodeBand(int s, int y0, int y1);
++private:
+     void SolidProgram();
+     /* t24: frames after a stretch without 3D (a loading screen or menu) decode every page they
+      * draw (THPS_GL_WARMFRAMES, default 30; 0 off) */
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index 8adec40..effc4b0 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -40,6 +40,7 @@
+ #include <sys/stat.h>
+ 
+ #include <psp2/kernel/processmgr.h>
++#include <psp2/kernel/threadmgr.h>
+ 
+ #include "pc/platform.h"
+ #endif
+@@ -896,8 +897,13 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+         }
+     }
+     {
+-        const char *pp = getenv("THPS_R3D_PREPASS");
+-        m_prepass = pp && atoi(pp) != 0;
++        const char *pp = getenv("THPS_R3D_PREPASS"), *zn = getenv("THPS_R3D_ZNUDGE");
++        m_zNudge = zn && atoi(zn) != 0;
++        m_prepass = !(pp && pp[0] == '0') && !m_zNudge;
++        fprintf(stderr, "[r3d] opaque batches: %s\n",
++                m_zNudge ? "one pass, faces nudged nearer in the PS1's order (THPS_R3D_ZNUDGE=1, a trial)"
++                : m_prepass ? "depth pass, then colour within the decal tolerance (THPS_R3D_PREPASS=0: one pass)"
++                            : "one pass (THPS_R3D_PREPASS=0; decals can flicker)");
+         const char *wf = getenv("THPS_GL_WARMFRAMES");
+         m_warmFrames = wf ? atoi(wf) : 30;
+     }
+@@ -2437,6 +2443,21 @@ void GlGpu::LayerBegin(const GlLayerParams *lp, const GlVert *v, int nv)
+         l.verts = m_layerConv;
+         CacheVerts(m_layerConv, nv, m_slowBefore);
+         l.conv_gen = m_cacheGen;
++        if (m_zNudge && nv >= 3) {
++            /* the whole position scaled: the same pixels, a nearer depth (view z) */
++            int nt = nv / 3;
++            for (int t = 0; t < nt; t++) {
++                GlVert *v = &m_layerConv[t * 3];
++                if (!(v->info & PC_GL_I_VIEW) || (v->info & PC_GL_I_SEMI))
++                    continue;
++                float k = 1.0f - (1.0f / 256.0f) * (float)t / (float)nt;
++                for (int j = 0; j < 3; j++) {
++                    v[j].x *= k;
++                    v[j].y *= k;
++                    v[j].z *= k;
++                }
++            }
++        }
+     }
+     if (m_layerVbo && nv > 0) {
+         if (!m_layerBufs[0])
+@@ -2618,7 +2639,9 @@ bool GlGpu::LayerBatch(int first, int count, int cls, int why)
+         m_batchIdx[c].clear();
+     /* t24: opaque faces that cannot show a transparent texel go to list 3 (the no-discard
+      * program, one pass) */
+-    bool solid_ok = m_drawProgSolid && !m_prepass && slow_tris == 0;
++    bool solid_ok = m_drawProgSolid && slow_tris == 0;
++    m_batchOrd.clear();
++    m_batchSeg.clear();
+     const char *bad = nullptr;
+     int maxIdx = -1, nverts = buf ? l.nv : count;
+     if (count % 3)
+@@ -2638,6 +2661,13 @@ bool GlGpu::LayerBatch(int first, int count, int cls, int why)
+         m_batchIdx[c].push_back((uint16_t)(t + 1 - base));
+         m_batchIdx[c].push_back((uint16_t)(t + 2 - base));
+         maxIdx = t + 2 - base;
++        if (c == 0 || c == 3) {
++            if (m_batchSeg.empty() || (m_batchSeg.back() & 3) != c)
++                m_batchSeg.push_back((int)m_batchOrd.size() << 2 | c);
++            m_batchOrd.push_back((uint16_t)(t - base));
++            m_batchOrd.push_back((uint16_t)(t + 1 - base));
++            m_batchOrd.push_back((uint16_t)(t + 2 - base));
++        }
+     }
+     const std::vector<uint16_t> &op = m_batchIdx[0], &se = m_batchIdx[1], &sb = m_batchIdx[2],
+                                 &so = m_batchIdx[3];
+@@ -2697,43 +2727,88 @@ bool GlGpu::LayerBatch(int first, int count, int cls, int why)
+         if (!ts[i]->Scissor(l.clip[0], l.clip[1], l.clip[2], l.clip[3], l.wide))
+             continue;
+         int n = 0;
+-        if (!so.empty()) {
+-            /* t24: no discard, no blending (alpha, the mask bit, kept): true depth, one pass */
+-            UseDraw(1, 1);
+-            DrawUniforms(ts[i]);
+-            glDisable(GL_BLEND);
+-            DPass(1);
+-            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+-            glDepthMask(GL_TRUE);
+-            glDrawElements(GL_TRIANGLES, (GLsizei)so.size(), GL_UNSIGNED_SHORT, so.data());
+-            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+-            UseDraw(slow_tris == 0);
+-            n++;
+-        }
+-        DrawUniforms(ts[i]);
+-        if (!op.empty() && m_prepass) {
+-            /* THPS_R3D_PREPASS=1 (t20-t23): the opaque faces' true depth (texels the shader
+-             * discards write none), then their colour where it is within the tolerance of the
+-             * nearest: a decal over its floor passes, and the later of the two (the PS1's
+-             * order) is the one left */
+-            SetBlend(0);
+-            DPass(1);
++        if (m_prepass && (!so.empty() || !op.empty())) {
++            /* t25 (t20-t23 with t24's program): the opaque faces' true depth (texels the
++             * shader discards write none), then their colour where it is within the tolerance
++             * of the nearest: a decal over its floor passes, and the later of the two (the PS1's
++             * order) is the one left. The colour pass keeps that order across both programs
++             * (up to 48 runs; past that, solid then the rest) */
+             glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+             glDepthMask(GL_TRUE);
+-            glDrawElements(GL_TRIANGLES, (GLsizei)op.size(), GL_UNSIGNED_SHORT, op.data());
+-            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++            if (!so.empty()) {
++                UseDraw(1, 1);
++                DrawUniforms(ts[i]);
++                glDisable(GL_BLEND);
++                DPass(1);
++                glDrawElements(GL_TRIANGLES, (GLsizei)so.size(), GL_UNSIGNED_SHORT, so.data());
++                n++;
++            }
++            if (!op.empty()) {
++                UseDraw(slow_tris == 0);
++                DrawUniforms(ts[i]);
++                SetBlend(0);
++                DPass(1);
++                glDrawElements(GL_TRIANGLES, (GLsizei)op.size(), GL_UNSIGNED_SHORT, op.data());
++                n++;
++            }
+             glDepthMask(GL_FALSE);
+-            DPass(0);
+-            glDrawElements(GL_TRIANGLES, (GLsizei)op.size(), GL_UNSIGNED_SHORT, op.data());
+-            n += 2;
+-        } else if (!op.empty()) {
+-            /* t24: one pass at the true depth, written as it goes (the GPU's own hidden surface
+-             * removal does the rest); decals within one run lose the 1/256 tolerance */
+-            SetBlend(0);
+-            DPass(1);
+-            glDepthMask(GL_TRUE);
+-            glDrawElements(GL_TRIANGLES, (GLsizei)op.size(), GL_UNSIGNED_SHORT, op.data());
+-            n++;
++            int nseg = (int)m_batchSeg.size(), ordered = nseg <= 48;
++            int runs = ordered ? nseg : (!so.empty()) + (!op.empty());
++            for (int r = 0; r < runs; r++) {
++                int c, a, e;
++                if (ordered) {
++                    c = m_batchSeg[r] & 3;
++                    a = m_batchSeg[r] >> 2;
++                    e = r + 1 < nseg ? m_batchSeg[r + 1] >> 2 : (int)m_batchOrd.size();
++                } else {
++                    c = r == 0 && !so.empty() ? 3 : 0;
++                    a = 0;
++                    e = (int)(c == 3 ? so.size() : op.size());
++                }
++                const uint16_t *ix = ordered ? m_batchOrd.data() + a : c == 3 ? so.data() : op.data();
++                if (c == 3) {
++                    UseDraw(1, 1);
++                    DrawUniforms(ts[i]);
++                    glDisable(GL_BLEND);
++                    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
++                } else {
++                    UseDraw(slow_tris == 0);
++                    DrawUniforms(ts[i]);
++                    SetBlend(0);
++                    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++                }
++                DPass(0);
++                glDrawElements(GL_TRIANGLES, (GLsizei)(e - a), GL_UNSIGNED_SHORT, ix);
++                n++;
++                m_st.colour_runs++;
++            }
++            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++            UseDraw(slow_tris == 0);
++            DrawUniforms(ts[i]);
++        } else {
++            if (!so.empty()) {
++                /* t24: no discard, no blending (alpha, the mask bit, kept): true depth, one pass */
++                UseDraw(1, 1);
++                DrawUniforms(ts[i]);
++                glDisable(GL_BLEND);
++                DPass(1);
++                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
++                glDepthMask(GL_TRUE);
++                glDrawElements(GL_TRIANGLES, (GLsizei)so.size(), GL_UNSIGNED_SHORT, so.data());
++                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++                UseDraw(slow_tris == 0);
++                n++;
++            }
++            DrawUniforms(ts[i]);
++            if (!op.empty()) {
++                /* t24: one pass at the true depth, written as it goes; decals within one run
++                 * lose the 1/256 tolerance (THPS_R3D_ZNUDGE=1 moves the later faces nearer) */
++                SetBlend(0);
++                DPass(1);
++                glDepthMask(GL_TRUE);
++                glDrawElements(GL_TRIANGLES, (GLsizei)op.size(), GL_UNSIGNED_SHORT, op.data());
++                n++;
++            }
+         }
+         glDepthMask(GL_FALSE);
+         DPass(0);
+@@ -3386,7 +3461,7 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                         "GL draws %.0f a frame; 3D %.0f draws a frame (new draw for depth %d, "
+                         "class %d, texture %d, 2D between %d, layer end %d); 3D layers in a "
+                         "buffer %d, 3D draws not %d, batched %d; framebuffer binds %.0f a frame; opaque batched tris %d without discard, "
+-                        "%d with\n",
++                        "%d with, %d colour runs\n",
+                 m_st.draws, m_st.readbacks, m_st.tex_ups, m_st.blits, m_st.cache_hits,
+                 m_st.cache_misses, m_st.cache_inval, m_st.cache_full, m_st.cache_deferred,
+                 m_st.cache_stale, m_st.fast_batches, m_st.fast_tris, m_st.slow_batches,
+@@ -3396,7 +3471,7 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                 m_st.split[PC_GL_SPLIT_DEPTH], m_st.split[PC_GL_SPLIT_CLASS],
+                 m_st.split[PC_GL_SPLIT_TEXTURE], m_st.split[PC_GL_SPLIT_2D],
+                 m_st.split[PC_GL_SPLIT_END], m_st.layer_bufs, m_st.layer_client,
+-                m_st.layer_batches, s_fbBinds / 60.0, m_st.solid_tris, m_st.cut_tris);
++                m_st.layer_batches, s_fbBinds / 60.0, m_st.solid_tris, m_st.cut_tris, m_st.colour_runs);
+         s_fbBinds = 0;
+         m_st = Stats{};
+         m_st.on = 1;
+@@ -3554,9 +3629,9 @@ void GlGpu::SlotFill(CacheSlot &c, uint64_t key)
+ void GlGpu::SolidProgram()
+ {
+     const char *nd = getenv("THPS_GL_NODISCARD"), *bt = getenv("THPS_R3D_BATCH");
+-    if (!m_drawProgFast || m_prepass || (nd && nd[0] == '0') || (bt && atoi(bt) == 0)) {
++    if (!m_drawProgFast || (nd && nd[0] == '0') || (bt && atoi(bt) == 0)) {
+         fprintf(stderr, "[gl] opaque no-discard program: off%s\n",
+-                !m_drawProgFast ? " (no fast program)" : m_prepass ? " (THPS_R3D_PREPASS=1)" : "");
++                !m_drawProgFast ? " (no fast program)" : "");
+         return;
+     }
+     static const char *const cut[3] = {
+@@ -3665,18 +3740,102 @@ void GlGpu::DecodeRow(const CacheSlot &c, int y, uint32_t *out)
+ }
+ 
+ /* a slot's 256x256 texels from the texture store (DecodeRow) */
+-void GlGpu::CacheDecode(int s)
+-{
+ #ifdef __vita__
+-    PC_VITA_PROF_SCOPE(PC_PROF_DECODE);
+-    /* a row at a time into the slot's rows of the atlas */
++/* t25: a page's rows decoded by up to 3 threads on cores 1-3 and the game thread at once
++ * (THPS_GL_DECODE_THREADS=n, default 3, 0 = the game thread alone). Each takes a band of rows
++ * (a multiple of 8, so that each writes its own rows of m_slotTransp); the game thread waits for
++ * all before the page is drawn. */
++namespace {
++struct DecodeWorker {
++    SceUID start = -1;
++    GlGpu *gpu = nullptr;
++    int s = 0, y0 = 0, y1 = 0;
++};
++DecodeWorker s_dw[3];
++SceUID s_dwDone = -1;
++int s_dwN = -1;
++
++int DecodeThread(SceSize, void *arg)
++{
++    DecodeWorker *w = *(DecodeWorker **)arg;
++    for (;;) {
++        if (sceKernelWaitSema(w->start, 1, NULL) < 0)
++            return 0;
++        w->gpu->DecodeBand(w->s, w->y0, w->y1);
++        sceKernelSignalSema(s_dwDone, 1);
++    }
++}
++
++void DecodeThreadsStart()
++{
++    const char *e = getenv("THPS_GL_DECODE_THREADS");
++    int want = e ? atoi(e) : 3;
++    s_dwN = 0;
++    if (want <= 0) {
++        fprintf(stderr, "[gl] texture decode threads: off (THPS_GL_DECODE_THREADS=0)\n");
++        return;
++    }
++    if (want > 3)
++        want = 3;
++    s_dwDone = sceKernelCreateSema("thps-dec-done", 0, 0, 3, NULL);
++    static const int masks[3] = { 0x20000, 0x40000, 0x80000 };   /* cores 1, 2, 3 */
++    char cores[16] = "";
++    for (int i = 0; i < want && s_dwDone >= 0; i++) {
++        DecodeWorker *w = &s_dw[i];
++        w->start = sceKernelCreateSema("thps-dec", 0, 0, 1, NULL);
++        SceUID th = sceKernelCreateThread("thps-decode", DecodeThread, 0x10000100 - 12, 0x2000, 0,
++                                          masks[i], NULL);
++        if (th < 0)   /* (core 3 without CapUnlocker) */
++            th = sceKernelCreateThread("thps-decode", DecodeThread, 0x10000100 - 12, 0x2000, 0,
++                                       0x20000 | 0x40000, NULL);
++        if (w->start < 0 || th < 0)
++            break;
++        sceKernelStartThread(th, sizeof w, &w);
++        snprintf(cores + strlen(cores), sizeof cores - strlen(cores), "%s%d", i ? "," : "", i + 1);
++        s_dwN++;
++    }
++    fprintf(stderr, "[gl] texture decode threads: %d (cores %s; THPS_GL_DECODE_THREADS=0 turns them "
++                    "off)\n", s_dwN, s_dwN ? cores : "-");
++}
++} // namespace
++#endif
++
++void GlGpu::DecodeBand(int s, int y0, int y1)
++{
+     uint32_t row[256];
+-    memset(m_slotTransp[s], 0, sizeof m_slotTransp[s]);
+-    for (int y = 0; y < 256; y++) {
++    for (int y = y0; y < y1; y++) {
+         DecodeRow(m_slot[s], y, row);
++#ifdef __vita__
+         memcpy(AtlasRow(s, y), row, sizeof row);
++#else
++        memcpy(m_decode.data() + (size_t)y * 256, row, sizeof row);
++#endif
+         TranspRow(s, y, row);
+     }
++}
++
++void GlGpu::CacheDecode(int s)
++{
++#ifdef __vita__
++    PC_VITA_PROF_SCOPE(PC_PROF_DECODE);
++    if (s_dwN < 0)
++        DecodeThreadsStart();
++    memset(m_slotTransp[s], 0, sizeof m_slotTransp[s]);
++    if (s_dwN > 0) {
++        int band = (256 / (s_dwN + 1)) & ~7;
++        for (int i = 0; i < s_dwN; i++) {
++            s_dw[i].gpu = this;
++            s_dw[i].s = s;
++            s_dw[i].y0 = i * band;
++            s_dw[i].y1 = (i + 1) * band;
++            sceKernelSignalSema(s_dw[i].start, 1);
++        }
++        DecodeBand(s, s_dwN * band, 256);
++        sceKernelWaitSema(s_dwDone, s_dwN, NULL);
++    } else {
++        /* a row at a time into the slot's rows of the atlas */
++        DecodeBand(s, 0, 256);
++    }
+ #else
+     memset(m_slotTransp[s], 0, sizeof m_slotTransp[s]);
+     for (int y = 0; y < 256; y++) {
+-- 
+2.53.0
+

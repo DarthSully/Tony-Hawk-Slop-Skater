@@ -1,0 +1,248 @@
+From 2254a81b0a8d3f79bce514aee01d0849c2c01328 Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Sat, 24 Oct 2026 22:20:40 +0300
+Subject: [PATCH] Vita: STR streams read ahead by a reader thread (a ring of
+ about 2 s), never on the game thread
+
+---
+ platform/pc/include/pc/stream.h |   3 +
+ platform/pc/src/pc_stream.cpp   | 149 +++++++++++++++++++++++++++++++-
+ 2 files changed, 151 insertions(+), 1 deletion(-)
+
+diff --git a/platform/pc/include/pc/stream.h b/platform/pc/include/pc/stream.h
+index cbdc9ca..996b42c 100644
+--- a/platform/pc/include/pc/stream.h
++++ b/platform/pc/include/pc/stream.h
+@@ -92,6 +92,9 @@ private:
+     /* the stream */
+     int m_id = 0;              /* playing (or paused), 0 for none */
+     FILE *m_f = nullptr;       /* an STR */
++#ifdef __vita__
++    bool m_readerOpen = false; /* the STR is the reader thread's (pc_stream.cpp; m_f stays null) */
++#endif
+     SfdFilm *m_sfd = nullptr;  /* a film (owned) */
+     bool m_reading = false, m_paused = false;
+     uint32_t m_owed = 0;       /* sectors owed, in sixtieths */
+diff --git a/platform/pc/src/pc_stream.cpp b/platform/pc/src/pc_stream.cpp
+index a1072af..abf343d 100644
+--- a/platform/pc/src/pc_stream.cpp
++++ b/platform/pc/src/pc_stream.cpp
+@@ -28,6 +28,10 @@
+ #include "pc_runtime.h"
+ #include "pc_sound.h"
+ #include "pc_stream.h"
++#ifdef __vita__
++#include <psp2/kernel/threadmgr.h>
++#include "pc/platform.h"
++#endif
+ #include "pc/assets.h"
+ #include "pc/platform.h"
+ #include "pc/sound.h"
+@@ -40,6 +44,94 @@ Streamer g_streamer;
+ namespace {
+ 
+ constexpr int kSectorsPerSecond = 150;
++
++#ifdef __vita__
++/* PS Vita: an STR is read by a thread on core 2 into a ring of sectors, about 2 s ahead, so the
++ * game thread (which takes them in its vblank, Streamer::Frame) never waits on the memory card: a
++ * track change's first read took 0.4 s there. Requests (open a file, or none) carry a generation;
++ * the game thread takes sectors only once the reader has acknowledged its latest. */
++constexpr int kRingSectors = 300, kRingSector = 2352;
++
++struct Reader {
++    uint8_t ring[kRingSectors][kRingSector];
++    uint32_t w, r;                 /* sectors written (reader), taken (game thread) */
++    uint32_t reqGen, ackGen;
++    int eof, failed;               /* of the acknowledged request */
++    char path[512];
++    SceUID sema = -1;
++    int underruns, minFill = kRingSectors;
++};
++Reader g_reader;
++
++int ReaderThread(SceSize, void *) {
++    Reader &R = g_reader;
++    FILE *f = nullptr;
++    uint32_t gen = 0;
++    char path[sizeof R.path];
++    for (;;) {
++        uint32_t g = __atomic_load_n(&R.reqGen, __ATOMIC_ACQUIRE);
++        if (g != gen) {
++            memcpy(path, R.path, sizeof path);
++            if (__atomic_load_n(&R.reqGen, __ATOMIC_ACQUIRE) != g)
++                continue;   /* rewritten while copied */
++            if (f)
++                fclose(f);
++            f = path[0] ? fopen(path, "rb") : nullptr;
++            R.w = R.r = 0;
++            R.eof = 0;
++            R.failed = path[0] && !f;
++            gen = g;
++            __atomic_store_n(&R.ackGen, g, __ATOMIC_RELEASE);
++            continue;
++        }
++        if (f && !R.eof && R.w - __atomic_load_n(&R.r, __ATOMIC_ACQUIRE) < (uint32_t)kRingSectors) {
++            if (fread(R.ring[R.w % kRingSectors], 1, kRingSector, f) != (size_t)kRingSector)
++                __atomic_store_n(&R.eof, 1, __ATOMIC_RELEASE);
++            else
++                __atomic_store_n(&R.w, R.w + 1, __ATOMIC_RELEASE);
++            continue;
++        }
++        SceUInt timeout = 20000;
++        sceKernelWaitSema(R.sema, 1, &timeout);
++    }
++    return 0;
++}
++
++/* open path (null: none) on the reader thread, from its first sector */
++void ReaderRequest(const char *path) {
++    Reader &R = g_reader;
++    if (R.sema < 0) {
++        R.sema = sceKernelCreateSema("thps-stream", 0, 0, 1 << 20, NULL);
++        SceUID th = sceKernelCreateThread("thps-stream", ReaderThread, 0x10000100 - 20, 0x4000, 0,
++                                          SCE_KERNEL_CPU_MASK_USER_2, NULL);
++        if (th >= 0)
++            sceKernelStartThread(th, 0, NULL);
++    }
++    snprintf(R.path, sizeof R.path, "%s", path ? path : "");
++    __atomic_add_fetch(&R.reqGen, 1, __ATOMIC_RELEASE);
++    sceKernelSignalSema(R.sema, 1);
++}
++
++/* the next sector into out: 1, 0 at the end of the file (or it couldn't be opened), -1 when it
++ * isn't read yet (the caller tries again next frame) */
++int ReaderNext(uint8_t *out) {
++    Reader &R = g_reader;
++    if (__atomic_load_n(&R.ackGen, __ATOMIC_ACQUIRE) != __atomic_load_n(&R.reqGen, __ATOMIC_ACQUIRE))
++        return -1;
++    uint32_t r = R.r, w = __atomic_load_n(&R.w, __ATOMIC_ACQUIRE);
++    if ((int)(w - r) < R.minFill)
++        R.minFill = (int)(w - r);
++    if (r == w) {
++        if (R.failed || __atomic_load_n(&R.eof, __ATOMIC_ACQUIRE))
++            return 0;
++        R.underruns++;
++        return -1;
++    }
++    memcpy(out, R.ring[r % kRingSectors], kRingSector);
++    __atomic_store_n(&R.r, r + 1, __ATOMIC_RELEASE);
++    return 1;
++}
++#endif
+ constexpr int kStrMagic = 0x0160;
+ constexpr int kStrHeader = 32;
+ constexpr int kStrPayload = 2016;
+@@ -224,6 +316,11 @@ void Streamer::FreeFrame(const void *frame) {
+ /* ---- playing ------------------------------------------------------------------------------------ */
+ 
+ void Streamer::Close() {
++#ifdef __vita__
++    if (m_readerOpen)
++        ReaderRequest(nullptr);
++    m_readerOpen = false;
++#endif
+     if (m_f)
+         fclose(m_f);
+     m_f = nullptr;
+@@ -234,25 +331,47 @@ void Streamer::Close() {
+ 
+ void Streamer::Play(int id) {
+     const FileEntry *file = FileOf(id);
++#ifdef __vita__
++    bool opened = false;
++    if (id != m_id || !(m_readerOpen || m_sfd)) {
++#else
+     if (id != m_id || !(m_f || m_sfd)) {
++#endif
+         Close();
+         m_id = 0;
+         if (!file)
+             return;
+         if (file->film)
+             m_sfd = SfdFilm::Open(file->path).release();
+-        else
++        else {
++#ifdef __vita__
++            ReaderRequest(file->path);   /* a file it can't open ends the stream (ReaderNext) */
++            m_readerOpen = opened = true;
++#else
+             m_f = fopen(file->path, "rb");
++#endif
++        }
++#ifdef __vita__
++        if (!m_readerOpen && !m_sfd) {
++#else
+         if (!m_f && !m_sfd) {
++#endif
+             PC_Log("cannot read %s", file->path);
+             return;
+         }
+         m_id = id;
+         ApplyMix();
+     }
++#ifdef __vita__
++    if (m_readerOpen) {
++        if (!opened)
++            ReaderRequest(FileOf(id)->path);   /* from the start again */
++    } else
++#else
+     if (m_f)
+         PC_FSEEK(m_f, 0, SEEK_SET);
+     else
++#endif
+         m_sfd->Seek(0);
+     g_xaDecoder.Reset();
+     ClearFrames();
+@@ -345,13 +464,37 @@ void Streamer::Frame() {
+         return;
+     }
+     m_owed += kSectorsPerSecond;
++#ifdef __vita__
++    /* not read yet: no catching up in a burst later */
++    if (m_owed > 60 * 8)
++        m_owed = 60 * 8;
++    static int s_statTick;
++    if (pc_vita_profile && ++s_statTick % 600 == 0) {
++        fprintf(stderr, "[stream] ring %d of %d sectors at least, %d underruns (last 10 s)\n",
++                g_reader.minFill, kRingSectors, g_reader.underruns);
++        g_reader.minFill = kRingSectors;
++        g_reader.underruns = 0;
++    }
++#endif
+     while (m_owed >= 60) {
++#ifdef __vita__
++        int got = ReaderNext(m_raw);
++        if (got < 0)
++            break;
++        m_owed -= 60;
++        if (!got) {
++            PC_Trace("stream %d: end of file", m_id);
++            m_reading = false;
++            return;
++        }
++#else
+         m_owed -= 60;
+         if (fread(m_raw, 1, kSector, m_f) != kSector) {
+             PC_Trace("stream %d: end of file", m_id);
+             m_reading = false;
+             return;
+         }
++#endif
+         if (m_raw[15] != 2) { /* not a mode 2 sector */
+             m_sector++;
+             continue;
+@@ -375,6 +518,10 @@ void Streamer::Frame() {
+         }
+         m_sector++;
+     }
++#ifdef __vita__
++    if (g_reader.sema >= 0)
++        sceKernelSignalSema(g_reader.sema, 1);
++#endif
+ }
+ 
+ } // namespace pc
+-- 
+2.53.0
+

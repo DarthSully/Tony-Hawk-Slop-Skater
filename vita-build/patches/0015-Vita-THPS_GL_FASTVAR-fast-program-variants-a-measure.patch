@@ -1,0 +1,400 @@
+From f9819b21d822bfc137617429d364795aa4db2104 Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Sat, 24 Oct 2026 21:54:32 +0300
+Subject: [PATCH] Vita: THPS_GL_FASTVAR fast-program variants (a measurement);
+ fast and slow program counts in the GL stats
+
+---
+ platform/pc/include/pc/gl_gpu.h          |   1 +
+ platform/pc/include/pc/gl_shaders_gles.h | 296 +++++++++++++++++++++++
+ platform/pc/src/pc_gpu_gl.cpp            |  33 ++-
+ 3 files changed, 327 insertions(+), 3 deletions(-)
+
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index f2548a8..4fb0172 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -221,6 +221,7 @@ class GlGpu {
+     struct Stats {
+         int on, draws, readbacks, tex_ups, blits, frames;
+         int cache_hits, cache_misses, cache_inval, cache_full;
++        int fast_batches, slow_batches, fast_tris, slow_tris, uncached_tris;
+     };
+ 
+     /* targets */
+diff --git a/platform/pc/include/pc/gl_shaders_gles.h b/platform/pc/include/pc/gl_shaders_gles.h
+index c28e1c3..5040a44 100644
+--- a/platform/pc/include/pc/gl_shaders_gles.h
++++ b/platform/pc/include/pc/gl_shaders_gles.h
+@@ -288,6 +288,302 @@ static const char *gl_draw_fast_fs =
+     "    gl_FragColor = vec4(c, 1.0 - keep);\n"
+     "}\n";
+ 
++/* THPS_GL_FASTVAR=1..4 (a measurement): the fast program without the texture window (1), without
++ * discard (2), reading one texel per slot (3), without both window and discard (4) */
++static const char *gl_draw_fast_fs1 =
++    "#ifdef GL_ES\n"
++    "precision highp float;\n"
++    "#endif\n"
++    "varying vec3 v_color;\n"
++    "varying vec2 v_uv;\n"
++    "varying vec4 v_page;\n"
++    "varying vec4 v_mode;\n"
++    "varying vec4 v_flags;\n"
++    "varying vec4 v_twin;\n"
++    "varying vec4 v_uvr;\n"
++    "uniform sampler2D u_vram;\n"
++    "uniform sampler2D u_hd;\n"
++    "uniform sampler2D u_atlas;\n"
++    "uniform float u_pass;\n"
++    /* the texture store's 16-bit texel at x, y (wrapping as VRAM does): its low and high bytes */
++    "vec2 vram(float x, float y) {\n"
++    "    vec4 tx = texture2D(u_vram, (vec2(mod(x, 1024.0), mod(y, 512.0)) + 0.5) /\n"
++    "                               vec2(1024.0, 512.0));\n"
++    "    return floor(vec2(tx.r, tx.a) * 255.0 + 0.5);\n"
++    "}\n"
++    /* (u & a) | o of 8-bit whole numbers: the texture window */
++    "float pmod(float x, float y) { return x - y * floor(x / y); }\n"
++    "float window(float u, float a, float o) {\n"
++    "    if (a > 254.5 && o < 0.5) return u;\n"
++    "    float r = 0.0, p = 1.0;\n"
++    "    for (int i = 0; i < 8; i++) {\n"
++    "        float ub = mod(floor(u / p), 2.0), ab = mod(floor(a / p), 2.0),\n"
++    "              ob = mod(floor(o / p), 2.0);\n"
++    "        r += p * max(ub * ab, ob);\n"
++    "        p *= 2.0;\n"
++    "    }\n"
++    "    return r;\n"
++    "}\n"
++    "void main() {\n"
++    "    vec4 page = floor(v_page + 0.5), mode = floor(v_mode + 0.5);\n"
++    "    vec4 tw = floor(v_twin + 0.5), uvr = floor(v_uvr + 0.5);\n"
++    "    bool view = v_flags.y > 0.5;\n"
++    "    float depth = mode.x, abr = mode.y;\n"
++    /* texture coordinates at the pixel's corner, rounded to the nearest texel like the PS1 (at
++     * the PS1's resolution the geometry moved by half a pixel instead, gl_shaders.h) */
++    "    vec2 uv = v_uv + 0.5;\n"
++    "    if (view || any(notEqual(uvr, vec4(0.0, 0.0, 255.0, 255.0))))\n"
++    "        uv = clamp(uv, uvr.xy, uvr.zw + 0.999);\n"
++    "    bool semi = v_flags.x > 0.5;\n"
++    "    vec3 c = v_color;\n"
++    "    bool blend = semi;\n"
++    "    float hd_a = 1.0;\n"
++    "    if (mode.z > 0.5 && depth > 2.5) {\n"
++    "        vec4 tx = texture2D(u_hd, v_uv / 256.0);\n"
++    "        if (tx.a < 0.03) discard;\n"
++    "        c = mode.w > 0.5 ? tx.rgb : min(tx.rgb * v_color * (255.0 / 128.0), vec3(1.0));\n"
++    "        hd_a = tx.a;\n"
++    /* a cached texture page: its texel, decoded (a: 0 transparent, 0.5 STP set, 1 opaque) */
++    "    } else if (mode.z > 0.5 && v_flags.z > 0.5) {\n"
++    "        float u = pmod(floor(uv.x), 256.0);\n"
++    "        float v = pmod(floor(uv.y), 256.0);\n"
++    "        vec4 ta = texture2D(u_atlas, (page.zw + vec2(u, v) + 0.5) / vec2(4096.0, 2048.0));\n"
++    "        if (ta.a < 0.25) discard;\n"
++    "        c = mode.w > 0.5 ? ta.rgb : min(ta.rgb * v_color * (255.0 / 128.0), vec3(1.0));\n"
++    "        blend = semi && ta.a < 0.75;\n"
++    "    }\n"
++    "    if ((u_pass > 0.5 && u_pass < 1.5 && blend) || (u_pass > 1.5 && !blend)) discard;\n"
++    "    float keep = 0.0;\n"
++    "    if (blend) {\n"
++    "        if (abr < 0.5) { c *= 0.5; keep = 0.5; }\n"
++    "        else if (abr > 2.5) { c *= 0.25; keep = 1.0; }\n"
++    "        else keep = 1.0;\n"
++    "    }\n"
++    "    c *= hd_a;\n"
++    "    keep = hd_a * keep + 1.0 - hd_a;\n"
++    "    gl_FragColor = vec4(c, 1.0 - keep);\n"
++    "}\n";
++
++static const char *gl_draw_fast_fs2 =
++    "#ifdef GL_ES\n"
++    "precision highp float;\n"
++    "#endif\n"
++    "varying vec3 v_color;\n"
++    "varying vec2 v_uv;\n"
++    "varying vec4 v_page;\n"
++    "varying vec4 v_mode;\n"
++    "varying vec4 v_flags;\n"
++    "varying vec4 v_twin;\n"
++    "varying vec4 v_uvr;\n"
++    "uniform sampler2D u_vram;\n"
++    "uniform sampler2D u_hd;\n"
++    "uniform sampler2D u_atlas;\n"
++    "uniform float u_pass;\n"
++    /* the texture store's 16-bit texel at x, y (wrapping as VRAM does): its low and high bytes */
++    "vec2 vram(float x, float y) {\n"
++    "    vec4 tx = texture2D(u_vram, (vec2(mod(x, 1024.0), mod(y, 512.0)) + 0.5) /\n"
++    "                               vec2(1024.0, 512.0));\n"
++    "    return floor(vec2(tx.r, tx.a) * 255.0 + 0.5);\n"
++    "}\n"
++    /* (u & a) | o of 8-bit whole numbers: the texture window */
++    "float pmod(float x, float y) { return x - y * floor(x / y); }\n"
++    "float window(float u, float a, float o) {\n"
++    "    if (a > 254.5 && o < 0.5) return u;\n"
++    "    float r = 0.0, p = 1.0;\n"
++    "    for (int i = 0; i < 8; i++) {\n"
++    "        float ub = mod(floor(u / p), 2.0), ab = mod(floor(a / p), 2.0),\n"
++    "              ob = mod(floor(o / p), 2.0);\n"
++    "        r += p * max(ub * ab, ob);\n"
++    "        p *= 2.0;\n"
++    "    }\n"
++    "    return r;\n"
++    "}\n"
++    "void main() {\n"
++    "    vec4 page = floor(v_page + 0.5), mode = floor(v_mode + 0.5);\n"
++    "    vec4 tw = floor(v_twin + 0.5), uvr = floor(v_uvr + 0.5);\n"
++    "    bool view = v_flags.y > 0.5;\n"
++    "    float depth = mode.x, abr = mode.y;\n"
++    /* texture coordinates at the pixel's corner, rounded to the nearest texel like the PS1 (at
++     * the PS1's resolution the geometry moved by half a pixel instead, gl_shaders.h) */
++    "    vec2 uv = v_uv + 0.5;\n"
++    "    if (view || any(notEqual(uvr, vec4(0.0, 0.0, 255.0, 255.0))))\n"
++    "        uv = clamp(uv, uvr.xy, uvr.zw + 0.999);\n"
++    "    bool semi = v_flags.x > 0.5;\n"
++    "    vec3 c = v_color;\n"
++    "    bool blend = semi;\n"
++    "    float hd_a = 1.0;\n"
++    "    if (mode.z > 0.5 && depth > 2.5) {\n"
++    "        vec4 tx = texture2D(u_hd, v_uv / 256.0);\n"
++    "        if (tx.a < 0.03) discard;\n"
++    "        c = mode.w > 0.5 ? tx.rgb : min(tx.rgb * v_color * (255.0 / 128.0), vec3(1.0));\n"
++    "        hd_a = tx.a;\n"
++    /* a cached texture page: its texel, decoded (a: 0 transparent, 0.5 STP set, 1 opaque) */
++    "    } else if (mode.z > 0.5 && v_flags.z > 0.5) {\n"
++    "        float u = window(pmod(floor(uv.x), 256.0), tw.x, tw.z);\n"
++    "        float v = window(pmod(floor(uv.y), 256.0), tw.y, tw.w);\n"
++    "        vec4 ta = texture2D(u_atlas, (page.zw + vec2(u, v) + 0.5) / vec2(4096.0, 2048.0));\n"
++    "        c = mode.w > 0.5 ? ta.rgb : min(ta.rgb * v_color * (255.0 / 128.0), vec3(1.0));\n"
++    "        blend = semi && ta.a < 0.75;\n"
++    "    }\n"
++    "    if ((u_pass > 0.5 && u_pass < 1.5 && blend) || (u_pass > 1.5 && !blend)) discard;\n"
++    "    float keep = 0.0;\n"
++    "    if (blend) {\n"
++    "        if (abr < 0.5) { c *= 0.5; keep = 0.5; }\n"
++    "        else if (abr > 2.5) { c *= 0.25; keep = 1.0; }\n"
++    "        else keep = 1.0;\n"
++    "    }\n"
++    "    c *= hd_a;\n"
++    "    keep = hd_a * keep + 1.0 - hd_a;\n"
++    "    gl_FragColor = vec4(c, 1.0 - keep);\n"
++    "}\n";
++
++static const char *gl_draw_fast_fs3 =
++    "#ifdef GL_ES\n"
++    "precision highp float;\n"
++    "#endif\n"
++    "varying vec3 v_color;\n"
++    "varying vec2 v_uv;\n"
++    "varying vec4 v_page;\n"
++    "varying vec4 v_mode;\n"
++    "varying vec4 v_flags;\n"
++    "varying vec4 v_twin;\n"
++    "varying vec4 v_uvr;\n"
++    "uniform sampler2D u_vram;\n"
++    "uniform sampler2D u_hd;\n"
++    "uniform sampler2D u_atlas;\n"
++    "uniform float u_pass;\n"
++    /* the texture store's 16-bit texel at x, y (wrapping as VRAM does): its low and high bytes */
++    "vec2 vram(float x, float y) {\n"
++    "    vec4 tx = texture2D(u_vram, (vec2(mod(x, 1024.0), mod(y, 512.0)) + 0.5) /\n"
++    "                               vec2(1024.0, 512.0));\n"
++    "    return floor(vec2(tx.r, tx.a) * 255.0 + 0.5);\n"
++    "}\n"
++    /* (u & a) | o of 8-bit whole numbers: the texture window */
++    "float pmod(float x, float y) { return x - y * floor(x / y); }\n"
++    "float window(float u, float a, float o) {\n"
++    "    if (a > 254.5 && o < 0.5) return u;\n"
++    "    float r = 0.0, p = 1.0;\n"
++    "    for (int i = 0; i < 8; i++) {\n"
++    "        float ub = mod(floor(u / p), 2.0), ab = mod(floor(a / p), 2.0),\n"
++    "              ob = mod(floor(o / p), 2.0);\n"
++    "        r += p * max(ub * ab, ob);\n"
++    "        p *= 2.0;\n"
++    "    }\n"
++    "    return r;\n"
++    "}\n"
++    "void main() {\n"
++    "    vec4 page = floor(v_page + 0.5), mode = floor(v_mode + 0.5);\n"
++    "    vec4 tw = floor(v_twin + 0.5), uvr = floor(v_uvr + 0.5);\n"
++    "    bool view = v_flags.y > 0.5;\n"
++    "    float depth = mode.x, abr = mode.y;\n"
++    /* texture coordinates at the pixel's corner, rounded to the nearest texel like the PS1 (at
++     * the PS1's resolution the geometry moved by half a pixel instead, gl_shaders.h) */
++    "    vec2 uv = v_uv + 0.5;\n"
++    "    if (view || any(notEqual(uvr, vec4(0.0, 0.0, 255.0, 255.0))))\n"
++    "        uv = clamp(uv, uvr.xy, uvr.zw + 0.999);\n"
++    "    bool semi = v_flags.x > 0.5;\n"
++    "    vec3 c = v_color;\n"
++    "    bool blend = semi;\n"
++    "    float hd_a = 1.0;\n"
++    "    if (mode.z > 0.5 && depth > 2.5) {\n"
++    "        vec4 tx = texture2D(u_hd, v_uv / 256.0);\n"
++    "        if (tx.a < 0.03) discard;\n"
++    "        c = mode.w > 0.5 ? tx.rgb : min(tx.rgb * v_color * (255.0 / 128.0), vec3(1.0));\n"
++    "        hd_a = tx.a;\n"
++    /* a cached texture page: its texel, decoded (a: 0 transparent, 0.5 STP set, 1 opaque) */
++    "    } else if (mode.z > 0.5 && v_flags.z > 0.5) {\n"
++    "        float u = window(pmod(floor(uv.x), 256.0), tw.x, tw.z);\n"
++    "        float v = window(pmod(floor(uv.y), 256.0), tw.y, tw.w);\n"
++    "        vec4 ta = texture2D(u_atlas, (page.zw + 128.5) / vec2(4096.0, 2048.0));\n"
++    "        if (ta.a < 0.25) discard;\n"
++    "        c = mode.w > 0.5 ? ta.rgb : min(ta.rgb * v_color * (255.0 / 128.0), vec3(1.0));\n"
++    "        blend = semi && ta.a < 0.75;\n"
++    "    }\n"
++    "    if ((u_pass > 0.5 && u_pass < 1.5 && blend) || (u_pass > 1.5 && !blend)) discard;\n"
++    "    float keep = 0.0;\n"
++    "    if (blend) {\n"
++    "        if (abr < 0.5) { c *= 0.5; keep = 0.5; }\n"
++    "        else if (abr > 2.5) { c *= 0.25; keep = 1.0; }\n"
++    "        else keep = 1.0;\n"
++    "    }\n"
++    "    c *= hd_a;\n"
++    "    keep = hd_a * keep + 1.0 - hd_a;\n"
++    "    gl_FragColor = vec4(c, 1.0 - keep);\n"
++    "}\n";
++
++static const char *gl_draw_fast_fs4 =
++    "#ifdef GL_ES\n"
++    "precision highp float;\n"
++    "#endif\n"
++    "varying vec3 v_color;\n"
++    "varying vec2 v_uv;\n"
++    "varying vec4 v_page;\n"
++    "varying vec4 v_mode;\n"
++    "varying vec4 v_flags;\n"
++    "varying vec4 v_twin;\n"
++    "varying vec4 v_uvr;\n"
++    "uniform sampler2D u_vram;\n"
++    "uniform sampler2D u_hd;\n"
++    "uniform sampler2D u_atlas;\n"
++    "uniform float u_pass;\n"
++    /* the texture store's 16-bit texel at x, y (wrapping as VRAM does): its low and high bytes */
++    "vec2 vram(float x, float y) {\n"
++    "    vec4 tx = texture2D(u_vram, (vec2(mod(x, 1024.0), mod(y, 512.0)) + 0.5) /\n"
++    "                               vec2(1024.0, 512.0));\n"
++    "    return floor(vec2(tx.r, tx.a) * 255.0 + 0.5);\n"
++    "}\n"
++    /* (u & a) | o of 8-bit whole numbers: the texture window */
++    "float pmod(float x, float y) { return x - y * floor(x / y); }\n"
++    "float window(float u, float a, float o) {\n"
++    "    if (a > 254.5 && o < 0.5) return u;\n"
++    "    float r = 0.0, p = 1.0;\n"
++    "    for (int i = 0; i < 8; i++) {\n"
++    "        float ub = mod(floor(u / p), 2.0), ab = mod(floor(a / p), 2.0),\n"
++    "              ob = mod(floor(o / p), 2.0);\n"
++    "        r += p * max(ub * ab, ob);\n"
++    "        p *= 2.0;\n"
++    "    }\n"
++    "    return r;\n"
++    "}\n"
++    "void main() {\n"
++    "    vec4 page = floor(v_page + 0.5), mode = floor(v_mode + 0.5);\n"
++    "    vec4 tw = floor(v_twin + 0.5), uvr = floor(v_uvr + 0.5);\n"
++    "    bool view = v_flags.y > 0.5;\n"
++    "    float depth = mode.x, abr = mode.y;\n"
++    /* texture coordinates at the pixel's corner, rounded to the nearest texel like the PS1 (at
++     * the PS1's resolution the geometry moved by half a pixel instead, gl_shaders.h) */
++    "    vec2 uv = v_uv + 0.5;\n"
++    "    if (view || any(notEqual(uvr, vec4(0.0, 0.0, 255.0, 255.0))))\n"
++    "        uv = clamp(uv, uvr.xy, uvr.zw + 0.999);\n"
++    "    bool semi = v_flags.x > 0.5;\n"
++    "    vec3 c = v_color;\n"
++    "    bool blend = semi;\n"
++    "    float hd_a = 1.0;\n"
++    "    if (mode.z > 0.5 && depth > 2.5) {\n"
++    "        vec4 tx = texture2D(u_hd, v_uv / 256.0);\n"
++    "        if (tx.a < 0.03) discard;\n"
++    "        c = mode.w > 0.5 ? tx.rgb : min(tx.rgb * v_color * (255.0 / 128.0), vec3(1.0));\n"
++    "        hd_a = tx.a;\n"
++    /* a cached texture page: its texel, decoded (a: 0 transparent, 0.5 STP set, 1 opaque) */
++    "    } else if (mode.z > 0.5 && v_flags.z > 0.5) {\n"
++    "        float u = pmod(floor(uv.x), 256.0);\n"
++    "        float v = pmod(floor(uv.y), 256.0);\n"
++    "        vec4 ta = texture2D(u_atlas, (page.zw + vec2(u, v) + 0.5) / vec2(4096.0, 2048.0));\n"
++    "        c = mode.w > 0.5 ? ta.rgb : min(ta.rgb * v_color * (255.0 / 128.0), vec3(1.0));\n"
++    "        blend = semi && ta.a < 0.75;\n"
++    "    }\n"
++    "    if ((u_pass > 0.5 && u_pass < 1.5 && blend) || (u_pass > 1.5 && !blend)) discard;\n"
++    "    float keep = 0.0;\n"
++    "    if (blend) {\n"
++    "        if (abr < 0.5) { c *= 0.5; keep = 0.5; }\n"
++    "        else if (abr > 2.5) { c *= 0.25; keep = 1.0; }\n"
++    "        else keep = 1.0;\n"
++    "    }\n"
++    "    c *= hd_a;\n"
++    "    keep = hd_a * keep + 1.0 - hd_a;\n"
++    "    gl_FragColor = vec4(c, 1.0 - keep);\n"
++    "}\n";
++
+ /* 16-bit pixels the CPU wrote (GlGpu::Blit) into a render target: the same LUMINANCE_ALPHA
+  * texture as the texture store's, their VRAM x, y at its 0, 0. */
+ static const char *gl_copy_fs =
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index 35d6e14..d687c29 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -615,7 +615,15 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+     m_locSlow = DrawLocs{m_drawUPass, m_drawUDpass, m_drawUProj, m_drawUTarget, m_drawUShift,
+                          m_drawUUvfix};
+     if (m_cacheOn && draw_fs == gl_draw_fs) {
+-        m_drawProgFast = Program(gl_draw_vs, gl_draw_fast_fs);
++        static const char *const fast_fs[5] = { gl_draw_fast_fs, gl_draw_fast_fs1, gl_draw_fast_fs2,
++                                                gl_draw_fast_fs3, gl_draw_fast_fs4 };
++        const char *fv = getenv("THPS_GL_FASTVAR");
++        int var = fv ? atoi(fv) : 0;
++        if (var < 0 || var > 4)
++            var = 0;
++        if (var)
++            fprintf(stderr, "[gl] THPS_GL_FASTVAR=%d: fast program variant (a measurement)\n", var);
++        m_drawProgFast = Program(gl_draw_vs, fast_fs[var]);
+         if (m_drawProgFast) {
+             glUseProgram(m_drawProgFast);
+             glUniform1i(glGetUniformLocation(m_drawProgFast, "u_vram"), 0);
+@@ -975,6 +983,14 @@ void GlGpu::Flush()
+ 
+ #ifdef PC_GLES
+     UseDraw(slow_tris == 0);
++    if (slow_tris == 0 && m_drawProgFast) {
++        m_st.fast_batches++;
++        m_st.fast_tris += b.nv / 3;
++    } else {
++        m_st.slow_batches++;
++        m_st.slow_tris += b.nv / 3;
++        m_st.uncached_tris += m_cacheOn ? slow_tris : 0;
++    }
+ #else
+     glUseProgram(m_drawProg);
+ #endif
+@@ -1530,6 +1546,14 @@ void GlGpu::LayerDraw(int first, int count, int cls, uint16_t hd)
+     if (m_cacheOn && l.verts == m_layerConv)
+         slow_tris = CacheVerts(m_layerConv + first, count);
+     UseDraw(slow_tris == 0);
++    if (slow_tris == 0 && m_drawProgFast) {
++        m_st.fast_batches++;
++        m_st.fast_tris += count / 3;
++    } else {
++        m_st.slow_batches++;
++        m_st.slow_tris += count / 3;
++        m_st.uncached_tris += m_cacheOn ? slow_tris : 0;
++    }
+     m_proj[0] = l.lp.ofs_x + l.lp.ofx;
+     m_proj[1] = l.lp.ofs_y + l.lp.ofy;
+     m_proj[2] = l.lp.h;
+@@ -2064,9 +2088,12 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+ #endif
+     if (m_st.on && ++m_st.frames == 60) {
+         fprintf(stderr, "[gl] last 60 frames: %d draw calls, %d readbacks, %d texture uploads, "
+-                        "%d blits; texture cache %d hits, %d misses, %d invalidated, %d full\n",
++                        "%d blits; texture cache %d hits, %d misses, %d invalidated, %d full; fast "
++                        "program %d batches/%d tris, slow %d batches/%d tris (%d textured tris "
++                        "without a slot)\n",
+                 m_st.draws, m_st.readbacks, m_st.tex_ups, m_st.blits, m_st.cache_hits,
+-                m_st.cache_misses, m_st.cache_inval, m_st.cache_full);
++                m_st.cache_misses, m_st.cache_inval, m_st.cache_full, m_st.fast_batches,
++                m_st.fast_tris, m_st.slow_batches, m_st.slow_tris, m_st.uncached_tris);
+         m_st = Stats{};
+         m_st.on = 1;
+     }
+-- 
+2.53.0
+

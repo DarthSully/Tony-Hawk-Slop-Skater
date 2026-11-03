@@ -1,0 +1,558 @@
+From 9b68271a8bb7d3f9fd1761a971f6a71970b2b3b3 Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Tue, 27 Oct 2026 18:55:18 +0300
+Subject: [PATCH] Vita: native 3D draws split only where faces really overlap,
+ each layer's vertices sent to the GPU once
+
+The overlap test that splits a native 3D layer into draws (Renderer3D::DrawUpto) worked on each
+face's bounding box at its whole depth range, so a big floor or wall split every draw that crossed
+any part of its box. FaceSpans now takes each triangle on its own: only the 16x16 cells its
+outline reaches (each cell, widened by a pixel, against the triangle's edges), at the depths its
+plane has inside that cell (1/z is linear on the screen, so the corners of the cell's part of the
+triangle's box bound it, kept within the triangle's corners' range and widened by 1/1024 for the
+float maths). Faces reaching the near plane or not in view space keep every cell at their whole
+range, single-cell faces their box. THPS_R3D_EXACT=0 brings back the old test.
+
+Each 3D draw handed vitaGL client-side arrays, which it copies at every draw (twice for an opaque
+draw: colour and depth pass). The layer's vertices now get their texture cache slots all at
+LayerBegin (what each draw did in turn; the slow-triangle counts per draw come from a running
+count) and go into one buffer of graphics memory (glBufferData, eight buffers in turn), which the
+draws read in place; the attributes are bound once a layer and the projection uniform is given
+to a program only when it changes. If a texture write frees cache slots during the layer, the
+remaining draws get their slots again draw by draw and are drawn from client memory, as before.
+THPS_GL_LAYERVBO=0 copies at every draw again. The [gl] line adds the layers drawn from a buffer
+and the 3D draws that were not.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ platform/pc/include/pc/gl_gpu.h   |  24 ++++-
+ platform/pc/include/pc/render3d.h |  13 ++-
+ platform/pc/src/pc_gpu_gl.cpp     | 108 ++++++++++++++-----
+ platform/pc/src/pc_render3d.cpp   | 166 ++++++++++++++++++++++++------
+ 4 files changed, 251 insertions(+), 60 deletions(-)
+
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index 49f2f2c..95fb9a9 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -219,7 +219,10 @@ class GlGpu {
+         GlLayerParams lp;
+         GLuint vao, vbo;
+ #ifdef PC_GLES
+-        const GlVert *verts;   /* LayerBegin's, drawn from where they are (no buffers) */
++        const GlVert *verts;   /* LayerBegin's, or their copy with the cache's slots */
++        const GlVert *src;     /* LayerBegin's */
++        GLuint buf;            /* verts in a buffer of graphics memory (0: drawn from verts) */
++        uint32_t conv_gen;     /* m_cacheGen when verts got their slots (all at LayerBegin) */
+ #endif
+     };
+ 
+@@ -231,6 +234,7 @@ class GlGpu {
+         int store_cells, store_switches, store_copies, blit_pool, blit_copies;
+         int cache_stale, own_fixed;
+         int gl_draws, layer_draws, split[PC_GL_SPLITS];
++        int layer_bufs, layer_client;   /* 3D layers drawn from a buffer; 3D draws not */
+     };
+ 
+     /* targets */
+@@ -301,6 +305,16 @@ class GlGpu {
+     /* ES 2 has no vertex array objects: a draw program's attributes from a client-side array
+      * (vitaGL copies those into its frame's memory) */
+     void DrawAttribs(const GlVert *v);
++    /* the draw program's attributes from buffer buf (0: client memory at v) */
++    void DrawAttribsFrom(GLuint buf, const GlVert *v);
++    /* THPS_GL_LAYERVBO (default on): a native 3D layer's vertices are written once, at
++     * LayerBegin, into a buffer of graphics memory its draws read (glBufferData; vitaGL frees
++     * the old memory once the GPU is done with it), instead of vitaGL copying them at every
++     * draw (twice for an opaque one: colour and depth). One buffer a layer, in turn. */
++    static constexpr int kLayerBufs = 8;
++    GLuint m_layerBufs[kLayerBufs] = {};
++    int m_layerBufNext = 0, m_layerVbo = 1;
++    GLuint m_attrBuf = 0;   /* the buffer the draw attributes read (0: client memory) */
+     void QuadAttribs(const float *v, int stride_floats, int uv);
+     /* rows of w 16-bit pixels, `stride` apart, into the bound LUMINANCE_ALPHA texture at x, y */
+     void Upload16(int x, int y, int w, int h, const uint16_t *src, int stride);
+@@ -346,9 +360,15 @@ class GlGpu {
+     std::vector<uint32_t> m_decode;
+     std::vector<uint32_t> m_windows;   /* the texture windows seen (the stats line counts them) */
+     GlVert m_layerConv[MAX_VERTS];   /* a layer's vertices with their slots (LayerBegin's are const) */
++    /* the layer's textured triangles without a slot before each of its triangles (LayerBegin) */
++    uint32_t m_slowBefore[MAX_VERTS / 3 + 1] = {};
++    /* counts slots freed (CacheInvalidate, CacheCheck): after one, a layer given its slots at
++     * LayerBegin is given them again draw by draw, as it was drawn before t16 */
++    uint32_t m_cacheGen = 0;
+     int CacheSlotFor(uint64_t key);
+     void CacheDecode(int s);
+-    int CacheVerts(GlVert *v, int n);
++    /* before: if given, the count before each triangle (n / 3 + 1 entries) */
++    int CacheVerts(GlVert *v, int n, uint32_t *before = nullptr);
+     void CacheInvalidate(int x, int y, int w, int h);
+     void CacheRefresh();
+     /* row y of a slot's texels, decoded from the store into out (256 RGBA texels) */
+diff --git a/platform/pc/include/pc/render3d.h b/platform/pc/include/pc/render3d.h
+index a485ad1..97a8522 100644
+--- a/platform/pc/include/pc/render3d.h
++++ b/platform/pc/include/pc/render3d.h
+@@ -114,7 +114,9 @@ private:
+     static bool ShadowMap(const ShadowSet *s, GlShadow *out);
+     /* last: LayerEnd's, after which nothing in the layer tests depth */
+     void DrawUpto(uint32_t bucket, int last = 0);
+-    void FaceCells(const Batch *b, const Face *f, int c[4]) const;
++    /* the cells of DrawUpto's grid face f covers and its depth range in each, into m_span */
++    void FaceSpans(const Batch *b, const Face *f);
++    void SpanBox(int x0, int y0, int x1, int y1, float lo, float hi);
+     void LayerEnd();
+     void LayerStart(uint32_t id);
+     void StatsTick();
+@@ -122,12 +124,21 @@ private:
+     /* options (environment, Init) */
+     bool m_native = false, m_verify = false, m_showStats = false, m_nearDrop = false;
+     bool m_retailFade = false, m_nclip = false;
++    bool m_exact = true;   /* THPS_R3D_EXACT=0: a face's bounding box and whole depth range */
+     Stats m_st = {};
+     /* DrawUpto's screen grid: 16x16 cells over 1024x512 of a layer's projection, each with the
+      * nearest depth of the opaque faces of the current draw that cover it (generation m_gridCur) */
+     float m_gridZ[32][64] = {};
+     uint16_t m_gridGen[32][64] = {};
+     uint16_t m_gridCur = 0;
++    /* FaceSpans: a cell (y * 64 + x) and the face's nearest and farthest depth in it */
++    struct CellZ {
++        uint16_t cell;
++        float lo, hi;
++    };
++    static constexpr int kSpans = 8192;
++    CellZ m_span[kSpans];
++    int m_nspan = 0;
+ 
+     /* float vertices */
+     Shadow m_pv[kPvSlots] = {}, m_sp[kSpSlots] = {};
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index bc3cdd2..a032fb2 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -751,6 +751,11 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+     {
+         const char *tc = getenv("THPS_GL_TEXCACHE");
+         m_cacheOn = !(tc && tc[0] == '0');
++        const char *lv = getenv("THPS_GL_LAYERVBO");
++        m_layerVbo = !(lv && lv[0] == '0');
++        fprintf(stderr, "[gl] 3D layers' vertices: %s\n",
++                m_layerVbo ? "one buffer a layer (THPS_GL_LAYERVBO=0: copied at every draw)"
++                           : "copied at every draw (THPS_GL_LAYERVBO=0)");
+     }
+     if (m_cacheOn) {
+         glActiveTexture(GL_TEXTURE0 + kAtlasUnit);
+@@ -963,6 +968,11 @@ void GlGpu::Shutdown()
+     GLuint bufs[4] = { m_vbo, m_copyVbo, m_presentVbo, m_layer.vbo };
+     glDeleteVertexArrays(4, vaos);
+     glDeleteBuffers(4, bufs);
++#else
++    if (m_layerBufs[0])
++        glDeleteBuffers(kLayerBufs, m_layerBufs);
++    memset(m_layerBufs, 0, sizeof m_layerBufs);
++    m_attrBuf = 0;
+ #endif
+     glDeleteTextures(4, texs);
+ #ifdef __vita__
+@@ -2306,11 +2316,27 @@ void GlGpu::LayerBegin(const GlLayerParams *lp, const GlVert *v, int nv)
+         return;
+     memcpy(l.mark, l.clip, sizeof l.mark);
+ #ifdef PC_GLES
+-    /* the layer's vertices stay the caller's until LayerEnd (pc_render3d.cpp) */
+-    l.verts = v;
++    /* the layer's vertices stay the caller's until LayerEnd (pc_render3d.cpp); with the cache,
++     * a copy given every triangle's slot now (as each draw used to), so that it can go to the
++     * GPU once */
++    l.verts = l.src = v;
++    l.buf = 0;
+     if (m_cacheOn && nv > 0 && nv <= MAX_VERTS) {
+         memcpy(m_layerConv, v, (size_t)nv * sizeof(GVert));
+         l.verts = m_layerConv;
++        CacheVerts(m_layerConv, nv, m_slowBefore);
++        l.conv_gen = m_cacheGen;
++    }
++    if (m_layerVbo && nv > 0) {
++        if (!m_layerBufs[0])
++            glGenBuffers(kLayerBufs, m_layerBufs);
++        l.buf = m_layerBufs[m_layerBufNext];
++        m_layerBufNext = (m_layerBufNext + 1) % kLayerBufs;
++        glBindBuffer(GL_ARRAY_BUFFER, l.buf);
++        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)nv * sizeof(GVert), l.verts, GL_STREAM_DRAW);
++        glBindBuffer(GL_ARRAY_BUFFER, 0);
++        m_attrBuf = 0;   /* bound to it at the first draw */
++        m_st.layer_bufs++;
+     }
+     glDepthMask(GL_TRUE);
+     glClearDepthf(1.0f);
+@@ -2347,8 +2373,28 @@ void GlGpu::LayerDraw(int first, int count, int cls, uint16_t hd, int depth, int
+     Prepare();
+ #ifdef PC_GLES
+     int slow_tris = 1;
+-    if (m_cacheOn && l.verts == m_layerConv)
+-        slow_tris = CacheVerts(m_layerConv + first, count);
++    GLuint buf = l.buf;
++    if (m_cacheOn && l.verts == m_layerConv) {
++        if (l.conv_gen == m_cacheGen && first % 3 == 0 && count % 3 == 0) {
++            slow_tris = (int)(m_slowBefore[(first + count) / 3] - m_slowBefore[first / 3]);
++        } else {
++            /* slots were freed since LayerBegin (a texture write): this draw's again, now, and
++             * drawn from them */
++            memcpy(m_layerConv + first, l.src + first, (size_t)count * sizeof(GVert));
++            slow_tris = CacheVerts(m_layerConv + first, count);
++            buf = 0;
++        }
++    }
++    if (!buf)
++        m_st.layer_client++;
++    /* the projection, given to each program once while it stays the same (UseDraw) */
++    float proj[4] = { (float)l.lp.ofs_x + l.lp.ofx, (float)l.lp.ofs_y + l.lp.ofy, l.lp.h,
++                      l.lp.hither };
++    if (!m_projSet || memcmp(proj, m_proj, sizeof proj)) {
++        memcpy(m_proj, proj, sizeof proj);
++        m_projSet = 1;
++        m_projApplied[0] = m_projApplied[1] = 0;
++    }
+     UseDraw(slow_tris == 0);
+     if (slow_tris == 0 && m_drawProgFast) {
+         m_st.fast_batches++;
+@@ -2358,22 +2404,21 @@ void GlGpu::LayerDraw(int first, int count, int cls, uint16_t hd, int depth, int
+         m_st.slow_tris += count / 3;
+         m_st.uncached_tris += m_cacheOn ? slow_tris : 0;
+     }
+-    m_proj[0] = l.lp.ofs_x + l.lp.ofx;
+-    m_proj[1] = l.lp.ofs_y + l.lp.ofy;
+-    m_proj[2] = l.lp.h;
+-    m_proj[3] = l.lp.hither;
+-    m_projSet = 1;
+-    m_projApplied[0] = m_projApplied[1] = 0;
+-    m_projApplied[slow_tris == 0 && m_drawProgFast ? 1 : 0] = 1;
+ #else
+     glUseProgram(m_drawProg);
+ #endif
+     if (hd)
+         HdBind(hd);
++#ifndef PC_GLES
+     glUniform4f(m_drawUProj, l.lp.ofs_x + l.lp.ofx, l.lp.ofs_y + l.lp.ofy, l.lp.h, l.lp.hither);
++#endif
+     BindStore();
+ #ifdef PC_GLES
+-    DrawAttribs(l.verts);
++    /* (UseDraw gave the program the projection) */
++    if (!buf)
++        DrawAttribs(l.verts);
++    else if (m_attrBuf != buf)
++        DrawAttribsFrom(buf, nullptr);
+ #else
+     glBindVertexArray(l.vao);
+ #endif
+@@ -2993,7 +3038,8 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                         "store %d cells written in place, %d new copies, %d waits for the GPU; "
+                         "blits %d in place, %d copied by vitaGL; %d descriptors pointed back; "
+                         "GL draws %.0f a frame; 3D %.0f draws a frame (new draw for depth %d, "
+-                        "class %d, texture %d, 2D between %d, layer end %d)\n",
++                        "class %d, texture %d, 2D between %d, layer end %d); 3D layers in a "
++                        "buffer %d, 3D draws not %d\n",
+                 m_st.draws, m_st.readbacks, m_st.tex_ups, m_st.blits, m_st.cache_hits,
+                 m_st.cache_misses, m_st.cache_inval, m_st.cache_full, m_st.cache_deferred,
+                 m_st.cache_stale, m_st.fast_batches, m_st.fast_tris, m_st.slow_batches,
+@@ -3002,7 +3048,7 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                 m_st.own_fixed, m_st.gl_draws / 60.0, m_st.layer_draws / 60.0,
+                 m_st.split[PC_GL_SPLIT_DEPTH], m_st.split[PC_GL_SPLIT_CLASS],
+                 m_st.split[PC_GL_SPLIT_TEXTURE], m_st.split[PC_GL_SPLIT_2D],
+-                m_st.split[PC_GL_SPLIT_END]);
++                m_st.split[PC_GL_SPLIT_END], m_st.layer_bufs, m_st.layer_client);
+         m_st = Stats{};
+         m_st.on = 1;
+     }
+@@ -3014,22 +3060,32 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+ 
+ void GlGpu::DrawAttribs(const GlVert *v)
+ {
+-    const char *b = (const char *)v;
+-    glBindBuffer(GL_ARRAY_BUFFER, 0);
++    DrawAttribsFrom(0, v);
++}
++
++void GlGpu::DrawAttribsFrom(GLuint buf, const GlVert *v)
++{
++    /* in a buffer, the attributes are offsets into it */
++    uintptr_t b = buf ? 0 : (uintptr_t)v;
++    m_attrBuf = buf;
++    glBindBuffer(GL_ARRAY_BUFFER, buf);
+     for (GLuint i = 0; i < 6; i++)
+         glEnableVertexAttribArray(i);
+-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(GVert), b + offsetof(GVert, x));
+-    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GVert), b + offsetof(GVert, r));
+-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(GVert), b + offsetof(GVert, u));
++    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(GVert), (const void *)(b + offsetof(GVert, x)));
++    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GVert), (const void *)(b + offsetof(GVert, r)));
++    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(GVert), (const void *)(b + offsetof(GVert, u)));
+     /* the words as whole-number floats, which the shader unpacks */
+-    glVertexAttribPointer(3, 2, GL_UNSIGNED_SHORT, GL_FALSE, sizeof(GVert), b + offsetof(GVert, clut));
+-    glVertexAttribPointer(4, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(GVert), b + offsetof(GVert, tw));
+-    glVertexAttribPointer(5, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(GVert), b + offsetof(GVert, uvr));
++    glVertexAttribPointer(3, 2, GL_UNSIGNED_SHORT, GL_FALSE, sizeof(GVert), (const void *)(b + offsetof(GVert, clut)));
++    glVertexAttribPointer(4, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(GVert), (const void *)(b + offsetof(GVert, tw)));
++    glVertexAttribPointer(5, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(GVert), (const void *)(b + offsetof(GVert, uvr)));
++    /* each attribute keeps the buffer it was given */
++    glBindBuffer(GL_ARRAY_BUFFER, 0);
+ }
+ 
+ /* positions (attribute 0) and, with uv, texture coordinates (attribute 2) after them */
+ void GlGpu::QuadAttribs(const float *v, int stride_floats, int uv)
+ {
++    m_attrBuf = 0;
+     glBindBuffer(GL_ARRAY_BUFFER, 0);
+     for (GLuint i = 1; i < 6; i++)
+         glDisableVertexAttribArray(i);
+@@ -3187,10 +3243,12 @@ void GlGpu::CacheDecode(int s)
+ 
+ /* each textured triangle's page to its slot (GlVert.clut = 0x8000 | slot); the number of textured
+  * triangles that keep the emulated lookup (no slot) */
+-int GlGpu::CacheVerts(GlVert *v, int n)
++int GlGpu::CacheVerts(GlVert *v, int n, uint32_t *before)
+ {
+     int slow = 0;
+     for (int i = 0; i + 2 < n; i += 3) {
++        if (before)
++            before[i / 3] = (uint32_t)slow;
+         if (v[i].clut & 0x8000)
+             continue;
+         uint64_t key = SlotKey(v[i]);
+@@ -3212,6 +3270,8 @@ int GlGpu::CacheVerts(GlVert *v, int n)
+         uint16_t w = (uint16_t)(0x8000 | s);
+         v[i].clut = v[i + 1].clut = v[i + 2].clut = w;
+     }
++    if (before)
++        before[n / 3] = (uint32_t)slow;
+     return slow;
+ }
+ 
+@@ -3234,6 +3294,7 @@ void GlGpu::CacheInvalidate(int x, int y, int w, int h)
+         if (!hit)
+             continue;
+         m_st.cache_inval++;
++        m_cacheGen++;
+         c.key = 0;
+     }
+     m_lastSlot = -1;
+@@ -3265,6 +3326,7 @@ void GlGpu::CacheCheck()
+                     m_slot[s].cy, y);
+         }
+         m_st.cache_stale++;
++        m_cacheGen++;
+         m_slot[s].key = 0;
+         m_lastSlot = -1;
+     }
+diff --git a/platform/pc/src/pc_render3d.cpp b/platform/pc/src/pc_render3d.cpp
+index 67166a3..3d6bae9 100644
+--- a/platform/pc/src/pc_render3d.cpp
++++ b/platform/pc/src/pc_render3d.cpp
+@@ -1206,30 +1206,123 @@ bool Renderer3D::ShadowMap(const ShadowSet *s, GlShadow *out)
+ /* ---------------------------------------------------------------------------------------------
+  * Drawing, while PC_DrawOT walks the ordering table */
+ 
+-/* The 16x16 cells of DrawUpto's grid a face covers on screen (x0, y0, x1, y1, inclusive): all of
+- * them for a face that reaches the near plane or isn't in view space */
+-void Renderer3D::FaceCells(const Batch *b, const Face *f, int c[4]) const
++namespace {
++
++/* a screen position's cell column (row: limit 31) */
++int GridCell(float p, int limit)
++{
++    return p < 0 ? 0 : p >= (float)(limit * 16 + 15) ? limit : (int)(p / 16);
++}
++
++} // namespace
++
++/* cells x0..x1, y0..y1 (inclusive) at depths lo..hi, into m_span */
++void Renderer3D::SpanBox(int x0, int y0, int x1, int y1, float lo, float hi)
+ {
++    for (int cy = y0; cy <= y1; cy++)
++        for (int cx = x0; cx <= x1; cx++)
++            m_span[m_nspan++] = CellZ{ (uint16_t)(cy * 64 + cx), lo, hi };
++}
++
++/* The cells of DrawUpto's grid a face covers on screen and its depth range in each (m_span): per
++ * triangle, the cells its outline reaches (a cell, widened by a pixel, against the triangle's
++ * edges), at the depths its plane has over the part of the cell inside the triangle's box (1/z is
++ * linear on the screen, so the box's corners bound it), within the triangle's corners' range. A
++ * face that reaches the near plane or isn't in view space has every cell at its whole range; one
++ * in a single cell, or with THPS_R3D_EXACT=0, its box at its whole range. */
++void Renderer3D::FaceSpans(const Batch *b, const Face *f)
++{
++    static constexpr int kMaxNv = 24;
+     const GlVert *v = &b->sv[f->first];
+-    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f, near = b->hither > 1 ? b->hither : 1;
+-    c[0] = c[1] = 0;
+-    c[2] = 63;
+-    c[3] = 31;
+-    if (!f->nv)
++    float near = b->hither > 1 ? b->hither : 1;
++    float sx[kMaxNv], sy[kMaxNv], x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
++    m_nspan = 0;
++    if (!f->nv || f->nv > kMaxNv) {
++        SpanBox(0, 0, 63, 31, f->zmin, f->zmax);
+         return;
++    }
+     for (int k = 0; k < f->nv; k++) {
+-        if (!(v[k].info & PC_GL_I_VIEW) || v[k].z < near)
++        if (!(v[k].info & PC_GL_I_VIEW) || v[k].z < near) {
++            SpanBox(0, 0, 63, 31, f->zmin, f->zmax);
+             return;
+-        float r = b->h / v[k].z, x = b->ofx + v[k].x * r, y = b->ofy + v[k].y * r;
+-        x0 = fminf(x0, x);
+-        y0 = fminf(y0, y);
+-        x1 = fmaxf(x1, x);
+-        y1 = fmaxf(y1, y);
++        }
++        float r = b->h / v[k].z;
++        sx[k] = b->ofx + v[k].x * r;
++        sy[k] = b->ofy + v[k].y * r;
++        x0 = fminf(x0, sx[k]);
++        y0 = fminf(y0, sy[k]);
++        x1 = fmaxf(x1, sx[k]);
++        y1 = fmaxf(y1, sy[k]);
++    }
++    int c0 = GridCell(x0, 63), c1 = GridCell(y0, 31), c2 = GridCell(x1, 63), c3 = GridCell(y1, 31);
++    if (!m_exact || f->nv % 3 || (c0 == c2 && c1 == c3)) {
++        SpanBox(c0, c1, c2, c3, f->zmin, f->zmax);
++        return;
++    }
++    for (int t = 0; t + 2 < f->nv; t += 3) {
++        const float px[3] = { sx[t], sx[t + 1], sx[t + 2] }, py[3] = { sy[t], sy[t + 1], sy[t + 2] };
++        const float w[3] = { 1 / v[t].z, 1 / v[t + 1].z, 1 / v[t + 2].z };
++        float zlo = fminf(v[t].z, fminf(v[t + 1].z, v[t + 2].z));
++        float zhi = fmaxf(v[t].z, fmaxf(v[t + 1].z, v[t + 2].z));
++        float bx0 = fminf(px[0], fminf(px[1], px[2])), bx1 = fmaxf(px[0], fmaxf(px[1], px[2]));
++        float by0 = fminf(py[0], fminf(py[1], py[2])), by1 = fmaxf(py[0], fmaxf(py[1], py[2]));
++        int t0 = GridCell(bx0 - 1, 63), t1 = GridCell(by0 - 1, 31);
++        int t2 = GridCell(bx1 + 1, 63), t3 = GridCell(by1 + 1, 31);
++        float ex1 = px[1] - px[0], ey1 = py[1] - py[0], ex2 = px[2] - px[0], ey2 = py[2] - py[0];
++        float det = ex1 * ey2 - ex2 * ey1;
++        if (m_nspan + (t2 - t0 + 1) * (t3 - t1 + 1) > kSpans) {
++            m_nspan = 0;
++            SpanBox(c0, c1, c2, c3, f->zmin, f->zmax);
++            return;
++        }
++        if (fabsf(det) < 1) {
++            /* edge-on (less than a pixel of area): its box at its range */
++            SpanBox(t0, t1, t2, t3, zlo, zhi);
++            continue;
++        }
++        /* w = 1/z = A x + B y + C */
++        float dw1 = w[1] - w[0], dw2 = w[2] - w[0];
++        float A = (dw1 * ey2 - dw2 * ey1) / det, B = (ex1 * dw2 - ex2 * dw1) / det;
++        float C = w[0] - A * px[0] - B * py[0];
++        float sg = det > 0 ? 1.0f : -1.0f;
++        for (int cy = t1; cy <= t3; cy++) {
++            float ry0 = (float)(cy * 16) - 1, ry1 = (float)(cy * 16 + 16) + 1;
++            for (int cx = t0; cx <= t2; cx++) {
++                float rx0 = (float)(cx * 16) - 1, rx1 = (float)(cx * 16 + 16) + 1;
++                /* outside an edge: all four corners of the cell on its outer side */
++                bool out = false;
++                for (int e = 0; e < 3 && !out; e++) {
++                    float ax = px[e], ay = py[e], dx = px[(e + 1) % 3] - ax, dy = py[(e + 1) % 3] - ay;
++                    float m = -1e30f;
++                    m = fmaxf(m, sg * (dx * (ry0 - ay) - dy * (rx0 - ax)));
++                    m = fmaxf(m, sg * (dx * (ry0 - ay) - dy * (rx1 - ax)));
++                    m = fmaxf(m, sg * (dx * (ry1 - ay) - dy * (rx0 - ax)));
++                    m = fmaxf(m, sg * (dx * (ry1 - ay) - dy * (rx1 - ax)));
++                    out = m < 0;
++                }
++                if (out)
++                    continue;
++                float qx0 = fmaxf(rx0, bx0), qx1 = fminf(rx1, bx1);
++                float qy0 = fmaxf(ry0, by0), qy1 = fminf(ry1, by1);
++                if (qx0 > qx1)
++                    qx0 = qx1 = (qx0 + qx1) * 0.5f;
++                if (qy0 > qy1)
++                    qy0 = qy1 = (qy0 + qy1) * 0.5f;
++                float wa = A * qx0 + B * qy0 + C, wb = A * qx1 + B * qy0 + C;
++                float wc = A * qx0 + B * qy1 + C, wd = A * qx1 + B * qy1 + C;
++                float wmin = fminf(fminf(wa, wb), fminf(wc, wd));
++                float wmax = fmaxf(fmaxf(wa, wb), fmaxf(wc, wd));
++                float lo = wmax > 0 ? fmaxf(zlo, 1 / wmax) : zlo;
++                float hi = wmin > 0 ? fminf(zhi, 1 / wmin) : zhi;
++                if (lo > hi) {
++                    lo = zlo;
++                    hi = zhi;
++                }
++                /* the float maths' error, towards the safe side */
++                m_span[m_nspan++] = CellZ{ (uint16_t)(cy * 64 + cx), lo - lo / 1024, hi + hi / 1024 };
++            }
++        }
+     }
+-    c[0] = x0 < 0 ? 0 : x0 >= 1023 ? 63 : (int)(x0 / 16);
+-    c[1] = y0 < 0 ? 0 : y0 >= 511 ? 31 : (int)(y0 / 16);
+-    c[2] = x1 < 0 ? 0 : x1 >= 1023 ? 63 : (int)(x1 / 16);
+-    c[3] = y1 < 0 ? 0 : y1 >= 511 ? 31 : (int)(y1 / 16);
+ }
+ 
+ /* Faces go to the GPU in the PS1's painter order, in draws of one class. Within a draw, colour is
+@@ -1239,7 +1332,8 @@ void Renderer3D::FaceCells(const Batch *b, const Face *f, int c[4]) const
+  * z - (z/256 + 2)); otherwise a new draw starts and the face is depth-tested against them. Order
+  * alone would repeat the PS1's sorting errors (objects showing through walls and floors whose
+  * far corner is further away). The test was once for the whole screen: 300-600 draws a frame
+- * in a level, each costly in vitaGL; now per 16x16 cell of a screen grid. */
++ * in a level, each costly in vitaGL; now per 16x16 cell of a screen grid, with each face's
++ * depth in that cell (FaceSpans) rather than over all of it. */
+ void Renderer3D::DrawUpto(uint32_t bucket, int last)
+ {
+     Batch *b = m_layer;
+@@ -1267,26 +1361,29 @@ void Renderer3D::DrawUpto(uint32_t bucket, int last)
+                 why = f->cls != cls ? PC_GL_SPLIT_CLASS : PC_GL_SPLIT_TEXTURE;
+                 break;
+             }
+-            int c[4], hit = 0;
+-            float behind = f->zmax - (f->zmax / 256 + 2);
+-            FaceCells(b, f, c);
+-            for (int cy = c[1]; cy <= c[3] && !hit; cy++)
+-                for (int cx = c[0]; cx <= c[2]; cx++)
+-                    if (m_gridGen[cy][cx] == m_gridCur && m_gridZ[cy][cx] < behind) {
+-                        hit = 1;
+-                        break;
+-                    }
++            int hit = 0;
++            FaceSpans(b, f);
++            for (int s = 0; s < m_nspan; s++) {
++                const CellZ &c = m_span[s];
++                int cy = c.cell >> 6, cx = c.cell & 63;
++                if (m_gridGen[cy][cx] == m_gridCur && m_gridZ[cy][cx] < c.hi - (c.hi / 256 + 2)) {
++                    hit = 1;
++                    break;
++                }
++            }
+             if (hit) {
+                 why = PC_GL_SPLIT_DEPTH;
+                 break;
+             }
+             if (cls == 0)
+-                for (int cy = c[1]; cy <= c[3]; cy++)
+-                    for (int cx = c[0]; cx <= c[2]; cx++)
+-                        if (m_gridGen[cy][cx] != m_gridCur || f->zmin < m_gridZ[cy][cx]) {
+-                            m_gridGen[cy][cx] = m_gridCur;
+-                            m_gridZ[cy][cx] = f->zmin;
+-                        }
++                for (int s = 0; s < m_nspan; s++) {
++                    const CellZ &c = m_span[s];
++                    int cy = c.cell >> 6, cx = c.cell & 63;
++                    if (m_gridGen[cy][cx] != m_gridCur || c.lo < m_gridZ[cy][cx]) {
++                        m_gridGen[cy][cx] = m_gridCur;
++                        m_gridZ[cy][cx] = c.lo;
++                    }
++                }
+             count += f->nv;
+         }
+         g_glGpu.LayerDraw(first, count, cls, hd, !(last && j == b->nf), why);
+@@ -1433,6 +1530,7 @@ void Renderer3D::Init(int gl)
+     m_nearDrop = getenv("THPS_R3D_NEARDROP") && atoi(getenv("THPS_R3D_NEARDROP"));
+     m_retailFade = getenv("THPS_R3D_RETAILFADE") && atoi(getenv("THPS_R3D_RETAILFADE"));
+     m_nclip = getenv("THPS_R3D_NCLIP") && atoi(getenv("THPS_R3D_NCLIP"));
++    m_exact = !(getenv("THPS_R3D_EXACT") && getenv("THPS_R3D_EXACT")[0] == '0');
+     if (m_native)
+         g_precise.Enable(true);
+     fprintf(stderr, "[r3d] 3D: %s\n", m_native ? "native" : "PS1 (THPS_RENDER3D=psx)");
+-- 
+2.53.0
+

@@ -1,0 +1,838 @@
+From bf9e0b90f4a4908f3e24b9bd28648a9ab1955a9c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 21:26:39 +0000
+Subject: [PATCH 1/3] Build the game for the PS Vita (THPS_ARCH=vita):
+ toolchain, runtime, VPK
+
+arm-vita-eabi from VITASDK: game code and data with -fno-short-enums (ARM EABI's
+1-byte enums broke CBruce's layout) and -fpcc-struct-return (egcs/MIPS aggregate
+returns), the runtime's Vita platform layer (ux0:data/THPS, a synced log, env.txt
+for the environment, no fault handlers), the R3000's division-by-zero results
+through wrapped EABI division helpers, and thps.vpk packaging. The renderer is
+still the OpenGL 3.3 one. psyq_sigmatch.py takes PSYQ_SIGDIR.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01NwhU758snL1NnmSbmmwENz
+---
+ platform/pc/dist/vita/sce_sys/icon0.png       | Bin 0 -> 2090 bytes
+ .../vita/sce_sys/livearea/contents/bg.png     | Bin 0 -> 3952 bytes
+ .../sce_sys/livearea/contents/startup.png     | Bin 0 -> 2277 bytes
+ .../sce_sys/livearea/contents/template.xml    |  11 ++
+ platform/pc/include/pc/platform.h             |   6 +
+ platform/pc/src/pc_main.cpp                   |  45 ++++++-
+ platform/pc/src/pc_platform.cpp               |  52 +++++++++
+ platform/pc/src/pc_vita.cpp                   | 110 ++++++++++++++++++
+ platform/pc/tools/build.py                    |  29 +++--
+ platform/pc/tools/link.py                     |  65 ++++++++++-
+ platform/pc/tools/toolchain.py                |  34 ++++--
+ tools/psyq_sigmatch.py                        |   2 +-
+ 12 files changed, 329 insertions(+), 25 deletions(-)
+ create mode 100644 platform/pc/dist/vita/sce_sys/icon0.png
+ create mode 100644 platform/pc/dist/vita/sce_sys/livearea/contents/bg.png
+ create mode 100644 platform/pc/dist/vita/sce_sys/livearea/contents/startup.png
+ create mode 100644 platform/pc/dist/vita/sce_sys/livearea/contents/template.xml
+ create mode 100644 platform/pc/src/pc_vita.cpp
+
+diff --git a/platform/pc/dist/vita/sce_sys/icon0.png b/platform/pc/dist/vita/sce_sys/icon0.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b45ce67f91ba6f75a86a73c46d0e2570b7eb403
+GIT binary patch
+literal 2090
+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
+P-wO!iiMT_Y6xsg(YA`?z
+
+literal 0
+HcmV?d00001
+
+diff --git a/platform/pc/dist/vita/sce_sys/livearea/contents/bg.png b/platform/pc/dist/vita/sce_sys/livearea/contents/bg.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..99a91ee97d1441f45953f7a0105a711caab12d3a
+GIT binary patch
+literal 3952
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/platform/pc/dist/vita/sce_sys/livearea/contents/startup.png b/platform/pc/dist/vita/sce_sys/livearea/contents/startup.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..e10fd2481bffd48a92101bf945dfffa3c0c6c594
+GIT binary patch
+literal 2277
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/platform/pc/dist/vita/sce_sys/livearea/contents/template.xml b/platform/pc/dist/vita/sce_sys/livearea/contents/template.xml
+new file mode 100644
+index 0000000..49c39e3
+--- /dev/null
++++ b/platform/pc/dist/vita/sce_sys/livearea/contents/template.xml
+@@ -0,0 +1,11 @@
++<?xml version="1.0" encoding="utf-8"?>
++
++<livearea style="a1" format-ver="01.00" content-rev="1">
++  <livearea-background>
++    <image>bg.png</image>
++  </livearea-background>
++
++  <gate>
++    <startup-image>startup.png</startup-image>
++  </gate>
++</livearea>
+diff --git a/platform/pc/include/pc/platform.h b/platform/pc/include/pc/platform.h
+index 593f199..2546741 100644
+--- a/platform/pc/include/pc/platform.h
++++ b/platform/pc/include/pc/platform.h
+@@ -26,6 +26,12 @@
+ #define PC_SEP "/"
+ #define PC_SEPC '/'
+ #define PC_EXE_NAME "thps"
++#ifdef __vita__
++/* PS Vita: everything the PC port keeps next to the executable or in the player's folder */
++#define PC_VITA_DIR "ux0:data/THPS"
++/* src/pc_vita.cpp: the settings (env.txt) and the log (thps.log), before the first log line */
++void PC_VitaLogOpen(void);
++#endif
+ #define PC_FSEEK fseeko
+ #define PC_FTELL ftello
+ #define _stricmp strcasecmp
+diff --git a/platform/pc/src/pc_main.cpp b/platform/pc/src/pc_main.cpp
+index 0197f11..c5553e4 100644
+--- a/platform/pc/src/pc_main.cpp
++++ b/platform/pc/src/pc_main.cpp
+@@ -9,11 +9,15 @@
+ #endif
+ #include <errno.h>
+ #include <pthread.h>
++#include <unistd.h>
++#ifdef __vita__
++#include <psp2/appmgr.h>
++#else
+ #include <signal.h>
+ #include <sys/mman.h>
+ #include <sys/syscall.h>
+ #include <ucontext.h>
+-#include <unistd.h>
++#endif
+ #endif
+ #include <stdarg.h>
+ #include <stdio.h>
+@@ -183,7 +187,16 @@ void *Runtime::GameHeap(uint32_t *size) {
+     return m_heap;
+ }
+ 
+-#ifndef _WIN32
++#ifdef __vita__
++/* the app's data folder, as everything else (PC_VITA_DIR) */
++const char *Runtime::UserDir() {
++    if (!m_userDir[0]) {
++        snprintf(m_userDir, sizeof m_userDir, "%s", PC_VITA_DIR);
++        os::MakeDirs(m_userDir);
++    }
++    return m_userDir;
++}
++#elif !defined(_WIN32)
+ /* $XDG_DATA_HOME/Neversoft/Tony Hawk's Pro Skater (~/.local/share/...) */
+ const char *Runtime::UserDir() {
+     char *dir = m_userDir;
+@@ -486,6 +499,12 @@ DWORD WINAPI WatchdogThread(LPVOID arg) {
+     g_diagnostics.WatchdogLoop();
+     return 0;
+ }
++#elif defined(__vita__)
++void *WatchdogThread(void *arg) {
++    (void)arg;
++    g_diagnostics.WatchdogLoop();
++    return NULL;
++}
+ #else
+ void CrashSignal(int sig, siginfo_t *si, void *ctx) { g_diagnostics.OnSignal(sig, si, ctx); }
+ 
+@@ -752,6 +771,11 @@ long Diagnostics::OnException(void *exceptionPointers) {
+ #endif
+ 
+ void Diagnostics::InstallCrashHandler() { AddVectoredExceptionHandler(1, CrashHandler); }
++#elif defined(__vita__)
++/* A user app gets no fault handler on the Vita: a crash ends in the system's crash dump
++ * (a .psp2dmp in ux0:data; xyzz/vita-parse-core reads it), the log up to there in thps.log. The
++ * game's leftover low-memory reads have no zero page to go to (README: Memory). */
++void Diagnostics::InstallCrashHandler() {}
+ #else
+ #ifdef PC_CPU_OTHER
+ /* No registers to read here, so no fixups: a fault is reported as it is. */
+@@ -868,6 +892,10 @@ void Diagnostics::DumpMainThread() {
+     ResumeThread((HANDLE)m_mainThread);
+ }
+ #endif
++#elif defined(__vita__)
++void Diagnostics::DumpMainThread() {
++    fprintf(stderr, "    (no backtrace: another thread's registers are not read on the Vita)\n");
++}
+ #else
+ void Diagnostics::OnDumpSignal(void *ctx) {
+ #ifdef PC_CPU_OTHER
+@@ -907,6 +935,12 @@ void Diagnostics::StartWatchdog() {
+                     FALSE, DUPLICATE_SAME_ACCESS);
+     CreateThread(NULL, 0, WatchdogThread, NULL, 0, NULL);
+ }
++#elif defined(__vita__)
++void Diagnostics::StartWatchdog() {
++    pthread_t th;
++    if (!pthread_create(&th, NULL, WatchdogThread, NULL))
++        pthread_detach(th);
++}
+ #else
+ void Diagnostics::StartWatchdog() {
+     struct sigaction sa;
+@@ -956,6 +990,9 @@ int Runtime::Main() {
+         snprintf(log, sizeof log, "%s\\thps.log", UserDir());
+         freopen(log, "w", stderr);
+     }
++#endif
++#ifdef __vita__
++    PC_VitaLogOpen();
+ #endif
+     PC_Log("Tony Hawk's Pro Skater %s", PC_Version);
+     g_diagnostics.InstallCrashHandler();
+@@ -995,6 +1032,10 @@ void Runtime::Restart() {
+     } else {
+         PC_Log("cannot start %s again (error %lu)", exe, GetLastError());
+     }
++#elif defined(__vita__)
++    SDL_Quit();
++    sceAppMgrLoadExec("app0:eboot.bin", NULL, NULL);
++    PC_Log("cannot start the game again");
+ #else
+     /* the window and audio go first: the new image would inherit their connections */
+     SDL_Quit();
+diff --git a/platform/pc/src/pc_platform.cpp b/platform/pc/src/pc_platform.cpp
+index 54db0f2..8fae671 100644
+--- a/platform/pc/src/pc_platform.cpp
++++ b/platform/pc/src/pc_platform.cpp
+@@ -8,7 +8,12 @@
+ #include <dirent.h>
+ #include <errno.h>
+ #include <fcntl.h>
++#ifdef __vita__
++#include <psp2/kernel/processmgr.h>
++#include <psp2/kernel/threadmgr.h>
++#else
+ #include <sys/mman.h>
++#endif
+ #include <sys/stat.h>
+ #include <time.h>
+ #include <unistd.h>
+@@ -176,6 +181,15 @@ bool RenameOver(const char *from, const char *to) {
+ 
+ void RemoveFile(const char *path) { unlink(path); }
+ 
++#ifdef __vita__
++/* every path the port makes on the Vita is absolute already (PC_VITA_DIR) */
++bool FullPath(const char *path, char *out, int n) {
++    if ((int)strlen(path) >= n)
++        return false;
++    strcpy(out, path);
++    return true;
++}
++#else
+ bool FullPath(const char *path, char *out, int n) {
+     char buf[PATH_MAX];
+     if (!realpath(path, buf) || (int)strlen(buf) >= n)
+@@ -183,7 +197,12 @@ bool FullPath(const char *path, char *out, int n) {
+     strcpy(out, buf);
+     return true;
+ }
++#endif
+ 
++#ifdef __vita__
++/* The app's data folder (PC_VITA_DIR): the disc image, Data/ and the saves (pc_main.cpp) */
++void ExeDir(char *out, int n) { snprintf(out, n, "%s", PC_VITA_DIR); }
++#else
+ void ExeDir(char *out, int n) {
+     ssize_t len = readlink("/proc/self/exe", out, (size_t)n - 1);
+     char *slash;
+@@ -196,6 +215,7 @@ void ExeDir(char *out, int n) {
+     if (slash)
+         *slash = 0;
+ }
++#endif
+ 
+ struct DirList::Impl {
+     DIR *d = nullptr;
+@@ -228,12 +248,43 @@ bool DirList::Next(DirEntry *e) {
+             continue;
+         snprintf(e->name, sizeof e->name, "%s", de->d_name);
+         e->isDir = S_ISDIR(st.st_mode);
++#ifdef __vita__
++        e->mtime = (long long)st.st_mtime * 1000000000LL;
++#else
+         e->mtime = (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
++#endif
+         return true;
+     }
+     return false;
+ }
+ 
++#ifdef __vita__
++int64_t ClockNow() { return (int64_t)sceKernelGetProcessTimeWide(); }
++
++int64_t ClockFreq() { return 1000000; }
++
++void SleepMs(unsigned ms) { sceKernelDelayThread(ms * 1000); }
++
++/* no desktop: the log has it (ux0:data/THPS/thps.log) */
++void ErrorBox(const char *msg) { (void)msg; }
++
++void Exit(int code) {
++    fflush(NULL);
++    (void)code;
++    sceKernelExitProcess(0);
++}
++
++/* no fault-free probe: the stack walks stop at a null or misaligned frame */
++bool Readable(const void *p, unsigned n) {
++    (void)n;
++    return p && !((uintptr_t)p & 3) && (uintptr_t)p >= 0x81000000u;
++}
++
++void *AllocExec(unsigned size) {
++    (void)size;
++    return NULL;
++}
++#else
+ int64_t ClockNow() {
+     struct timespec t;
+     clock_gettime(CLOCK_MONOTONIC, &t);
+@@ -279,6 +330,7 @@ void *AllocExec(unsigned size) {
+                    0);
+     return p == MAP_FAILED ? NULL : p;
+ }
++#endif /* __vita__ */
+ 
+ #endif
+ 
+diff --git a/platform/pc/src/pc_vita.cpp b/platform/pc/src/pc_vita.cpp
+new file mode 100644
+index 0000000..909961a
+--- /dev/null
++++ b/platform/pc/src/pc_vita.cpp
+@@ -0,0 +1,110 @@
++/* What only the PS Vita build has (THPS_ARCH=vita; see platform/pc/README.md, "PS Vita"): the
++ * process's stack and heap sizes, the log file, the settings file standing in for the
++ * environment, and the R3000's division results. */
++#ifdef __vita__
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <psp2/io/fcntl.h>
++#include <psp2/io/stat.h>
++#include <psp2/kernel/clib.h>
++
++#include "pc/platform.h"
++#include "pc_runtime.h"
++
++/* The game thread is the main thread: the PS1 code's stack frames are large, and the default
++ * is 256 KB. newlib's heap holds the game's 8 MB block and the runtime's buffers (decoded sound
++ * banks, the texture store, the extracted files' index); vitaGL keeps its own pools. */
++extern "C" {
++int sceUserMainThreadStackSize = 4 * 1024 * 1024;
++int _newlib_heap_size_user = 192 * 1024 * 1024;
++}
++
++namespace {
++
++SceUID g_logFd = -1;
++
++/* stderr's writes: straight to the file and synced, so a crash that takes the console down
++ * loses nothing written before it (stdio's buffers and the kernel's cache would) */
++int LogWrite(void *cookie, const char *buf, int n) {
++    (void)cookie;
++    if (g_logFd >= 0 && n > 0) {
++        sceIoWrite(g_logFd, buf, (SceSize)n);
++        sceIoSyncByFd(g_logFd, 0);
++    }
++    sceClibPrintf("%.*s", n, buf);   /* and to a debugger's console (vitacompanion, psp2shell) */
++    return n;
++}
++
++/* PC_VITA_DIR/env.txt: NAME=value lines, as the environment variables the PC build reads
++ * (THPS_TRACE=1, THPS_SCALE=1 ...); '#' starts a comment */
++void LoadEnv() {
++    char line[512];
++    FILE *f = fopen(PC_VITA_DIR "/env.txt", "r");
++    if (!f)
++        return;
++    while (fgets(line, sizeof line, f)) {
++        char *eq, *end = line + strlen(line);
++        while (end > line && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' '))
++            *--end = 0;
++        if (line[0] == '#' || !(eq = strchr(line, '=')))
++            continue;
++        *eq = 0;
++        setenv(line, eq + 1, 1);
++    }
++    fclose(f);
++}
++
++} // namespace
++
++/* Before the first log line (Runtime::Main): the data folder, the settings, stderr to
++ * PC_VITA_DIR/thps.log (stdout too: the game's debug output, THPS_TRACE). */
++void PC_VitaLogOpen(void) {
++    FILE *f;
++    sceIoMkdir("ux0:data", 0777);
++    sceIoMkdir(PC_VITA_DIR, 0777);
++    LoadEnv();
++    g_logFd = sceIoOpen(PC_VITA_DIR "/thps.log", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
++    f = funopen(NULL, NULL, LogWrite, NULL, NULL);
++    if (f) {
++        setvbuf(f, NULL, _IOLBF, 1024);
++        stderr = f;
++        stdout = f;
++    }
++}
++
++/* ---- the R3000's division --------------------------------------------------------------------
++ * The Cortex-A9 has no divide instruction: GCC calls the EABI helpers, and link.py wraps them
++ * (VITA_WRAP) so that a zero divisor gives what MIPS `div`/`divu` leave in LO and HI, as the
++ * x86 builds' FixDivide does from their fault handler: quotient (dividend < 0 ? 1 : -1) or all
++ * ones unsigned, remainder the dividend. libgcc's own answer would be 0. INT_MIN / -1 is
++ * INT_MIN, remainder 0, on both. The idivmod pair comes back in r0 (quotient) and r1
++ * (remainder): a 64-bit return. */
++extern "C" {
++int __real___aeabi_idiv(int, int);
++unsigned __real___aeabi_uidiv(unsigned, unsigned);
++uint64_t __real___aeabi_idivmod(int, int);
++uint64_t __real___aeabi_uidivmod(unsigned, unsigned);
++
++int __wrap___aeabi_idiv(int n, int d) { return d ? __real___aeabi_idiv(n, d) : n < 0 ? 1 : -1; }
++
++unsigned __wrap___aeabi_uidiv(unsigned n, unsigned d) {
++    return d ? __real___aeabi_uidiv(n, d) : 0xffffffffu;
++}
++
++uint64_t __wrap___aeabi_idivmod(int n, int d) {
++    if (!d)
++        return (uint64_t)(uint32_t)(n < 0 ? 1 : -1) | (uint64_t)(uint32_t)n << 32;
++    return __real___aeabi_idivmod(n, d);
++}
++
++uint64_t __wrap___aeabi_uidivmod(unsigned n, unsigned d) {
++    if (!d)
++        return 0xffffffffull | (uint64_t)n << 32;
++    return __real___aeabi_uidivmod(n, d);
++}
++} // extern "C"
++
++#endif /* __vita__ */
+diff --git a/platform/pc/tools/build.py b/platform/pc/tools/build.py
+index abe4d7e..764dc7f 100644
+--- a/platform/pc/tools/build.py
++++ b/platform/pc/tools/build.py
+@@ -39,25 +39,31 @@ GAME = os.path.join(ROOT, "game")      # the port's game code, data and headers
+ sys.path.insert(0, HERE)
+ import portsrc  # noqa: E402
+ import toolchain  # noqa: E402
+-from toolchain import MFLAG, OUT, SANITIZE, TOOLBIN, USCORE, WINDOWS, X64, tool  # noqa: E402,F401
++from toolchain import (I386, MFLAG, OUT, SANITIZE, TOOLBIN, USCORE, VITA, VITA_FLAGS,  # noqa: E402,F401
++                       WINDOWS, X64, tool)
+ 
+ GAME_CODE_END = 0x800858AC
+ CODE_END = 0x8009D0E0  # hand-written assembly rewritten in C (reimpl.tsv) lies past the game code
+ 
++# ARM EABI sizes an enum by its values (CBruce's 1-byte EPhysicsState): ints, as egcs on MIPS. Game
++# code and data only: VitaSDK's SDL2 and system headers keep the target's short enums
++VITA_GAME_FLAGS = ["-fno-short-enums"] if VITA else []
++
+ COMMON_FLAGS = [
+-    MFLAG, "-mno-ms-bitfields", "-O1", "-g",
++    MFLAG, "-O1", "-g",
+     "-fno-strict-aliasing", "-fwrapv", "-fno-delete-null-pointer-checks", "-fno-builtin",
+     "-fno-omit-frame-pointer", "-w", "-DPC_PORT=1",
+-    # outgoing args are stored, never pushed, so the only post-call %esp adjustment is the
+-    # aggregate-return one caller_pops_sret removes
+-    "-maccumulate-outgoing-args",
+     # plain char is unsigned in the PS1 ABI (egcs on MIPS): the decompiled code is verified with it
+     "-funsigned-char",
+     "-I", os.path.join(PC, "include", "psyq"), "-I", os.path.join(PC, "include"),
+     "-I", os.path.join(GAME, "include"),
+     "-include", os.path.join(PC, "include", "pc_game.h"),
+ ] + SANITIZE
+-if not X64:
++if not VITA:
++    # x86: GCC's bitfield layout (not MSVC's), and outgoing args are stored, never pushed, so the
++    # only post-call %esp adjustment is the aggregate-return one caller_pops_sret removes
++    COMMON_FLAGS += ["-mno-ms-bitfields", "-maccumulate-outgoing-args"]
++if I386:
+     # i386: cdecl for C++ members too (no thiscall: C code calls them with `this` first), 8-byte
+     # aligned doubles as everywhere else
+     COMMON_FLAGS += ["-mabi=sysv", "-malign-double"]
+@@ -72,7 +78,8 @@ if X64 and WINDOWS:
+ if not WINDOWS:
+     # ELF: no position independence, and (i386) small structs returned in registers as on Windows
+     # (the runtime is built the same way)
+-    COMMON_FLAGS += ["-fno-pic", "-fno-pie"] + ([] if X64 else ["-freg-struct-return"])
++    COMMON_FLAGS += ["-fno-pic", "-fno-pie"] + (["-freg-struct-return"] if I386 else [])
++COMMON_FLAGS += VITA_FLAGS + VITA_GAME_FLAGS
+ C_FLAGS = ["-std=gnu89", "-fpermissive", "-fcommon"]
+ # -fno-lifetime-dse: egcs destructors re-store their class's vptr (portsrc adds the store); g++ would
+ # drop stores into an object whose lifetime is ending, and those vptrs are read by the base dtors
+@@ -195,7 +202,8 @@ DATA_DIR = os.path.join(GAME, "data")
+ DATA_FLAGS = [MFLAG, "-std=gnu++98", "-O1", "-g", "-fno-common", "-fno-exceptions", "-fno-rtti",
+               "-w", "-funsigned-char", "-DPC_PORT=1", "-DGAME_DATA_TU", "-I", DATA_DIR,
+               "-I", os.path.join(GAME, "include"), "-I", os.path.join(PC, "include", "psyq"),
+-              "-I", os.path.join(PC, "include")] + ([] if WINDOWS else ["-fno-pic"]) + SANITIZE
++              "-I", os.path.join(PC, "include")] + ([] if WINDOWS else ["-fno-pic"]) + SANITIZE + \
++    VITA_FLAGS + VITA_GAME_FLAGS
+ 
+ 
+ def nm_symbols(obj):
+@@ -524,13 +532,14 @@ def build_tu(ctx, tu, flags_hash):
+     asm_text = open(asm, encoding="utf-8").read()
+     if is_cxx:
+         asm_text = split_virtual_defs(asm_text, classes)
+-    if not X64:
++    if I386:
+         asm_text = caller_pops_sret(asm_text)
+     # --- symbol resolution ----------------------------------------------------------------
+     res = Resolver(ctx, tu, is_cxx, classes)
+     asm2 = base + ".fix.s"
+     open(asm2, "w", encoding="utf-8").write(asm_text)
+-    rc, so, se = run([tool("as"), "--64" if X64 else "--32", asm2, "-o", base + ".raw.o"])
++    asflags = [] if VITA else ["--64" if X64 else "--32"]
++    rc, so, se = run([tool("as")] + asflags + [asm2, "-o", base + ".raw.o"])
+     if rc:
+         meta["errors"].append("assemble:\n" + se[-4000:])
+         json.dump(meta, open(meta_path, "w"))
+diff --git a/platform/pc/tools/link.py b/platform/pc/tools/link.py
+index c8d3bb0..48dc5a9 100644
+--- a/platform/pc/tools/link.py
++++ b/platform/pc/tools/link.py
+@@ -21,7 +21,7 @@ import zipfile
+ 
+ HERE = os.path.dirname(os.path.abspath(__file__))
+ sys.path.insert(0, HERE)
+-from toolchain import EXE_NAME, MFLAG, SANITIZE, USCORE, WINDOWS, X64, tool  # noqa: E402
++from toolchain import EXE_NAME, I386, MFLAG, SANITIZE, USCORE, VITA, VITA_FLAGS, VITASDK, WINDOWS, X64, tool  # noqa: E402
+ PC = os.path.dirname(HERE)
+ ROOT = os.path.dirname(os.path.dirname(PC))
+ 
+@@ -173,11 +173,59 @@ def package(out, toolbin, version=None):
+     print("packaged %s: %s" % (zpath, ", ".join(files)))
+ 
+ 
++# PS Vita: SDL2 (audio, controllers), vitaGL over SceGxm, and the system modules they import
++VITA_LIBS = ["-lSDL2", "-lvitaGL", "-lvitashark", "-lmathneon", "-lSceShaccCg_stub",
++             "-lSceShaccCgExt", "-ltaihen_stub", "-lSceKernelDmacMgr_stub", "-lSceIme_stub",
++             "-lSceGxm_stub", "-lSceDisplay_stub", "-lSceCtrl_stub", "-lSceAppMgr_stub",
++             "-lSceAppUtil_stub", "-lSceAudio_stub", "-lSceAudioIn_stub", "-lSceSysmodule_stub",
++             "-lSceIofilemgr_stub", "-lSceCommonDialog_stub", "-lSceTouch_stub", "-lSceHid_stub",
++             "-lSceMotion_stub", "-lScePower_stub", "-lSceProcessmgr_stub", "-lSceLibKernel_stub",
++             "-lSceKernelThreadMgr_stub", "-lSceRtc_stub", "-lpthread", "-lm"]
++# the MIPS division results (pc_vita.cpp: the EABI helpers GCC calls, as libgcc's but with the
++# R3000's answers for a zero divisor)
++VITA_WRAP = ["__aeabi_idiv", "__aeabi_uidiv", "__aeabi_idivmod", "__aeabi_uidivmod"]
++
++
++# the Vita app's title ID (4 letters, 5 digits) and LiveArea assets (dist/vita/sce_sys)
++VITA_TITLE_ID = "THPS00001"
++VITA_TITLE = "Tony Hawk's Pro Skater"
++
++
++def vita_package(out, elf, version):
++    """The installable app, build/vita/thps.vpk: eboot.bin (the ELF as a SELF) and sce_sys
++    (param.sfo, icon, LiveArea). The disc image and the game's data are not in it: they go to
++    ux0:data/THPS (README, PS Vita)."""
++    vbin = os.path.join(VITASDK, "bin")
++    velf = os.path.join(out, "thps.velf")
++    eboot = os.path.join(out, "eboot.bin")
++    sfo = os.path.join(out, "param.sfo")
++    run([os.path.join(vbin, "vita-elf-create"), elf, velf])
++    # -c: compressed, -s: safe homebrew (no kernel or extra permissions)
++    run([os.path.join(vbin, "vita-make-fself"), "-c", "-s", velf, eboot])
++    nums = re.match(r"(\d+)(?:\.(\d+))?", version or "")
++    app_ver = "%02d.%02d" % (int(nums.group(1)), int(nums.group(2) or 0)) if nums else "01.00"
++    run([os.path.join(vbin, "vita-mksfoex"), "-s", "TITLE_ID=" + VITA_TITLE_ID,
++         "-s", "APP_VER=" + app_ver, "-d", "ATTRIBUTE2=12", VITA_TITLE, sfo])
++    sce = os.path.join(PC, "dist", "vita", "sce_sys")
++    vpk = os.path.join(out, "thps.vpk")
++    cmd = [os.path.join(vbin, "vita-pack-vpk"), "-s", sfo, "-b", eboot]
++    for dirpath, _, files in os.walk(sce):
++        for f in sorted(files):
++            src = os.path.join(dirpath, f)
++            cmd += ["-a", "%s=%s" % (src, "sce_sys/" + os.path.relpath(src, sce).replace("\\", "/"))]
++    run(cmd + [vpk])
++    return vpk
++
++
+ def sdl_flags():
+     """(compile flags, link flags) for SDL2: the MinGW toolchain's on Windows; elsewhere the 32-bit
+     one pkg-config knows (THPS_SDL_CFLAGS / THPS_SDL_LIBS override)."""
+     if WINDOWS:
+         return None
++    if VITA:
++        # VitaSDK's SDL2 (with vitaGL for its OpenGL ES): its .pc file's flags, by hand
++        inc = os.path.join(VITASDK, "arm-vita-eabi", "include")
++        return ["-I" + inc, "-I" + os.path.join(inc, "SDL2")], VITA_LIBS
+     cflags, libs = os.environ.get("THPS_SDL_CFLAGS"), os.environ.get("THPS_SDL_LIBS")
+     if cflags is None or libs is None:
+         env = dict(os.environ)
+@@ -418,7 +466,9 @@ def runtime_flags(toolbin):
+         # absolute addresses (no PIE), the Windows ABI's small-struct returns (as the game code,
+         # build.py), 64-bit file offsets (disc images are bigger than 2 GB)
+         rt_flags += ["-fno-pic", "-fno-pie", "-D_FILE_OFFSET_BITS=64"] + \
+-            ([] if X64 else ["-freg-struct-return"])
++            (["-freg-struct-return"] if I386 else [])
++    if VITA:
++        rt_flags += VITA_FLAGS
+     return rt_flags, sdl_libs
+ 
+ 
+@@ -608,14 +658,23 @@ def link(ctx, metas, out, toolbin, release=False, version=None):
+             # a fixed base above 4 GB: stable addresses for symbolize.py, and a pointer cut to 32
+             # bits faults
+             ldflags += ["-Wl,--disable-dynamicbase", "-Wl,--image-base=0x140000000"]
++    elif VITA:
++        # everything is linked in; -q keeps the relocations vita-elf-create needs
++        libs = VITA_LIBS
++        ldflags = ["-Wl,-q"] + ["-Wl,--wrap=" + w for w in VITA_WRAP]
+     else:
+         # SDL2 and the C library are the system's; OpenGL comes through SDL. Not position
+         # independent: the image sits at its default 0x08048000
+         libs = sdl_libs + ["-lm", "-lpthread"]
+         # the runtime's C++ library is linked in (no libstdc++ version to match on the player's system)
+         ldflags = ["-no-pie", "-Wl,-z,noexecstack", "-static-libstdc++", "-static-libgcc"]
+-    run([gxx, MFLAG, "-g", "@" + rsp, "-o", exe] + SANITIZE + ldflags +
++    run([gxx, MFLAG] + VITA_FLAGS + ["-g", "@" + rsp, "-o", exe] + SANITIZE + ldflags +
+         ["-Wl," + os.path.join(gen, "psx_syms.ld").replace("\\", "/")] + libs)
++    if VITA:
++        vpk = vita_package(out, exe, ver)
++        print("linked %s (%s): %d game functions, %d stubs -> %s" % (exe, ver_full, len(game),
++                                                                    len(stubs), vpk))
++        return 0
+     if release:
+         # the debug info goes to thps.debug (for symbolize.py; not shipped)
+         dbg = os.path.join(out, "thps.debug")
+diff --git a/platform/pc/tools/toolchain.py b/platform/pc/tools/toolchain.py
+index 8a0905d..be40b1b 100644
+--- a/platform/pc/tools/toolchain.py
++++ b/platform/pc/tools/toolchain.py
+@@ -1,6 +1,6 @@
+ """The host toolchain: MinGW-w64 on Windows (PE/COFF), the system's GCC elsewhere (Linux: ELF).
+ 
+-THPS_ARCH: x86 (32-bit, the default) or x64 (64-bit).
++THPS_ARCH: x86 (32-bit, the default), x64 (64-bit) or vita (PS Vita: arm-vita-eabi from VITASDK).
+ THPS_MINGW: the MinGW bin folder (Windows; default C:\\msys64\\mingw32\\bin, x64:
+ C:\\msys64\\ucrt64\\bin). THPS_MINGW32: the 32-bit one, which the 64-bit checks use too (ptr64_check.py).
+ THPS_TOOLBIN: a folder with gcc, g++, as, nm, objcopy... (other systems; default: PATH).
+@@ -15,10 +15,17 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+ 
+ WINDOWS = sys.platform == "win32"
+ ARCH = os.environ.get("THPS_ARCH", "x86")
+-if ARCH not in ("x86", "x64"):
+-    raise SystemExit("THPS_ARCH must be x86 or x64")
++if ARCH not in ("x86", "x64", "vita"):
++    raise SystemExit("THPS_ARCH must be x86, x64 or vita")
+ X64 = ARCH == "x64"
+-if WINDOWS:
++# PS Vita: 32-bit ARM (Cortex-A9) with VitaSDK's cross toolchain, a VPK at the end
++VITA = ARCH == "vita"
++# i386: the cdecl/sret fixups (build.py caller_pops_sret, -mabi=sysv, -freg-struct-return)
++I386 = ARCH == "x86"
++VITASDK = os.environ.get("VITASDK", "/usr/local/vitasdk")
++if VITA:
++    TOOLBIN = TOOLBIN32 = TOOLBIN64 = os.path.join(VITASDK, "bin")
++elif WINDOWS:
+     # the 32-bit toolchain too: the 64-bit checks compare with the 32-bit objects (ptr64_check.py,
+     # tu_equiv.py)
+     TOOLBIN32 = os.environ.get("THPS_MINGW32", r"C:\msys64\mingw32\bin")
+@@ -26,24 +33,33 @@ if WINDOWS:
+     TOOLBIN = os.environ.get("THPS_MINGW", TOOLBIN64 if X64 else TOOLBIN32)
+ else:
+     TOOLBIN = TOOLBIN32 = TOOLBIN64 = os.environ.get("THPS_TOOLBIN", "")
+-EXE_SUFFIX = ".exe" if WINDOWS else ""
++EXE_SUFFIX = ".exe" if WINDOWS and not VITA else ""
+ EXE_NAME = "thps" + EXE_SUFFIX
+ OUT = os.environ.get("THPS_BUILD_DIR") or os.path.join(
+-    ROOT, "build", ("pc" if WINDOWS else "pc-linux").replace("pc", "pc64" if X64 else "pc", 1))
++    ROOT, "build", "vita" if VITA else
++    ("pc" if WINDOWS else "pc-linux").replace("pc", "pc64" if X64 else "pc", 1))
+ # assembler names of C symbols: 32-bit PE prefixes them with '_', x64 PE and ELF don't
+-USCORE = "_" if WINDOWS and not X64 else ""
+-# the compiler flag for the word size
+-MFLAG = "-m64" if X64 else "-m32"
++USCORE = "_" if WINDOWS and I386 else ""
++# the compiler flag for the word size (Vita: the CPU; its ABI is 32-bit already)
++MFLAG = "-m64" if X64 else "-mcpu=cortex-a9" if VITA else "-m32"
+ # THPS_ASAN=1: AddressSanitizer on the game code, its data and the runtime (Linux; a separate
+ # THPS_BUILD_DIR): reads past a global's end, use after free...
+ SANITIZE = ["-fsanitize=address", "-fsanitize-recover=address"] if os.environ.get("THPS_ASAN") else []
+ PTR = 8 if X64 else 4
++# PS Vita: the Cortex-A9's VFPv3/NEON, hard-float as VitaSDK's libraries, and every aggregate
++# returned through the hidden pointer in r0, as egcs on MIPS does (AAPCS returns one of 4 bytes or
++# less in r0), so the decomp's `T f(a)` and `void f(T *, a)` stay one call. Game code, its data and
++# the runtime alike (build.py, link.py)
++VITA_FLAGS = ["-mfpu=neon", "-mfloat-abi=hard", "-mthumb", "-fpcc-struct-return",
++              "-DPC_VITA=1"] if VITA else []
+ 
+ 
+ def tool(name, bits=None):
+     """A toolchain program: gcc, g++, as, nm, objcopy, c++filt, addr2line, objdump... (bits=32:
+     the 32-bit toolchain's, whatever THPS_ARCH is)"""
+     d = {32: TOOLBIN32, 64: TOOLBIN64}.get(bits, TOOLBIN)
++    if VITA:
++        return os.path.join(d, "arm-vita-eabi-" + name)
+     if WINDOWS:
+         return os.path.join(d, name + ".exe")
+     return os.path.join(d, name) if d else name
+diff --git a/tools/psyq_sigmatch.py b/tools/psyq_sigmatch.py
+index 16b3139..e066a67 100644
+--- a/tools/psyq_sigmatch.py
++++ b/tools/psyq_sigmatch.py
+@@ -8,7 +8,7 @@ usage: python tools/psyq_sigmatch.py [--exe extern/thps1_retail/SLUS_008.60]
+ """
+ import argparse, glob, json, os, re, struct
+ 
+-SIGDIR = r"D:\Tools\ghidra\Ghidra\Extensions\ghidra_psx_ldr\data\psyq"
++SIGDIR = os.environ.get("PSYQ_SIGDIR", r"D:\Tools\ghidra\Ghidra\Extensions\ghidra_psx_ldr\data\psyq")
+ LIB_START = 0x800858AC  # first byte after the game code (see decomp/functions.tsv)
+ 
+ 
+-- 
+2.43.0
+

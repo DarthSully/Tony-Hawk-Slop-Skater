@@ -1,0 +1,489 @@
+From 509681277dd93480107d19bd75e925f60b5ddedf Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Wed, 28 Oct 2026 10:35:53 +0300
+Subject: [PATCH] Vita: opaque 3D in one pass (no-discard program where no
+ texel is transparent), uncapped decoding after loading screens, 720x408 by
+ default
+
+- Batched opaque faces: one pass at the true depth with depth writes (THPS_R3D_PREPASS=1: the
+  depth pass then colour of t20-t23). Faces whose texels (8x8 cells of the cache slot, over the
+  span GlVert.uvr gives) hold no transparent one, and untextured faces, go through a program
+  with no discard, drawn without blending and with alpha (the mask bit) kept: with discard in a
+  program the GPU shades every pixel of every face. The program is gl_draw_fast_fs without its
+  three discards, compiled last; rejected, those faces keep the fast program
+  (THPS_GL_NODISCARD=0: not built). [gl] line: opaque batched tris without / with discard.
+- Texture decoding: the first 8 decodes a frame were outside the THPS_GL_DECODEMS budget, and at
+  a level's start each took ~7 ms (56 ms frames, with the GPU on the per-pixel lookup of the pages
+  not yet decoded: swap ~260 ms). Now 2 are free. The 30 frames after a stretch of 30 without 3D
+  (loading screens, menus) decode every page they draw (THPS_GL_WARMFRAMES=n, 0 off), logged
+  with the pages and time it took.
+- 720x408 by default (t23: GPU ~50 ms a frame at 960x544, ~25 at 720x408); THPS_VITA_RES=960x544
+  for the full resolution. Smoothing stays on (a filtered present, not the cost).
+- The program cache logs why a saved program wasn't taken or saved (t23 compiled all 4 at
+  every start).
+---
+ platform/pc/README.md           |   5 +-
+ platform/pc/include/pc/gl_gpu.h |  23 +++-
+ platform/pc/src/pc_gpu_gl.cpp   | 204 ++++++++++++++++++++++++++++----
+ platform/pc/src/pc_vitagfx.cpp  |   4 +-
+ 4 files changed, 206 insertions(+), 30 deletions(-)
+
+diff --git a/platform/pc/README.md b/platform/pc/README.md
+index 6fbf497..953226b 100644
+--- a/platform/pc/README.md
++++ b/platform/pc/README.md
+@@ -561,7 +561,10 @@ window, `THPS_FAST`, `THPS_DETERMINISTIC`) never wait for a display.
+ | `THPS_RENDER3D=psx` | OpenGL: draw the world and models through the PS1 path (default `native`, see Graphics) |
+ | `THPS_PGXP=0` | OpenGL: both of the above off (`THPS_GL_PRECISE=0 THPS_GL_PERSPECTIVE=0`) |
+ | `THPS_R3D_BATCH=0` | OpenGL ES (Vita): a native 3D layer's faces drawn in the PS1's order, split where they overlap (before t20); default: each run of faces between 2D primitives in one depth pass and one colour pass for the opaque faces, then the semi-transparent ones in order |
+-| `THPS_VITA_RES=WxH` | Vita: screens drawn at most 512x240, 720x408 or 960x544 (default), scaled up to the screen |
++| `THPS_VITA_RES=WxH` | Vita: screens drawn at most 512x240, 720x408 (default, t24) or 960x544, scaled up to the screen |
++| `THPS_R3D_PREPASS=1` | OpenGL ES (Vita), batched 3D: the opaque faces depth first, then colour with the decal tolerance (t20-t23); default: one pass at the true depth |
++| `THPS_GL_NODISCARD=0` | OpenGL ES (Vita), batched 3D: no separate no-discard, no-blend program for opaque faces with no transparent texel under them |
++| `THPS_GL_WARMFRAMES=n` | OpenGL ES: frames after a stretch without 3D (loading screens, menus) that decode every texture page they draw, uncapped (default 30, 0 off) |
+ | `THPS_VITA_FPS=30` | Vita: every other frame shown (the game still runs at 60) |
+ | `THPS_GL_FBCACHE=0` | OpenGL: bind the target framebuffer and set the viewport at every draw again (before t22); default: only when they change |
+ | `THPS_GL_DECODEMS=n` | OpenGL ES: texture cache pages decoded a frame: 8, then more while the frame's decoding took under n ms (default 25; before t22: 8 only) |
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index e7be80d..c5aa240 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -250,6 +250,7 @@ class GlGpu {
+         int gl_draws, layer_draws, split[PC_GL_SPLITS];
+         int layer_bufs, layer_client;   /* 3D layers drawn from a buffer; 3D draws not */
+         int layer_batches;              /* t20: 3D draws made by LayerBatch */
++        int solid_tris, cut_tris;       /* t24: LayerBatch opaque triangles without / with discard */
+     };
+ 
+     /* targets */
+@@ -370,13 +371,29 @@ class GlGpu {
+     DrawLocs m_locSlow = {}, m_locFast = {};
+     /* t22: LayerBatch's index lists (opaque, semi-transparent, subtractive). t23: vertex numbers
+      * of the layer's buffer, its attributes at offset 0 (see LayerBatch) */
+-    std::vector<uint16_t> m_batchIdx[3];
++    std::vector<uint16_t> m_batchIdx[4];   /* t24: [3] opaque without discard */
+     bool m_batchOff = false;
+     int m_batchLogFrames = 0, m_batchLogged = 0;   /* t23: [r3d] batch lines, the first frames */
+     long long m_decodeUs = 0, m_decodeBudgetUs = 25000;   /* this frame's decoding; THPS_GL_DECODEMS */
+     float m_proj[4] = {};
+-    int m_projSet = 0, m_projApplied[2] = {};
+-    void UseDraw(int fast);
++    int m_projSet = 0, m_projApplied[3] = {};
++    /* solid: the no-discard program (t24, opaque faces over texels none of which is transparent) */
++    void UseDraw(int fast, int solid = 0);
++    /* t24: the fast program with no discard (drawn without blending, alpha kept), for opaque
++     * faces no texel of which is transparent: the GPU can then skip hidden pixels */
++    GLuint m_drawProgSolid = 0;
++    DrawLocs m_locSolid = {};
++    bool m_prepass = false;       /* THPS_R3D_PREPASS=1: t20-t23 opaque depth pass, then colour */
++    /* t24: per slot, 32 rows of 32 bits: an 8x8 cell of texels holds a transparent one */
++    uint32_t m_slotTransp[128][32] = {};
++    bool TriSolid(const GlVert *v) const;
++    void TranspRow(int s, int y, const uint32_t *row);
++    void SolidProgram();
++    /* t24: frames after a stretch without 3D (a loading screen or menu) decode every page they
++     * draw (THPS_GL_WARMFRAMES, default 30; 0 off) */
++    uint32_t m_last3D = 0, m_warmUntil = 0;
++    int m_warmFrames = 30, m_warmDecodes = 0;
++    long long m_warmUs = 0;
+     CacheSlot m_slot[kCacheSlots] = {};
+     uint32_t m_frameNo = 1;
+     int m_lastSlot = -1;
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index 6f1465f..8adec40 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -248,8 +248,12 @@ GLuint ProgramLoad(const char *path, const char *vs, const char *fs)
+     }
+     free(data);
+     fclose(f);
+-    if (!p)
++    if (!p) {
++        /* t24: every start compiled all 4 (t23): say why a saved one wasn't taken */
++        fprintf(stderr, "[gl] program cache: %s not taken (header/size/link/locations), compiled\n",
++                path);
+         remove(path);   /* (stale or foreign: compiled and saved again) */
++    }
+     else if (s_progPathN < 8)
+         snprintf(s_progPaths[s_progPathN++], sizeof s_progPaths[0], "%s", path);
+     return p;
+@@ -259,8 +263,10 @@ void ProgramSave(GLuint p, const char *path, const char *vs, const char *fs)
+ {
+     GLint len = 0;
+     glGetProgramiv(p, GL_PROGRAM_BINARY_LENGTH, &len);
+-    if (len <= 0 || len > (8 << 20))
++    if (len <= 0 || len > (8 << 20)) {
++        fprintf(stderr, "[gl] program cache: not saved, binary length %d\n", (int)len);
+         return;
++    }
+     void *data = malloc((size_t)len);
+     if (!data)
+         return;
+@@ -281,6 +287,11 @@ void ProgramSave(GLuint p, const char *path, const char *vs, const char *fs)
+         fclose(f);
+         if (!ok)
+             remove(path);
++        fprintf(stderr, "[gl] program cache: %s %s (%d bytes)\n", path, ok ? "saved" : "NOT saved",
++                (int)got);
++    } else {
++        fprintf(stderr, "[gl] program cache: %s not saved (%s)\n", path,
++                got > 0 ? "cannot create" : "no binary");
+     }
+     free(data);
+ }
+@@ -884,6 +895,13 @@ int GlGpu::Init(int fixed_scale, int out_w, int out_h)
+             glUseProgram(m_drawProg);
+         }
+     }
++    {
++        const char *pp = getenv("THPS_R3D_PREPASS");
++        m_prepass = pp && atoi(pp) != 0;
++        const char *wf = getenv("THPS_GL_WARMFRAMES");
++        m_warmFrames = wf ? atoi(wf) : 30;
++    }
++    SolidProgram();
+     AtlasUniforms();
+     fprintf(stderr, "[gl] texture cache: %s%s\n",
+             m_cacheOn ? "on (128 pages of 256x256, THPS_GL_TEXCACHE=0 turns it off)" : "off",
+@@ -2404,6 +2422,16 @@ void GlGpu::LayerBegin(const GlLayerParams *lp, const GlVert *v, int nv)
+     l.verts = l.src = v;
+     l.buf = 0;
+     l.nv = nv;
++    if (m_cacheOn && m_warmFrames > 0 && (!m_last3D || m_frameNo - m_last3D > 30) &&
++        m_frameNo >= m_warmUntil) {
++        m_warmUntil = m_frameNo + (uint32_t)m_warmFrames;
++        m_warmDecodes = 0;
++        m_warmUs = 0;
++        fprintf(stderr, "[gl] 3D after %u frames without: every page decoded for %d frames "
++                        "(THPS_GL_WARMFRAMES)\n",
++                m_last3D ? m_frameNo - m_last3D : m_frameNo, m_warmFrames);
++    }
++    m_last3D = m_frameNo;
+     if (m_cacheOn && nv > 0 && nv <= MAX_VERTS) {
+         memcpy(m_layerConv, v, (size_t)nv * sizeof(GVert));
+         l.verts = m_layerConv;
+@@ -2476,7 +2504,7 @@ void GlGpu::LayerDraw(int first, int count, int cls, uint16_t hd, int depth, int
+     if (!m_projSet || memcmp(proj, m_proj, sizeof proj)) {
+         memcpy(m_proj, proj, sizeof proj);
+         m_projSet = 1;
+-        m_projApplied[0] = m_projApplied[1] = 0;
++        m_projApplied[0] = m_projApplied[1] = m_projApplied[2] = 0;
+     }
+     UseDraw(slow_tris == 0);
+     if (slow_tris == 0 && m_drawProgFast) {
+@@ -2586,8 +2614,11 @@ bool GlGpu::LayerBatch(int first, int count, int cls, int why)
+      * unsigned short); from client memory vitaGL copies from the pointer up to the highest
+      * index, so there they start at first and the indices count from it. */
+     int base = buf ? 0 : first;
+-    for (int c = 0; c < 3; c++)
++    for (int c = 0; c < 4; c++)
+         m_batchIdx[c].clear();
++    /* t24: opaque faces that cannot show a transparent texel go to list 3 (the no-discard
++     * program, one pass) */
++    bool solid_ok = m_drawProgSolid && !m_prepass && slow_tris == 0;
+     const char *bad = nullptr;
+     int maxIdx = -1, nverts = buf ? l.nv : count;
+     if (count % 3)
+@@ -2601,25 +2632,28 @@ bool GlGpu::LayerBatch(int first, int count, int cls, int why)
+         int c = !(info & PC_GL_I_SEMI) ? 0 : ((info >> 5) & 3) == 2 ? 2 : 1;
+         if (!(cls & 1 << c))
+             c = 0;   /* (never: DrawUpto gave the classes present) */
++        if (c == 0 && solid_ok && TriSolid(&l.verts[t]))
++            c = 3;
+         m_batchIdx[c].push_back((uint16_t)(t - base));
+         m_batchIdx[c].push_back((uint16_t)(t + 1 - base));
+         m_batchIdx[c].push_back((uint16_t)(t + 2 - base));
+         maxIdx = t + 2 - base;
+     }
+-    const std::vector<uint16_t> &op = m_batchIdx[0], &se = m_batchIdx[1], &sb = m_batchIdx[2];
++    const std::vector<uint16_t> &op = m_batchIdx[0], &se = m_batchIdx[1], &sb = m_batchIdx[2],
++                                &so = m_batchIdx[3];
+     if (!bad && maxIdx >= nverts)
+         bad = "highest index >= vertex count";
+-    if (!bad && (int)(op.size() + se.size() + sb.size()) != count)
++    if (!bad && (int)(op.size() + se.size() + sb.size() + so.size()) != count)
+         bad = "index count != vertex count";
+     if (m_batchLogFrames == 0)
+         m_batchLogFrames = (int)m_frameNo;
+     if (bad || ((int)m_frameNo - m_batchLogFrames < 3 && m_batchLogged < 48)) {
+         m_batchLogged++;
+         fprintf(stderr, "[r3d] batch frame %u: vertices %d..%d of %d (%s, base %d), opaque tris "
+-                "%d, semi %d, subtractive %d, indices %d, highest %d of %d%s%s\n",
++                "%d (+%d without discard), semi %d, subtractive %d, indices %d, highest %d of %d%s%s\n",
+                 (unsigned)m_frameNo, first, first + count - 1, l.nv, buf ? "buffer" : "client",
+-                base, (int)op.size() / 3, (int)se.size() / 3, (int)sb.size() / 3,
+-                (int)(op.size() + se.size() + sb.size()), maxIdx, nverts,
++                base, (int)op.size() / 3, (int)so.size() / 3, (int)se.size() / 3, (int)sb.size() / 3,
++                (int)(op.size() + se.size() + sb.size() + so.size()), maxIdx, nverts,
+                 bad ? ": CHECK FAILED, batching off for this run of the game: " : "",
+                 bad ? bad : "");
+     }
+@@ -2638,7 +2672,7 @@ bool GlGpu::LayerBatch(int first, int count, int cls, int why)
+     if (!m_projSet || memcmp(proj, m_proj, sizeof proj)) {
+         memcpy(m_proj, proj, sizeof proj);
+         m_projSet = 1;
+-        m_projApplied[0] = m_projApplied[1] = 0;
++        m_projApplied[0] = m_projApplied[1] = m_projApplied[2] = 0;
+     }
+     UseDraw(slow_tris == 0);
+     if (slow_tris == 0 && m_drawProgFast) {
+@@ -2662,12 +2696,26 @@ bool GlGpu::LayerBatch(int first, int count, int cls, int why)
+         ts[i]->Use();
+         if (!ts[i]->Scissor(l.clip[0], l.clip[1], l.clip[2], l.clip[3], l.wide))
+             continue;
+-        DrawUniforms(ts[i]);
+         int n = 0;
+-        if (!op.empty()) {
+-            /* the opaque faces' true depth (texels the shader discards write none), then
+-             * their colour where it is within the tolerance of the nearest: a decal over its
+-             * floor passes, and the later of the two (the PS1's order) is the one left */
++        if (!so.empty()) {
++            /* t24: no discard, no blending (alpha, the mask bit, kept): true depth, one pass */
++            UseDraw(1, 1);
++            DrawUniforms(ts[i]);
++            glDisable(GL_BLEND);
++            DPass(1);
++            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
++            glDepthMask(GL_TRUE);
++            glDrawElements(GL_TRIANGLES, (GLsizei)so.size(), GL_UNSIGNED_SHORT, so.data());
++            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++            UseDraw(slow_tris == 0);
++            n++;
++        }
++        DrawUniforms(ts[i]);
++        if (!op.empty() && m_prepass) {
++            /* THPS_R3D_PREPASS=1 (t20-t23): the opaque faces' true depth (texels the shader
++             * discards write none), then their colour where it is within the tolerance of the
++             * nearest: a decal over its floor passes, and the later of the two (the PS1's
++             * order) is the one left */
+             SetBlend(0);
+             DPass(1);
+             glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+@@ -2678,8 +2726,17 @@ bool GlGpu::LayerBatch(int first, int count, int cls, int why)
+             DPass(0);
+             glDrawElements(GL_TRIANGLES, (GLsizei)op.size(), GL_UNSIGNED_SHORT, op.data());
+             n += 2;
++        } else if (!op.empty()) {
++            /* t24: one pass at the true depth, written as it goes (the GPU's own hidden surface
++             * removal does the rest); decals within one run lose the 1/256 tolerance */
++            SetBlend(0);
++            DPass(1);
++            glDepthMask(GL_TRUE);
++            glDrawElements(GL_TRIANGLES, (GLsizei)op.size(), GL_UNSIGNED_SHORT, op.data());
++            n++;
+         }
+         glDepthMask(GL_FALSE);
++        DPass(0);
+         if (!se.empty()) {
+             /* semi-transparent faces after every opaque one, in their own order */
+             SetBlend(0);
+@@ -2697,6 +2754,8 @@ bool GlGpu::LayerBatch(int first, int count, int cls, int why)
+         m_st.draws++;
+         m_st.gl_draws += n;
+     }
++    m_st.solid_tris += (int)so.size() / 3;
++    m_st.cut_tris += (int)op.size() / 3;
+     if (!buf)
+         m_attrBuf = 0;   /* (client memory: bound again at the next draw) */
+     glDisable(GL_DEPTH_TEST);
+@@ -3310,6 +3369,9 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+ #endif
+ #ifdef PC_GLES
+     m_frameNo++;
++    if (m_warmUntil && m_frameNo == m_warmUntil)
++        fprintf(stderr, "[gl] 3D start window over: %d pages decoded in %.0f ms\n", m_warmDecodes,
++                m_warmUs / 1000.0);
+ #endif
+ #ifdef __vita__
+     OwnCheck();
+@@ -3323,7 +3385,8 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                         "blits %d in place, %d copied by vitaGL; %d descriptors pointed back; "
+                         "GL draws %.0f a frame; 3D %.0f draws a frame (new draw for depth %d, "
+                         "class %d, texture %d, 2D between %d, layer end %d); 3D layers in a "
+-                        "buffer %d, 3D draws not %d, batched %d; framebuffer binds %.0f a frame\n",
++                        "buffer %d, 3D draws not %d, batched %d; framebuffer binds %.0f a frame; opaque batched tris %d without discard, "
++                        "%d with\n",
+                 m_st.draws, m_st.readbacks, m_st.tex_ups, m_st.blits, m_st.cache_hits,
+                 m_st.cache_misses, m_st.cache_inval, m_st.cache_full, m_st.cache_deferred,
+                 m_st.cache_stale, m_st.fast_batches, m_st.fast_tris, m_st.slow_batches,
+@@ -3333,7 +3396,7 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+                 m_st.split[PC_GL_SPLIT_DEPTH], m_st.split[PC_GL_SPLIT_CLASS],
+                 m_st.split[PC_GL_SPLIT_TEXTURE], m_st.split[PC_GL_SPLIT_2D],
+                 m_st.split[PC_GL_SPLIT_END], m_st.layer_bufs, m_st.layer_client,
+-                m_st.layer_batches, s_fbBinds / 60.0);
++                m_st.layer_batches, s_fbBinds / 60.0, m_st.solid_tris, m_st.cut_tris);
+         s_fbBinds = 0;
+         m_st = Stats{};
+         m_st.on = 1;
+@@ -3386,11 +3449,13 @@ void GlGpu::QuadAttribs(const float *v, int stride_floats, int uv)
+ 
+ /* the draw program for a batch (fast: every textured triangle has a slot), its uniforms in
+  * m_drawU*, and the layer projection it hasn't had yet */
+-void GlGpu::UseDraw(int fast)
++void GlGpu::UseDraw(int fast, int solid)
+ {
+     int f = fast && m_drawProgFast ? 1 : 0;
+-    glUseProgram(f ? m_drawProgFast : m_drawProg);
+-    const DrawLocs &l = f ? m_locFast : m_locSlow;
++    if (f && solid && m_drawProgSolid)
++        f = 2;
++    glUseProgram(f == 2 ? m_drawProgSolid : f ? m_drawProgFast : m_drawProg);
++    const DrawLocs &l = f == 2 ? m_locSolid : f ? m_locFast : m_locSlow;
+     m_drawUPass = l.pass;
+     m_drawUDpass = l.dpass;
+     m_drawUProj = l.proj;
+@@ -3437,7 +3502,11 @@ int GlGpu::CacheSlotFor(uint64_t key)
+     /* t22: past the first 8, more while the frame's decoding took under THPS_GL_DECODEMS (default
+      * 25): a triangle without a slot takes the per-pixel lookup, which at 960x544 cost loading
+      * screens and menus 300-500 ms a frame (t21) */
+-    if (m_decodesLeft <= 0 && m_decodeUs >= m_decodeBudgetUs) {
++    /* t24: the first 8 were free of the budget, and at a level's start (the GPU busy with the
++     * per-pixel lookup of the pages not decoded yet) each took ~7 ms: 56 ms frames. Now 2 are
++     * free, then the budget; and the frames after a stretch without 3D decode all they draw */
++    bool warm = m_frameNo < m_warmUntil;
++    if (!warm && m_decodesLeft <= kDecodesPerFrame - 2 && m_decodeUs >= m_decodeBudgetUs) {
+         m_st.cache_deferred++;
+         return -1;
+     }
+@@ -3448,10 +3517,15 @@ int GlGpu::CacheSlotFor(uint64_t key)
+     SlotFill(m_slot[victim], key);
+     CacheDecode(victim);
+ #ifdef __vita__
+-    m_decodeUs += sceKernelGetProcessTimeWide() - dt0;
++    long long dus = sceKernelGetProcessTimeWide() - dt0;
+ #else
+-    m_decodeUs += 2500;
++    long long dus = 2500;
+ #endif
++    m_decodeUs += dus;
++    if (warm) {
++        m_warmDecodes++;
++        m_warmUs += dus;
++    }
+     m_st.cache_misses++;
+     return m_lastSlot = victim;
+ }
+@@ -3471,9 +3545,84 @@ void GlGpu::SlotFill(CacheSlot &c, uint64_t key)
+     c.cw = depth == 0 ? 16 : depth == 1 ? 256 : 0;
+ }
+ 
++/* t24: the fast program with no discard at all, for LayerBatch's opaque faces no texel of which is
++ * transparent (TriSolid), drawn without blending: a program that can discard makes the GPU shade
++ * every pixel of every face, hidden or not. Its source is gl_draw_fast_fs without the three
++ * discards (the vertex shader is untouched). Compiled after every other program (t20: after a
++ * rejected one vitaGL's compiler failed the rest): rejected, the faces keep the fast program.
++ * THPS_GL_NODISCARD=0: not built. */
++void GlGpu::SolidProgram()
++{
++    const char *nd = getenv("THPS_GL_NODISCARD"), *bt = getenv("THPS_R3D_BATCH");
++    if (!m_drawProgFast || m_prepass || (nd && nd[0] == '0') || (bt && atoi(bt) == 0)) {
++        fprintf(stderr, "[gl] opaque no-discard program: off%s\n",
++                !m_drawProgFast ? " (no fast program)" : m_prepass ? " (THPS_R3D_PREPASS=1)" : "");
++        return;
++    }
++    static const char *const cut[3] = {
++        "        if (tx.a < 0.03) discard;\n",
++        "        if (ta.a < 0.25) discard;\n",
++        "    if ((u_pass > 0.5 && u_pass < 1.5 && blend) || (u_pass > 1.5 && !blend)) discard;\n",
++    };
++    std::string fs = gl_draw_fast_fs;
++    for (const char *c : cut) {
++        size_t at = fs.find(c);
++        if (at == std::string::npos) {
++            fprintf(stderr, "[gl] opaque no-discard program: the fast shader has changed, off\n");
++            return;
++        }
++        fs.erase(at, strlen(c));
++    }
++    GLuint p = Program(gl_draw_vs, fs.c_str());
++    if (!p) {
++        fprintf(stderr, "[gl] opaque no-discard program: REJECTED by the compiler, off (source above)\n");
++        glUseProgram(m_drawProg);
++        return;
++    }
++    glUseProgram(p);
++    glUniform1i(glGetUniformLocation(p, "u_vram"), 0);
++    glUniform1i(glGetUniformLocation(p, "u_hd"), 1);
++    glUniform1i(glGetUniformLocation(p, "u_atlas"), kAtlasUnit);
++    m_locSolid = DrawLocs{glGetUniformLocation(p, "u_pass"), glGetUniformLocation(p, "u_dpass"),
++                          glGetUniformLocation(p, "u_proj"), glGetUniformLocation(p, "u_target"),
++                          glGetUniformLocation(p, "u_shift"), glGetUniformLocation(p, "u_uvfix")};
++    glUseProgram(m_drawProg);
++    m_drawProgSolid = p;
++    fprintf(stderr, "[gl] opaque no-discard program: ok (THPS_GL_NODISCARD=0 turns it off)\n");
++}
++
++/* row y of slot s's decoded texels: its 8x8 cells that hold a transparent one (0) */
++void GlGpu::TranspRow(int s, int y, const uint32_t *row)
++{
++    uint32_t bits = 0;
++    for (int x = 0; x < 256; x++)
++        if (!row[x])
++            bits |= 1u << (x >> 3);
++    m_slotTransp[s][y >> 3] |= bits;
++}
++
++/* a triangle (its first vertex's words) that cannot have a transparent texel: untextured, or a
++ * cached page with none in the texels it spans (GlVert.uvr) */
++bool GlGpu::TriSolid(const GlVert *v) const
++{
++    if (!(v->info & PC_GL_I_TEXTURED))
++        return true;
++    if (!(v->clut & 0x8000) || ((v->info >> 7) & 3) == 3)
++        return false;
++    int s = v->clut & 127;
++    int x0 = v->uvr[0] >> 3, y0 = v->uvr[1] >> 3, x1 = v->uvr[2] >> 3, y1 = v->uvr[3] >> 3;
++    if (x1 < x0 || y1 < y0)
++        return false;
++    uint32_t mask = (x1 - x0 == 31 ? 0xffffffffu : ((1u << (x1 - x0 + 1)) - 1)) << x0;
++    for (int y = y0; y <= y1; y++)
++        if (m_slotTransp[s][y] & mask)
++            return false;
++    return true;
++}
++
+ void GlGpu::AtlasUniforms()
+ {
+-    GLuint progs[2] = { m_drawProg, m_drawProgFast };
++    GLuint progs[3] = { m_drawProg, m_drawProgFast, m_drawProgSolid };
+     for (GLuint p : progs) {
+         if (!p)
+             continue;
+@@ -3522,13 +3671,18 @@ void GlGpu::CacheDecode(int s)
+     PC_VITA_PROF_SCOPE(PC_PROF_DECODE);
+     /* a row at a time into the slot's rows of the atlas */
+     uint32_t row[256];
++    memset(m_slotTransp[s], 0, sizeof m_slotTransp[s]);
+     for (int y = 0; y < 256; y++) {
+         DecodeRow(m_slot[s], y, row);
+         memcpy(AtlasRow(s, y), row, sizeof row);
++        TranspRow(s, y, row);
+     }
+ #else
+-    for (int y = 0; y < 256; y++)
++    memset(m_slotTransp[s], 0, sizeof m_slotTransp[s]);
++    for (int y = 0; y < 256; y++) {
+         DecodeRow(m_slot[s], y, m_decode.data() + (size_t)y * 256);
++        TranspRow(s, y, m_decode.data() + (size_t)y * 256);
++    }
+     glActiveTexture(GL_TEXTURE0 + kAtlasUnit);
+     glBindTexture(GL_TEXTURE_2D, m_atlas);
+     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+diff --git a/platform/pc/src/pc_vitagfx.cpp b/platform/pc/src/pc_vitagfx.cpp
+index c24b61b..8cb1884 100644
+--- a/platform/pc/src/pc_vitagfx.cpp
++++ b/platform/pc/src/pc_vitagfx.cpp
+@@ -15,7 +15,9 @@ void Read()
+     static const int sizes[3][2] = { { 512, 240 }, { 720, 408 }, { 960, 544 } };
+     const char *e;
+     int w, h;
+-    s_gfx = PC_VitaGfx{ 960, 544, 1, 1, 60, 1 };
++    /* t24: 720x408 by default (t23: the GPU took ~50 ms a frame at 960x544, ~25 at 720x408;
++     * THPS_VITA_RES=960x544 for the full screen) */
++    s_gfx = PC_VitaGfx{ 720, 408, 1, 1, 60, 1 };
+     if ((e = getenv("THPS_VITA_RES")) && sscanf(e, "%dx%d", &w, &h) == 2) {
+         for (int i = 0; i < 3; i++)
+             if (w == sizes[i][0] && h == sizes[i][1]) {
+-- 
+2.53.0
+

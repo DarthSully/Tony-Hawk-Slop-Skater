@@ -1,0 +1,28 @@
+From 182fdee11a07272e19037e1dbec8cdb5d6ff5155 Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Sat, 24 Oct 2026 01:46:00 +0300
+Subject: [PATCH] Vita: show fatal errors in the system message dialog
+
+---
+ platform/pc/src/pc_platform.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/platform/pc/src/pc_platform.cpp b/platform/pc/src/pc_platform.cpp
+index 8fae671..322d369 100644
+--- a/platform/pc/src/pc_platform.cpp
++++ b/platform/pc/src/pc_platform.cpp
+@@ -265,8 +265,9 @@ int64_t ClockFreq() { return 1000000; }
+ 
+ void SleepMs(unsigned ms) { sceKernelDelayThread(ms * 1000); }
+ 
+-/* no desktop: the log has it (ux0:data/THPS/thps.log) */
+-void ErrorBox(const char *msg) { (void)msg; }
++/* the system's message dialog (SDL's, over its own GXM setup when nothing has the screen yet);
++ * the log has it too (ux0:data/THPS/thps.log) */
++void ErrorBox(const char *msg) { SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "THPS", msg, NULL); }
+ 
+ void Exit(int code) {
+     fflush(NULL);
+-- 
+2.53.0
+

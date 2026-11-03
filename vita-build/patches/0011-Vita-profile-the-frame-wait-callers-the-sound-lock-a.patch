@@ -1,0 +1,273 @@
+From ba0263c245edd2f0b6d3d73eac240c0712c1510b Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Sat, 24 Oct 2026 16:32:20 +0300
+Subject: [PATCH] Vita: profile the frame-wait callers, the sound lock and mix,
+ the vblank handler, the stream and the frame sleeps
+
+---
+ platform/pc/include/pc/platform.h |  6 ++-
+ platform/pc/include/pc/sound.h    |  3 ++
+ platform/pc/src/pc_frame.cpp      | 23 ++++++++++-
+ platform/pc/src/pc_sound.cpp      | 29 ++++++++++++++
+ platform/pc/src/pc_vita.cpp       | 63 +++++++++++++++++++++++++++----
+ 5 files changed, 114 insertions(+), 10 deletions(-)
+
+diff --git a/platform/pc/include/pc/platform.h b/platform/pc/include/pc/platform.h
+index 77e113f..9422b98 100644
+--- a/platform/pc/include/pc/platform.h
++++ b/platform/pc/include/pc/platform.h
+@@ -34,11 +34,15 @@ void PC_VitaLogOpen(void);
+ /* the `profile` switch (an empty PC_VITA_DIR/profile file): time spent per slot, logged once a
+  * second at the frame boundary (PC_VitaProfFrame) */
+ enum { PC_PROF_PRESENT, PC_PROF_SWAP, PC_PROF_READBACK, PC_PROF_MOVIE, PC_PROF_DRAW, PC_PROF_FILE,
+-       PC_PROF_SLOTS };
++       PC_PROF_SNDLOCK, PC_PROF_VBLANK, PC_PROF_STREAM, PC_PROF_SLEEP, PC_PROF_SLOTS };
+ extern int pc_vita_profile;
+ long long PC_VitaProfNow(void);
+ void PC_VitaProfAdd(int slot, long long us);
+ void PC_VitaProfFrame(void);
++/* a frame wait of n frames from the code at ret (the game's call site), for the stall lines */
++void PC_VitaProfCaller(void *ret, int n);
++/* one mix on the mixer thread (the device callback or the pacer) */
++void PC_VitaProfMix(long long us);
+ #ifdef __cplusplus
+ /* times the rest of the enclosing block into a slot */
+ struct PC_VitaProfScope {
+diff --git a/platform/pc/include/pc/sound.h b/platform/pc/include/pc/sound.h
+index b1a88ec..668f92d 100644
+--- a/platform/pc/include/pc/sound.h
++++ b/platform/pc/include/pc/sound.h
+@@ -254,6 +254,9 @@ private:
+     void Unlock();
+     const Sample *FindSample(uint32_t id);
+     void Mix(uint8_t *stream, int len);
++#ifdef __vita__
++    void MixInner(uint8_t *stream, int len);
++#endif
+     void StartPacer();
+     static void DeviceCallback(void *userdata, uint8_t *stream, int len);
+     static int Pacer(void *userdata);
+diff --git a/platform/pc/src/pc_frame.cpp b/platform/pc/src/pc_frame.cpp
+index a73a580..b83e3e8 100644
+--- a/platform/pc/src/pc_frame.cpp
++++ b/platform/pc/src/pc_frame.cpp
+@@ -47,9 +47,19 @@ void FrameClock::Init() {
+  * display's refresh, and the frames that catch up on the clock mustn't. */
+ void FrameClock::RunFrame(bool present) {
+     m_frames++;
++#ifdef __vita__
++    {
++        PC_VITA_PROF_SCOPE(PC_PROF_STREAM);
++        g_streamer.Frame();
++    }
++#else
+     g_streamer.Frame();
++#endif
+     g_otDrawer.RunDone();
+     if (m_handler && !m_inHandler) {
++#ifdef __vita__
++        PC_VITA_PROF_SCOPE(PC_PROF_VBLANK);
++#endif
+         m_inHandler = true;
+         m_handler();
+         m_inHandler = false;
+@@ -156,8 +166,12 @@ void FrameClock::WaitFrame() {
+             now = Now();
+             if (now < m_next) {
+                 int64_t ms = (m_next - now) * 1000 / m_freq;
+-                if (ms > 1)
++                if (ms > 1) {
++#ifdef __vita__
++                    PC_VITA_PROF_SCOPE(PC_PROF_SLEEP);
++#endif
+                     os::SleepMs((unsigned)(ms - 1));
++                }
+             }
+             Poll();
+         }
+@@ -180,7 +194,12 @@ void FrameClock::SetHandler(void (*fn)(void)) {
+ /* ---- the game's interface (pc_frame.h) ---- */
+ 
+ extern "C" {
+-void PC_FrameWait(int n) { pc::g_frameClock.Wait(n); }
++void PC_FrameWait(int n) {
++#ifdef __vita__
++    PC_VitaProfCaller(__builtin_return_address(0), n);
++#endif
++    pc::g_frameClock.Wait(n);
++}
+ int PC_FramePoll(void) { return pc::g_frameClock.Poll(); }
+ uint32_t PC_FrameCount(void) { return pc::g_frameClock.Count(); }
+ void PC_SetFrameHandler(void (*fn)(void)) { pc::g_frameClock.SetHandler(fn); }
+diff --git a/platform/pc/src/pc_sound.cpp b/platform/pc/src/pc_sound.cpp
+index b653202..85dd006 100644
+--- a/platform/pc/src/pc_sound.cpp
++++ b/platform/pc/src/pc_sound.cpp
+@@ -31,6 +31,9 @@
+ #include <SDL2/SDL.h>
+ 
+ #include "pc/sound.h"
++#ifdef __vita__
++#include "pc/platform.h"
++#endif
+ #include "pc_runtime.h"
+ 
+ namespace pc {
+@@ -105,7 +108,19 @@ int16_t Sound::Music::s_buf[kMusicFifo * 2];
+ 
+ /* ---- device lock ------------------------------------------------------------------------------- */
+ 
++#ifdef __vita__
++/* the game thread (Init's): only its waits for the lock count */
++static SDL_threadID s_gameThread;
++#endif
++
+ void Sound::Lock() {
++#ifdef __vita__
++    if (m_mx && pc_vita_profile && SDL_ThreadID() == s_gameThread) {
++        PC_VITA_PROF_SCOPE(PC_PROF_SNDLOCK);
++        SDL_LockMutex(m_mx);
++        return;
++    }
++#endif
+     if (m_mx)
+         SDL_LockMutex(m_mx);
+ }
+@@ -673,7 +688,18 @@ void Sound::Music::Frame(int *outL, int *outR) {
+     *outR = (r * m_level[1]) >> 14;
+ }
+ 
++#ifdef __vita__
++void Sound::Mix(uint8_t *stream, int len) {
++    long long t0 = PC_VitaProfNow();
++    MixInner(stream, len);
++    if (pc_vita_profile)
++        PC_VitaProfMix(PC_VitaProfNow() - t0);
++}
++
++void Sound::MixInner(uint8_t *stream, int len) {
++#else
+ void Sound::Mix(uint8_t *stream, int len) {
++#endif
+     int16_t *out = (int16_t *)stream;
+     int frames = len / 4;
+     for (int f = 0; f < frames; f++) {
+@@ -743,6 +769,9 @@ void Sound::Init() {
+ 
+     m_trace = getenv("THPS_TRACE_SOUND") && atoi(getenv("THPS_TRACE_SOUND"));
+     m_mx = SDL_CreateMutex();
++#ifdef __vita__
++    s_gameThread = SDL_ThreadID();
++#endif
+     ReverbMode(0);
+     if (dump && !(m_dump = fopen(dump, "wb")))
+         PC_Log("audio: cannot create %s", dump);
+diff --git a/platform/pc/src/pc_vita.cpp b/platform/pc/src/pc_vita.cpp
+index d91e199..211dd19 100644
+--- a/platform/pc/src/pc_vita.cpp
++++ b/platform/pc/src/pc_vita.cpp
+@@ -88,7 +88,8 @@ void PC_VitaLogOpen(void) {
+     SceIoStat st;
+     pc_vita_profile = sceIoGetstat(PC_VITA_DIR "/profile", &st) >= 0;
+     if (pc_vita_profile)
+-        fprintf(stderr, "profile: on (one line a second)\n");
++        fprintf(stderr, "profile: on (one line a second); PC_VitaLogOpen at %p\n",
++                (void *)&PC_VitaLogOpen);
+ }
+ 
+ /* ---- the profile switch -------------------------------------------------------------------- */
+@@ -100,8 +101,42 @@ long long g_profUs[PC_PROF_SLOTS], g_profFrameUs[PC_PROF_SLOTS];
+ int g_profCount[PC_PROF_SLOTS], g_profFrameNo;
+ long long g_profStart, g_profFrameStart, g_profFrameMax;
+ int g_profFrames;
++
++/* the frame-wait call sites of the current frame */
++struct Caller {
++    void *ret;
++    int calls, frames;
++};
++Caller g_callers[6];
++int g_ncallers;
++
++/* the mixer thread's timings, read and reset by the game thread at the second's line */
++volatile long long g_mixSum, g_mixMax;
++volatile int g_mixCount;
+ } // namespace
+ 
++void PC_VitaProfCaller(void *ret, int n) {
++    if (!pc_vita_profile)
++        return;
++    for (int i = 0; i < g_ncallers; i++)
++        if (g_callers[i].ret == ret) {
++            g_callers[i].calls++;
++            g_callers[i].frames += n;
++            return;
++        }
++    if (g_ncallers < 6)
++        g_callers[g_ncallers++] = Caller{ret, 1, n};
++}
++
++void PC_VitaProfMix(long long us) {
++    if (!pc_vita_profile)
++        return;
++    g_mixSum += us;
++    g_mixCount++;
++    if (us > g_mixMax)
++        g_mixMax = us;
++}
++
+ long long PC_VitaProfNow(void) { return pc_vita_profile ? (long long)sceKernelGetProcessTimeWide() : 0; }
+ 
+ void PC_VitaProfAdd(int slot, long long us) {
+@@ -127,16 +162,25 @@ void PC_VitaProfFrame(void) {
+         long long *f = g_profFrameUs;
+         double dt = (now - g_profFrameStart) / 1000.0;
+         double known = (f[PC_PROF_PRESENT] + f[PC_PROF_READBACK] + f[PC_PROF_MOVIE]) / 1000.0;
++        char who[256];
++        int k = 0;
++        who[0] = 0;
++        for (int i = 0; i < g_ncallers && k < (int)sizeof who - 40; i++)
++            k += snprintf(who + k, sizeof who - k, " %p:%dx%d", g_callers[i].ret, g_callers[i].calls,
++                          g_callers[i].frames);
+         fprintf(stderr,
+                 "[stall] frame %d: %.1f ms: present %.1f (swap %.1f), draw %.1f, file %.1f, "
+-                "readback %.1f, other %.1f; vgl free ram %uK vram %uK phycont %uK, heap free %uK\n",
++                "readback %.1f, other %.1f; sndlock %.1f, vblank %.1f, stream %.1f, sleep %.1f, "
++                "mix max %.1f; waits from%s; vgl free ram %uK, heap free %uK\n",
+                 g_profFrameNo, dt, f[PC_PROF_PRESENT] / 1000.0, f[PC_PROF_SWAP] / 1000.0,
+                 f[PC_PROF_DRAW] / 1000.0, f[PC_PROF_FILE] / 1000.0, f[PC_PROF_READBACK] / 1000.0,
+-                dt - known > 0 ? dt - known : 0.0, (unsigned)(vglMemFree(VGL_MEM_RAM) >> 10),
+-                (unsigned)(vglMemFree(VGL_MEM_VRAM) >> 10), (unsigned)(vglMemFree(VGL_MEM_PHYCONT) >> 10),
+-                (unsigned)(mallinfo().fordblks >> 10));
++                dt - known > 0 ? dt - known : 0.0, f[PC_PROF_SNDLOCK] / 1000.0,
++                f[PC_PROF_VBLANK] / 1000.0, f[PC_PROF_STREAM] / 1000.0, f[PC_PROF_SLEEP] / 1000.0,
++                g_mixMax / 1000.0, g_ncallers ? who : " (none)",
++                (unsigned)(vglMemFree(VGL_MEM_RAM) >> 10), (unsigned)(mallinfo().fordblks >> 10));
+     }
+     memset(g_profFrameUs, 0, sizeof g_profFrameUs);
++    g_ncallers = 0;
+     g_profFrameStart = now;
+     if (!g_profStart)
+         g_profStart = now;
+@@ -149,11 +193,16 @@ void PC_VitaProfFrame(void) {
+     double other = span / n - present - rb - movie;
+     fprintf(stderr,
+             "[prof] %.1f fps, frame %.1f ms (max %.1f): present %.1f (swap %.1f), readback %.1f "
+-            "(%d), movie %.1f (%d), other %.1f (draw %.1f, file %.1f)\n",
++            "(%d), movie %.1f (%d), other %.1f (draw %.1f, file %.1f, sndlock %.1f, vblank %.1f, "
++            "sleep %.1f); mix %d x %.2f ms (max %.1f)\n",
+             n * 1000.0 / span, span / n, g_profFrameMax / 1000.0, present,
+             swap, rb, g_profCount[PC_PROF_READBACK], movie, g_profCount[PC_PROF_MOVIE],
+             other > 0 ? other : 0.0, g_profUs[PC_PROF_DRAW] / 1000.0 / n,
+-            g_profUs[PC_PROF_FILE] / 1000.0 / n);
++            g_profUs[PC_PROF_FILE] / 1000.0 / n, g_profUs[PC_PROF_SNDLOCK] / 1000.0 / n,
++            g_profUs[PC_PROF_VBLANK] / 1000.0 / n, g_profUs[PC_PROF_SLEEP] / 1000.0 / n,
++            g_mixCount, g_mixCount ? g_mixSum / 1000.0 / g_mixCount : 0.0, g_mixMax / 1000.0);
++    g_mixSum = g_mixMax = 0;
++    g_mixCount = 0;
+     /* every 10 s: what vitaGL's pools and newlib's heap have left */
+     static int s_memTick;
+     if (++s_memTick % 10 == 1) {
+-- 
+2.53.0
+

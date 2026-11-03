@@ -1,0 +1,222 @@
+From edc5b85fb9aed1048cbeb14751c8d7e3e79841e6 Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Wed, 28 Oct 2026 23:43:32 +0300
+Subject: [PATCH] Vita: game files read once, in large direct reads; opens
+ counted as file time; slow files named
+
+- t26's skater select ran at ~6 fps for seconds: frames of 430 and 845 ms, all "other", with
+  "file" ~25 ms each. Every .psx open (FileIo::Open -> ConvertDcFile) read the whole file to
+  see whether it is a Dreamcast one, then FileIO_Load read it again; the open wasn't profiled.
+  Both reads went through stdio's fread, which on the Vita goes to the card in pieces of its
+  buffer, each paying the card's latency: the first (cold) read is the stall, the second hits
+  the cache (the 25 ms). Loading screens take the same path.
+- Now an open reads 16 bytes (the version word) and only a Dreamcast file is read whole there;
+  sizes come from sceIoGetstat, and reads are sceIoRead in pieces of 1 MB
+  (THPS_FILE_DIRECT=0: stdio as before). PC_FileOpen counts as file time, and a file whose
+  open and read took over 60 ms is logged: "[file] name: N KB, open X ms, read Y ms".
+---
+ platform/pc/README.md            |   1 +
+ platform/pc/include/pc/file_io.h |   1 +
+ platform/pc/src/pc_fileio.cpp    | 122 +++++++++++++++++++++++++++----
+ 3 files changed, 109 insertions(+), 15 deletions(-)
+
+diff --git a/platform/pc/README.md b/platform/pc/README.md
+index 982a518..8b420ba 100644
+--- a/platform/pc/README.md
++++ b/platform/pc/README.md
+@@ -572,6 +572,7 @@ window, `THPS_FAST`, `THPS_DETERMINISTIC`) never wait for a display.
+ | `THPS_R3D_BATCH=0` | OpenGL ES (Vita): a native 3D layer's faces drawn in the PS1's order, split where they overlap (before t20); default: each run of faces between 2D primitives in one depth pass and one colour pass for the opaque faces, then the semi-transparent ones in order |
+ | `THPS_VITA_RES=WxH` | Vita: screens drawn at most 512x240, 720x408 or 960x544 (default; t24-t25: 720x408), scaled up to the screen |
+ | `THPS_R3D_PREPASS=0` | OpenGL ES (Vita), batched 3D: opaque faces in one pass at the true depth (t24; decals can flicker); default (t25): depth first, then colour with the decal tolerance, the no-discard program in both where it can |
++| `THPS_FILE_DIRECT=0` | Vita: game files read with stdio as before t28 (default: sceIoRead in pieces of 1 MB, an open reads only the header) |
+ | `THPS_GL_DECODE_THREADS=n` | Vita: texture cache pages decoded by n threads on cores 1-3 with the game thread (default 3, 0 = the game thread alone) |
+ | `THPS_GL_NODISCARD=0` | OpenGL ES (Vita), batched 3D: no separate no-discard, no-blend program for opaque faces with no transparent texel under them |
+ | `THPS_GL_WARMFRAMES=n` | OpenGL ES: frames after a stretch without 3D (loading screens, menus) that decode every texture page they draw, uncapped (default 30, 0 off) |
+diff --git a/platform/pc/include/pc/file_io.h b/platform/pc/include/pc/file_io.h
+index 49577b6..1a0b5f1 100644
+--- a/platform/pc/include/pc/file_io.h
++++ b/platform/pc/include/pc/file_io.h
+@@ -12,6 +12,7 @@ namespace pc {
+ 
+ class FileIo {
+ public:
++    const char *Name() const { return m_name; }   /* the file as the game asked for it */
+     /* Finds the file the game asks for (fatal if it isn't in Data/) and returns its size in bytes. */
+     int Open(const char *name);
+     /* Reads the file Open found to dest, zeroing up to size (the game allocates whole sectors). */
+diff --git a/platform/pc/src/pc_fileio.cpp b/platform/pc/src/pc_fileio.cpp
+index 8075d00..5b2fe73 100644
+--- a/platform/pc/src/pc_fileio.cpp
++++ b/platform/pc/src/pc_fileio.cpp
+@@ -25,10 +25,80 @@
+ #include "pc/platform.h"
+ #include "pc_runtime.h"
+ #include "pc/dc_sound.h"
++#ifdef __vita__
++#include <psp2/io/fcntl.h>
++#include <psp2/io/stat.h>
++#endif
+ 
+ namespace pc {
+ 
+ namespace {
++/* t28: a file's bytes in a few large reads. On the Vita, stdio's fread of a whole file went to
++ * the card in pieces of its buffer (about 1 KB), each paying the card's latency: a cold 300 KB
++ * model took 0.4-0.85 s (the skater select's stalls, t26: frames of 430 and 845 ms with "file"
++ * only 25 ms, the second, cached read). sceIoRead in pieces of 1 MB; THPS_FILE_DIRECT=0: stdio
++ * as before. Elsewhere stdio. */
++bool DirectIo() {
++#ifdef __vita__
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("THPS_FILE_DIRECT");
++        on = !(e && e[0] == '0');
++        fprintf(stderr, "[file] game files: %s\n",
++                on ? "direct reads of 1 MB (THPS_FILE_DIRECT=0: stdio)" : "stdio (THPS_FILE_DIRECT=0)");
++    }
++    return on != 0;
++#else
++    return false;
++#endif
++}
++
++/* up to n bytes of path from its start into dest; the count read, -1 when it cannot be opened */
++long ReadFile(const char *path, void *dest, long n) {
++#ifdef __vita__
++    if (DirectIo()) {
++        SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
++        if (fd < 0)
++            return -1;
++        long got = 0;
++        while (got < n) {
++            long k = n - got > (1 << 20) ? (1 << 20) : n - got;
++            int r = sceIoRead(fd, (char *)dest + got, (SceSize)k);
++            if (r <= 0)
++                break;
++            got += r;
++        }
++        sceIoClose(fd);
++        return got;
++    }
++#endif
++    FILE *f = fopen(path, "rb");
++    if (!f)
++        return -1;
++    long got = (long)fread(dest, 1, (size_t)n, f);
++    fclose(f);
++    return got;
++}
++
++/* path's size, -1 when it cannot be opened */
++long FileSize(const char *path) {
++#ifdef __vita__
++    if (DirectIo()) {
++        SceIoStat st;
++        if (sceIoGetstat(path, &st) < 0)
++            return -1;
++        return (long)st.st_size;
++    }
++#endif
++    FILE *f = fopen(path, "rb");
++    if (!f)
++        return -1;
++    fseek(f, 0, SEEK_END);
++    long n = ftell(f);
++    fclose(f);
++    return n;
++}
++
+ /* A loaded .bmp the Dreamcast redrew larger (pc_assets.h): the size the PS1 game lays it out at
+  * goes into its header, as "PCLS" in the file header's reserved words and the size in the
+  * pixels-per-metre fields. */
+@@ -105,13 +175,16 @@ void FileIo::ConvertDcFile() {
+     m_image = nullptr;
+     if (n < 4 || _stricmp(m_path + n - 4, ".psx") || m_size < 12)
+         return;
+-    FILE *f = fopen(m_path, "rb");
+-    if (!f)
+-        PC_Fatal("cannot open %s", m_path);
++    /* t28: its first bytes say (the whole file was read here, then again by Read: twice from
++     * the card for every model) */
++    uint8_t head[16];
++    if (ReadFile(m_path, head, sizeof head) != (long)sizeof head)
++        PC_Fatal("cannot read %s", m_path);
++    if (!DcTextures::PsxIsV6(head, (uint32_t)m_size))
++        return;
+     uint8_t *data = (uint8_t *)malloc((size_t)m_size);
+-    if (fread(data, 1, (size_t)m_size, f) != (size_t)m_size)
++    if (ReadFile(m_path, data, m_size) != (long)m_size)
+         PC_Fatal("cannot read %s", m_path);
+-    fclose(f);
+     if (DcTextures::PsxIsV6(data, (uint32_t)m_size)) {
+         m_image = g_dcTextures.PsxStrip(data, (uint32_t)m_size, &outSize);
+         if (!m_image)
+@@ -138,12 +211,10 @@ int FileIo::Open(const char *name) {
+             SilentVab();
+         }
+     } else {
+-        FILE *f = fopen(m_path, "rb");
+-        if (!f)
++        long sz = FileSize(m_path);
++        if (sz < 0)
+             PC_Fatal("cannot open %s", m_path);
+-        fseek(f, 0, SEEK_END);
+-        m_size = (int)ftell(f);
+-        fclose(f);
++        m_size = (int)sz;
+         ConvertDcFile();
+     }
+     PC_Trace("FileIO_Open(%s) -> %s, %d bytes", name, m_path, m_size);
+@@ -156,10 +227,8 @@ void FileIo::Read(void *dest, int size) {
+         free(m_image);
+         m_image = nullptr;
+     } else {
+-        FILE *f = fopen(m_path, "rb");
+-        if (!f || fread(dest, 1, (size_t)m_size, f) != (size_t)m_size)
++        if (ReadFile(m_path, dest, m_size) != (long)m_size)
+             PC_Fatal("cannot read %s", m_path);
+-        fclose(f);
+         MarkLayoutSize((uint8_t *)dest, m_size);
+     }
+     if (size > m_size)
+@@ -172,12 +241,35 @@ void FileIo::Read(void *dest, int size) {
+ 
+ extern "C" {
+ 
+-int PC_FileOpen(const char *name) { return pc::g_fileIo.Open(name); }
++#ifdef __vita__
++static long long s_openUs;   /* t28: the last open, for the slow-file line */
++#endif
++
++int PC_FileOpen(const char *name) {
++#ifdef __vita__
++    PC_VITA_PROF_SCOPE(PC_PROF_FILE);   /* (t28: an open read the file too, uncounted) */
++    long long t0 = PC_VitaProfNow();
++    int r = pc::g_fileIo.Open(name);
++    s_openUs = PC_VitaProfNow() - t0;
++    return r;
++#else
++    return pc::g_fileIo.Open(name);
++#endif
++}
+ void PC_FileRead(void *dest, int size) {
+ #ifdef __vita__
+     PC_VITA_PROF_SCOPE(PC_PROF_FILE);
+-#endif
++    long long t0 = PC_VitaProfNow();
+     pc::g_fileIo.Read(dest, size);
++    long long us = PC_VitaProfNow() - t0;
++    /* t28: a file that took over 60 ms, named (the game thread waits for every one) */
++    if (s_openUs + us > 60000)
++        fprintf(stderr, "[file] %s: %d KB, open %.0f ms, read %.0f ms\n", pc::g_fileIo.Name(),
++                size >> 10, s_openUs / 1000.0, us / 1000.0);
++    s_openUs = 0;
++#else
++    pc::g_fileIo.Read(dest, size);
++#endif
+ }
+ int PC_BmpLayoutSize(const void *bmp, int *lw, int *lh) { return pc::FileIo::BmpLayoutSize(bmp, lw, lh); }
+ 
+-- 
+2.53.0
+

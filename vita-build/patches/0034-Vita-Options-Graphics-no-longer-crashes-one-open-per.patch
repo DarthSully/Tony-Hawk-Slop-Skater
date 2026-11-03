@@ -1,0 +1,463 @@
+From fd52a2266de2f0936333964e2a064c66f351903a Mon Sep 17 00:00:00 2001
+From: vita-build <vita@build>
+Date: Thu, 29 Oct 2026 01:07:19 +0300
+Subject: [PATCH] Vita: Options > Graphics no longer crashes, one open per
+ file, a log per start, a texture-free depth pass
+
+- Options > Graphics crashed (t27-t28): the Options screen takes options.bmp out of front-end
+  set 11; the GRAPHICS screen loads set 11 again, which is still loaded, so nothing reloads the
+  taken file, FrontLoader_TakeFile returns 0 and DownloadBMP16x2 read through it. A missing image
+  is now logged and skipped (the background on screen stays).
+- Game files: one sceIoOpen a load (t28 looked the file up three times: size, first bytes, read;
+  ~200 ms each for the files in Data/): size by sceIoLseek, first bytes and data by sceIoPread
+  on that handle, closed by the read.
+- Logs: each start writes ux0:data/THPS/logs/thps_YYYY-MM-DD_HH-MM-SS.log (the newest 10 kept)
+  instead of appending to thps.log; the writer syncs at most once a second (and at exit).
+- Batched 3D: the depth pass of the opaque faces without transparent texels uses the draw
+  vertex shader with a fragment shader that reads no texture (the colour writes are masked off
+  there), compiled last (THPS_GL_DEPTHFS=0: the no-discard program as before).
+- THPS_GL_GPUTIME=1 (a measurement): glFinish before the swap, "[gpu]" every 60 frames.
+---
+ game/src/shellutils.cpp          |  8 ++++
+ platform/pc/README.md            |  6 ++-
+ platform/pc/include/pc/file_io.h |  1 +
+ platform/pc/include/pc/gl_gpu.h  |  7 +++-
+ platform/pc/src/pc_fileio.cpp    | 62 ++++++++++++++++++++++++++--
+ platform/pc/src/pc_gpu_gl.cpp    | 70 ++++++++++++++++++++++++++++----
+ platform/pc/src/pc_video.cpp     |  2 +-
+ platform/pc/src/pc_vita.cpp      | 67 ++++++++++++++++++++++--------
+ 8 files changed, 192 insertions(+), 31 deletions(-)
+
+diff --git a/game/src/shellutils.cpp b/game/src/shellutils.cpp
+index ee7ff4c..ccf3597 100644
+--- a/game/src/shellutils.cpp
++++ b/game/src/shellutils.cpp
+@@ -193,6 +193,14 @@ void DownloadBMP16x2(char *pData) {
+ 	char *in;
+ 	char *out;
+ 
++	/* t29: no image (FrontLoader_TakeFile found none: Options > Graphics asked again for the
++	   options.bmp the Options screen had already taken out of the set, which was still loaded,
++	   so nothing loaded it again; retail read through 0 here and crashed): the last one stays */
++	if (!pData) {
++		printf("[front] DownloadBMP16x2: no image (already taken from the loader), the screen keeps the last\n");
++		return;
++	}
++
+ 	/* a Dreamcast screen, already 640x480 (pc_assets.h): loaded as it is, not line-doubled
+ 	   (DownloadBMP16, 0x80061a10) */
+ 	{
+diff --git a/platform/pc/README.md b/platform/pc/README.md
+index 8b420ba..6bda689 100644
+--- a/platform/pc/README.md
++++ b/platform/pc/README.md
+@@ -262,8 +262,8 @@ demangler, `build/psyq_names.tsv`). To run it on the console:
+   The first start extracts `Data/` next to it (about 630 MB; the image can be deleted afterwards).
+ - vitaGL compiles the renderer's shaders at runtime: `ur0:data/libshacccg.suprx` must be present
+   (extracted from the firmware with ShaRKBR33D or the like).
+-- `ux0:data/THPS/thps.log` is the log (written straight through, so it survives a crash; each
+-  launch appends after a `===== date time =====` line, and over 4 MB it moves to `thps.old.log`);
++- Each start writes its own log, `ux0:data/THPS/logs/thps_YYYY-MM-DD_HH-MM-SS.log` (the newest 10
++  are kept; synced at most once a second, so it survives the game crashing);
+   `ux0:data/THPS/env.txt` holds `NAME=value` lines that stand in for environment variables
+   (`THPS_TRACE=1` ...). Saves go in `ux0:data/THPS` too.
+ 
+@@ -572,6 +572,8 @@ window, `THPS_FAST`, `THPS_DETERMINISTIC`) never wait for a display.
+ | `THPS_R3D_BATCH=0` | OpenGL ES (Vita): a native 3D layer's faces drawn in the PS1's order, split where they overlap (before t20); default: each run of faces between 2D primitives in one depth pass and one colour pass for the opaque faces, then the semi-transparent ones in order |
+ | `THPS_VITA_RES=WxH` | Vita: screens drawn at most 512x240, 720x408 or 960x544 (default; t24-t25: 720x408), scaled up to the screen |
+ | `THPS_R3D_PREPASS=0` | OpenGL ES (Vita), batched 3D: opaque faces in one pass at the true depth (t24; decals can flicker); default (t25): depth first, then colour with the decal tolerance, the no-discard program in both where it can |
++| `THPS_GL_DEPTHFS=0` | OpenGL ES (Vita), batched 3D: the depth pass of opaque faces without transparent texels shades with the no-discard program instead of one that reads no texture |
++| `THPS_GL_GPUTIME=1` | Vita, a measurement: each frame drawn to the end before the swap, the GPU time logged (`[gpu]`); slower |
+ | `THPS_FILE_DIRECT=0` | Vita: game files read with stdio as before t28 (default: sceIoRead in pieces of 1 MB, an open reads only the header) |
+ | `THPS_GL_DECODE_THREADS=n` | Vita: texture cache pages decoded by n threads on cores 1-3 with the game thread (default 3, 0 = the game thread alone) |
+ | `THPS_GL_NODISCARD=0` | OpenGL ES (Vita), batched 3D: no separate no-discard, no-blend program for opaque faces with no transparent texel under them |
+diff --git a/platform/pc/include/pc/file_io.h b/platform/pc/include/pc/file_io.h
+index 1a0b5f1..40bcdbe 100644
+--- a/platform/pc/include/pc/file_io.h
++++ b/platform/pc/include/pc/file_io.h
+@@ -30,6 +30,7 @@ private:
+     char m_name[64] = {};    /* as the game asked for it */
+     int m_size = 0;
+     uint8_t *m_image = nullptr;   /* the converted file (malloc'd), else null: read the file */
++    int m_fd = -1;                /* t29 (Vita): the file Open opened, read and closed by Read */
+ };
+ 
+ extern FileIo g_fileIo;
+diff --git a/platform/pc/include/pc/gl_gpu.h b/platform/pc/include/pc/gl_gpu.h
+index be9d8a9..93699f7 100644
+--- a/platform/pc/include/pc/gl_gpu.h
++++ b/platform/pc/include/pc/gl_gpu.h
+@@ -378,13 +378,18 @@ class GlGpu {
+     int m_batchLogFrames = 0, m_batchLogged = 0;   /* t23: [r3d] batch lines, the first frames */
+     long long m_decodeUs = 0, m_decodeBudgetUs = 25000;   /* this frame's decoding; THPS_GL_DECODEMS */
+     float m_proj[4] = {};
+-    int m_projSet = 0, m_projApplied[3] = {};
++    int m_projSet = 0, m_projApplied[4] = {};
+     /* solid: the no-discard program (t24, opaque faces over texels none of which is transparent) */
+     void UseDraw(int fast, int solid = 0);
+     /* t24: the fast program with no discard (drawn without blending, alpha kept), for opaque
+      * faces no texel of which is transparent: the GPU can then skip hidden pixels */
+     GLuint m_drawProgSolid = 0;
+     DrawLocs m_locSolid = {};
++    /* t29: the depth pass's program for those faces: the draw vertex shader (the same depth to
++     * the bit) with a fragment shader that reads no texture (THPS_GL_DEPTHFS=0: the no-discard
++     * program, as t25-t28). UseDraw(1, 2) */
++    GLuint m_drawProgDepth = 0;
++    DrawLocs m_locDepth = {};
+     /* t25: the batched opaque faces' depth pass, then their colour within the decal tolerance,
+      * the no-discard program in both where it can (default; THPS_R3D_PREPASS=0: t24's single
+      * pass) */
+diff --git a/platform/pc/src/pc_fileio.cpp b/platform/pc/src/pc_fileio.cpp
+index 5b2fe73..774c1df 100644
+--- a/platform/pc/src/pc_fileio.cpp
++++ b/platform/pc/src/pc_fileio.cpp
+@@ -53,6 +53,21 @@ bool DirectIo() {
+ #endif
+ }
+ 
++#ifdef __vita__
++/* n bytes of fd from offset at into dest, in pieces of 1 MB; the count read */
++long ReadAt(SceUID fd, void *dest, long n, long at) {
++    long got = 0;
++    while (got < n) {
++        long k = n - got > (1 << 20) ? (1 << 20) : n - got;
++        int r = sceIoPread(fd, (char *)dest + got, (SceSize)k, (SceOff)(at + got));
++        if (r <= 0)
++            break;
++        got += r;
++    }
++    return got;
++}
++#endif
++
+ /* up to n bytes of path from its start into dest; the count read, -1 when it cannot be opened */
+ long ReadFile(const char *path, void *dest, long n) {
+ #ifdef __vita__
+@@ -178,12 +193,24 @@ void FileIo::ConvertDcFile() {
+     /* t28: its first bytes say (the whole file was read here, then again by Read: twice from
+      * the card for every model) */
+     uint8_t head[16];
+-    if (ReadFile(m_path, head, sizeof head) != (long)sizeof head)
++    long hn;
++#ifdef __vita__
++    hn = m_fd >= 0 ? ReadAt(m_fd, head, sizeof head, 0) : ReadFile(m_path, head, sizeof head);
++#else
++    hn = ReadFile(m_path, head, sizeof head);
++#endif
++    if (hn != (long)sizeof head)
+         PC_Fatal("cannot read %s", m_path);
+     if (!DcTextures::PsxIsV6(head, (uint32_t)m_size))
+         return;
+     uint8_t *data = (uint8_t *)malloc((size_t)m_size);
+-    if (ReadFile(m_path, data, m_size) != (long)m_size)
++    long dn;
++#ifdef __vita__
++    dn = m_fd >= 0 ? ReadAt(m_fd, data, m_size, 0) : ReadFile(m_path, data, m_size);
++#else
++    dn = ReadFile(m_path, data, m_size);
++#endif
++    if (dn != (long)m_size)
+         PC_Fatal("cannot read %s", m_path);
+     if (DcTextures::PsxIsV6(data, (uint32_t)m_size)) {
+         m_image = g_dcTextures.PsxStrip(data, (uint32_t)m_size, &outSize);
+@@ -211,6 +238,24 @@ int FileIo::Open(const char *name) {
+             SilentVab();
+         }
+     } else {
++#ifdef __vita__
++        /* t29: one lookup of the file a load (t28 had three: its size, its first bytes, the
++         * read; each ~200 ms on the card for the files in Data/): opened here, size and first
++         * bytes from the handle, read and closed by Read */
++        if (m_fd >= 0)
++            sceIoClose(m_fd);
++        m_fd = -1;
++        if (DirectIo()) {
++            SceUID fd = sceIoOpen(m_path, SCE_O_RDONLY, 0);
++            if (fd < 0)
++                PC_Fatal("cannot open %s", m_path);
++            m_fd = fd;
++            m_size = (int)sceIoLseek(fd, 0, SCE_SEEK_END);
++            ConvertDcFile();
++            PC_Trace("FileIO_Open(%s) -> %s, %d bytes", name, m_path, m_size);
++            return m_size;
++        }
++#endif
+         long sz = FileSize(m_path);
+         if (sz < 0)
+             PC_Fatal("cannot open %s", m_path);
+@@ -227,10 +272,21 @@ void FileIo::Read(void *dest, int size) {
+         free(m_image);
+         m_image = nullptr;
+     } else {
+-        if (ReadFile(m_path, dest, m_size) != (long)m_size)
++        long got;
++#ifdef __vita__
++        got = m_fd >= 0 ? ReadAt(m_fd, dest, m_size, 0) : ReadFile(m_path, dest, m_size);
++#else
++        got = ReadFile(m_path, dest, m_size);
++#endif
++        if (got != (long)m_size)
+             PC_Fatal("cannot read %s", m_path);
+         MarkLayoutSize((uint8_t *)dest, m_size);
+     }
++#ifdef __vita__
++    if (m_fd >= 0)
++        sceIoClose(m_fd);
++    m_fd = -1;
++#endif
+     if (size > m_size)
+         memset((uint8_t *)dest + m_size, 0, (size_t)(size - m_size));
+ }
+diff --git a/platform/pc/src/pc_gpu_gl.cpp b/platform/pc/src/pc_gpu_gl.cpp
+index bfb474b..5de4b06 100644
+--- a/platform/pc/src/pc_gpu_gl.cpp
++++ b/platform/pc/src/pc_gpu_gl.cpp
+@@ -2537,7 +2537,7 @@ void GlGpu::LayerDraw(int first, int count, int cls, uint16_t hd, int depth, int
+     if (!m_projSet || memcmp(proj, m_proj, sizeof proj)) {
+         memcpy(m_proj, proj, sizeof proj);
+         m_projSet = 1;
+-        m_projApplied[0] = m_projApplied[1] = m_projApplied[2] = 0;
++        m_projApplied[0] = m_projApplied[1] = m_projApplied[2] = m_projApplied[3] = 0;
+     }
+     UseDraw(slow_tris == 0);
+     if (slow_tris == 0 && m_drawProgFast) {
+@@ -2714,7 +2714,7 @@ bool GlGpu::LayerBatch(int first, int count, int cls, int why)
+     if (!m_projSet || memcmp(proj, m_proj, sizeof proj)) {
+         memcpy(m_proj, proj, sizeof proj);
+         m_projSet = 1;
+-        m_projApplied[0] = m_projApplied[1] = m_projApplied[2] = 0;
++        m_projApplied[0] = m_projApplied[1] = m_projApplied[2] = m_projApplied[3] = 0;
+     }
+     UseDraw(slow_tris == 0);
+     if (slow_tris == 0 && m_drawProgFast) {
+@@ -2749,7 +2749,7 @@ bool GlGpu::LayerBatch(int first, int count, int cls, int why)
+             glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+             glDepthMask(GL_TRUE);
+             if (!so.empty()) {
+-                UseDraw(1, 1);
++                UseDraw(1, 2);   /* (t29: the depth program, else the no-discard one) */
+                 DrawUniforms(ts[i]);
+                 glDisable(GL_BLEND);
+                 DPass(1);
+@@ -3444,6 +3444,29 @@ void GlGpu::Present(void *sdl_window, int x, int y, int w, int h, int enabled,
+         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+     }
+ #ifdef __vita__
++    {
++        /* t29: THPS_GL_GPUTIME=1 (a measurement; it stops the CPU and GPU overlapping): the
++         * frame drawn to the end before the swap, its GPU time logged every 60 frames */
++        static int gputime = -1;
++        static long long gpu_us, gpu_max;
++        static int gpu_n;
++        if (gputime < 0)
++            gputime = getenv("THPS_GL_GPUTIME") && atoi(getenv("THPS_GL_GPUTIME"));
++        if (gputime) {
++            long long g0 = PC_VitaProfNow();
++            glFinish();
++            long long g = PC_VitaProfNow() - g0;
++            gpu_us += g;
++            gpu_max = g > gpu_max ? g : gpu_max;
++            if (++gpu_n == 60) {
++                fprintf(stderr, "[gpu] last 60 frames: GPU finished %.1f ms after the frame was "
++                                "drawn (max %.1f) (THPS_GL_GPUTIME=1)\n",
++                        gpu_us / 60000.0, gpu_max / 1000.0);
++                gpu_us = gpu_max = 0;
++                gpu_n = 0;
++            }
++        }
++    }
+     long long prof_t1 = PC_VitaProfNow();
+     SDL_GL_SwapWindow(win);
+     ForgetFb();
+@@ -3543,10 +3566,12 @@ void GlGpu::QuadAttribs(const float *v, int stride_floats, int uv)
+ void GlGpu::UseDraw(int fast, int solid)
+ {
+     int f = fast && m_drawProgFast ? 1 : 0;
+-    if (f && solid && m_drawProgSolid)
++    if (f && solid == 2 && m_drawProgDepth)
++        f = 3;
++    else if (f && solid && m_drawProgSolid)
+         f = 2;
+-    glUseProgram(f == 2 ? m_drawProgSolid : f ? m_drawProgFast : m_drawProg);
+-    const DrawLocs &l = f == 2 ? m_locSolid : f ? m_locFast : m_locSlow;
++    glUseProgram(f == 3 ? m_drawProgDepth : f == 2 ? m_drawProgSolid : f ? m_drawProgFast : m_drawProg);
++    const DrawLocs &l = f == 3 ? m_locDepth : f == 2 ? m_locSolid : f ? m_locFast : m_locSlow;
+     m_drawUPass = l.pass;
+     m_drawUDpass = l.dpass;
+     m_drawUProj = l.proj;
+@@ -3680,6 +3705,37 @@ void GlGpu::SolidProgram()
+     glUseProgram(m_drawProg);
+     m_drawProgSolid = p;
+     fprintf(stderr, "[gl] opaque no-discard program: ok (THPS_GL_NODISCARD=0 turns it off)\n");
++
++    /* t29: the depth pass of those faces shaded nothing: every pixel the pass covers ran the
++     * whole texture lookup only for colour writes that were masked off (at 960x544 the GPU
++     * took ~25 ms a frame, t28). Compiled after the no-discard program; rejected, the depth
++     * pass keeps that one */
++    const char *df = getenv("THPS_GL_DEPTHFS");
++    if (df && df[0] == '0') {
++        fprintf(stderr, "[gl] depth-pass program: off (THPS_GL_DEPTHFS=0)\n");
++        return;
++    }
++    static const char depth_fs[] =
++        "#ifdef GL_ES\n"
++        "precision mediump float;\n"
++        "#endif\n"
++        "varying vec4 v_flags;\n"
++        "void main() {\n"
++        "    gl_FragColor = vec4(0.0, 0.0, 0.0, v_flags.x);\n"
++        "}\n";
++    GLuint d = Program(gl_draw_vs, depth_fs);
++    if (!d) {
++        fprintf(stderr, "[gl] depth-pass program: REJECTED by the compiler, off (source above)\n");
++        glUseProgram(m_drawProg);
++        return;
++    }
++    glUseProgram(d);
++    m_locDepth = DrawLocs{glGetUniformLocation(d, "u_pass"), glGetUniformLocation(d, "u_dpass"),
++                          glGetUniformLocation(d, "u_proj"), glGetUniformLocation(d, "u_target"),
++                          glGetUniformLocation(d, "u_shift"), glGetUniformLocation(d, "u_uvfix")};
++    glUseProgram(m_drawProg);
++    m_drawProgDepth = d;
++    fprintf(stderr, "[gl] depth-pass program: ok (THPS_GL_DEPTHFS=0 turns it off)\n");
+ }
+ 
+ /* row y of slot s's decoded texels: its 8x8 cells that hold a transparent one (0) */
+@@ -3713,7 +3769,7 @@ bool GlGpu::TriSolid(const GlVert *v) const
+ 
+ void GlGpu::AtlasUniforms()
+ {
+-    GLuint progs[3] = { m_drawProg, m_drawProgFast, m_drawProgSolid };
++    GLuint progs[4] = { m_drawProg, m_drawProgFast, m_drawProgSolid, m_drawProgDepth };
+     for (GLuint p : progs) {
+         if (!p)
+             continue;
+diff --git a/platform/pc/src/pc_video.cpp b/platform/pc/src/pc_video.cpp
+index ff86483..c861eb0 100644
+--- a/platform/pc/src/pc_video.cpp
++++ b/platform/pc/src/pc_video.cpp
+@@ -654,7 +654,7 @@ void Video::Init(int scale)
+     m_videoInited = true;
+ #ifdef __vita__
+     if (!InitGl(scale))
+-        PC_Fatal("The renderer did not start (SDL: %s). ux0:data/THPS/thps.log says which "
++        PC_Fatal("The renderer did not start (SDL: %s). the newest log in ux0:data/THPS/logs says which "
+                  "shader failed.", SDL_GetError());
+ #else
+     if (!InitGl(scale))
+diff --git a/platform/pc/src/pc_vita.cpp b/platform/pc/src/pc_vita.cpp
+index 5e54806..6aef5fd 100644
+--- a/platform/pc/src/pc_vita.cpp
++++ b/platform/pc/src/pc_vita.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <psp2/io/fcntl.h>
+ #include <psp2/io/stat.h>
++#include <psp2/io/dirent.h>
+ #include <psp2/kernel/clib.h>
+ #include <psp2/kernel/processmgr.h>
+ #include <psp2/power.h>
+@@ -43,6 +44,8 @@ char g_logRing[kLogRing];
+ uint32_t g_logPut, g_logOut;            /* bytes put (LogWrite), written (LogDrain) */
+ SceUID g_logSema = -1, g_logMutex = -1; /* lines put; one writer at a time (the thread, a flush) */
+ uint32_t g_logWrites, g_logSlowestUs;   /* for the profile's [log] line */
++long long g_logSyncedAt;                /* t29: the last sync (at most one a second) */
++bool g_logForce;                        /* the next drain syncs whatever the time */
+ 
+ /* all that has been put, into the file, then one sync */
+ void LogDrain() {
+@@ -59,7 +62,13 @@ void LogDrain() {
+         __atomic_store_n(&g_logOut, out, __ATOMIC_RELEASE);
+         wrote = true;
+     }
+-    if (wrote) {
++    /* t29: synced at most once a second (t28: syncs of up to 1.5 s, the card busy for the game's
++     * own reads); the exit and a flush sync at once. Written lines survive the game crashing (the
++     * system has them); only the console going down loses the last second */
++    long long now = (long long)sceKernelGetProcessTimeWide();
++    if (wrote && (g_logForce || now - g_logSyncedAt >= 1000000)) {
++        g_logForce = false;
++        g_logSyncedAt = now;
+         sceIoSyncByFd(g_logFd, 0);
+         uint32_t us = (uint32_t)((long long)sceKernelGetProcessTimeWide() - t0);
+         g_logWrites++;
+@@ -123,10 +132,34 @@ void LoadEnv() {
+ 
+ } // namespace
+ 
++/* t29: the newest keep of PC_VITA_DIR/logs/thps_*.log kept (the names sort by time) */
++static void PruneLogs(int keep) {
++    char names[64][64];
++    int n = 0;
++    SceUID d = sceIoDopen(PC_VITA_DIR "/logs");
++    if (d < 0)
++        return;
++    SceIoDirent e;
++    while (n < 64 && sceIoDread(d, &e) > 0) {
++        if (!strncmp(e.d_name, "thps_", 5) && strlen(e.d_name) < sizeof names[0] &&
++            strstr(e.d_name, ".log"))
++            snprintf(names[n++], sizeof names[0], "%s", e.d_name);
++    }
++    sceIoDclose(d);
++    qsort(names, (size_t)n, sizeof names[0], (int (*)(const void *, const void *))strcmp);
++    for (int i = 0; i < n - keep; i++) {
++        char path[128];
++        snprintf(path, sizeof path, PC_VITA_DIR "/logs/%s", names[i]);
++        sceIoRemove(path);
++    }
++}
++
+ /* os::Exit: the lines the writer thread hasn't written yet, written and synced now */
+ void PC_VitaLogFlush(void) {
+-    if (g_logSema >= 0)
++    if (g_logSema >= 0) {
++        g_logForce = true;
+         LogDrain();
++    }
+ }
+ 
+ /* Before the first log line (Runtime::Main): the data folder, the settings, stderr to
+@@ -136,25 +169,25 @@ void PC_VitaLogOpen(void) {
+     sceIoMkdir("ux0:data", 0777);
+     sceIoMkdir(PC_VITA_DIR, 0777);
+     LoadEnv();
+-    /* t23: each launch appends, after a blank line and the Vita's local time; over 4 MB at
+-     * launch the log becomes thps.old.log (replacing the last one) and a new one starts */
++    /* t29: a log file per start, PC_VITA_DIR/logs/thps_YYYY-MM-DD_HH-MM-SS.log (the Vita's local
++     * time; ':' can't be in a name), the newest 10 kept (t23-t28: one thps.log, appended) */
+     {
+-        SceIoStat ls;
+-        if (sceIoGetstat(PC_VITA_DIR "/thps.log", &ls) >= 0 && ls.st_size > 4 * 1024 * 1024) {
+-            sceIoRemove(PC_VITA_DIR "/thps.old.log");
+-            sceIoRename(PC_VITA_DIR "/thps.log", PC_VITA_DIR "/thps.old.log");
+-        }
+-    }
+-    g_logFd = sceIoOpen(PC_VITA_DIR "/thps.log", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0666);
+-    if (g_logFd >= 0) {
+         SceDateTime dt;
+-        char head[64];
++        char path[128], head[64];
+         memset(&dt, 0, sizeof dt);
+         sceRtcGetCurrentClockLocalTime(&dt);
+-        int n = snprintf(head, sizeof head, "\n===== %04u-%02u-%02u %02u:%02u:%02u =====\n",
+-                         (unsigned)dt.year, (unsigned)dt.month, (unsigned)dt.day,
+-                         (unsigned)dt.hour, (unsigned)dt.minute, (unsigned)dt.second);
+-        sceIoWrite(g_logFd, head, n);
++        sceIoMkdir(PC_VITA_DIR "/logs", 0777);
++        snprintf(path, sizeof path, PC_VITA_DIR "/logs/thps_%04u-%02u-%02u_%02u-%02u-%02u.log",
++                 (unsigned)dt.year, (unsigned)dt.month, (unsigned)dt.day, (unsigned)dt.hour,
++                 (unsigned)dt.minute, (unsigned)dt.second);
++        g_logFd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
++        if (g_logFd >= 0) {
++            int n = snprintf(head, sizeof head, "===== %04u-%02u-%02u %02u:%02u:%02u =====\n",
++                             (unsigned)dt.year, (unsigned)dt.month, (unsigned)dt.day,
++                             (unsigned)dt.hour, (unsigned)dt.minute, (unsigned)dt.second);
++            sceIoWrite(g_logFd, head, n);
++        }
++        PruneLogs(10);
+     }
+     const char *sync = getenv("THPS_LOG_SYNC");
+     if (g_logFd >= 0 && !(sync && atoi(sync))) {
+-- 
+2.53.0
+
