@@ -55,13 +55,7 @@ Saves, `Settings.ini` and logs are in `ux0:data/THPS`.
 | 3D | **native** / PlayStation | PlayStation = the PS1's own way, with its wobble |
 | Precise 3D | **on** / off | sub-pixel vertices, perspective-correct textures |
 
-`ux0:data/THPS/env.txt` (one `NAME=value` per line) overrides them for testing, e.g. `THPS_VITA_RES=864x488`,
-`THPS_FILTER=0`, `THPS_VITA_FPS=30`. `THPS_GLSTATS=1` adds renderer statistics to the log; an empty file
-`ux0:data/THPS/profile` adds per-second timings. Switches that turn single optimisations off (if something looks
-wrong, try these and report which one fixes it): `THPS_R3D_BATCH=0`, `THPS_R3D_PREPASS=0`, `THPS_GL_NODISCARD=0`,
-`THPS_GL_DEPTHFS=0`, `THPS_GL_HALF=0`, `THPS_GL_USEDBOX=0`, `THPS_GL_PARTIAL=0`, `THPS_GL_PRECISEINV=0`,
-`THPS_GL_SAMEBYTES=0`, `THPS_FMV_THREAD=0`, `THPS_GL_DECODE_THREADS=0`, `THPS_FILE_DIRECT=0`,
-`THPS_GL_SHADERCACHE=0`, `THPS_DATA_BUCKETS=0` (or `=undo` to move the Data files back).
+Every option of `ux0:data/THPS/env.txt` is listed under [env.txt options](#envtxt-options) below.
 
 ## Known bugs and limitations
 
@@ -77,6 +71,131 @@ wrong, try these and report which one fixes it): `THPS_R3D_BATCH=0`, `THPS_R3D_P
 - The first start is slow (see Installing).
 
 Please report bugs with the log from `ux0:data/THPS/logs` (and a crash dump `ux0:data/*.psp2dmp` if it crashed).
+
+## env.txt options
+
+`ux0:data/THPS/env.txt` is a text file of `NAME=value` lines (one per line, `#` starts a comment), read at start-up.
+You don't need one: the defaults are what v0.30 ships with. Options > Graphics saves resolution, widescreen,
+smoothing, frame rate, 3D mode and precise 3D (PGXP) to `Settings.ini`; the matching `env.txt` options below
+("Settings" in the default column) override the menu while they're in the file. An empty file named
+`ux0:data/THPS/profile` turns on per-second timings in the log (`[prof]` lines).
+
+Most performance options exist to turn one optimisation off: if something looks wrong, try them one at a time
+and report which one fixes it. The debug options are for development and can slow the game down.
+
+### Display and resolution
+
+| option | values | default | what it does |
+|---|---|---|---|
+| `THPS_VITA_RES` | 512x240, 720x408, 832x472, 864x488, 960x544 | Settings (960x544) | the size the game is drawn at before it's scaled to the screen; smaller is faster |
+| `THPS_WIDESCREEN` | 0, 1 | Settings (1) | 16:9 3D (1) or the PS1's 4:3 (0) |
+| `THPS_FILTER` | 0, 1 | Settings (1) | smooth (1) or sharp (0) scaling to the screen |
+| `THPS_VITA_FPS` | 30, 60 | Settings (60) | 30: every other frame shown (the game still runs at 60) |
+| `THPS_RENDER3D` | native, psx | Settings (native) | the native 3D renderer, or the PS1's own drawing (wobble and warping included) |
+| `THPS_PGXP` | 0, 1 | Settings (1) | 0: both of the next two off (the PS1's whole-pixel, affine look) |
+| `THPS_GL_PRECISE` | 0, 1 | 1 | 0: polygons at the PS1's whole-pixel positions (default: sub-pixel) |
+| `THPS_GL_PERSPECTIVE` | 0, 1 | 1 | 0: affine texturing like the PS1 (default: perspective-correct) |
+| `THPS_GL_SCALE` | n | off | draw the screens at exactly n times the PS1's 320x240 |
+| `THPS_DRAWDIST` | 50-400, full | Settings | draw distance in percent, or the entire level |
+| `THPS_OBJDIST` | 50-400 | Settings | object distance in percent |
+| `THPS_FOG` | 0, 1, 2 | Settings | fog: normal, light, off |
+| `THPS_SHADOWS` | 0, 1 | Settings | the skaters' shadows: the PS1's or the Dreamcast's |
+| `THPS_GLOWS` | retail | off | draw light glows the retail way instead of the port's round ones |
+| `THPS_WINDOW` | WxH | - | PC builds only: window size (no effect on the Vita) |
+| `THPS_SCALE` | n | 3 | PC builds only: headless window size (no effect on the Vita) |
+| `THPS_MSAA` | 0, 2, 4, 8 | - | PC builds only: antialiasing (the Vita has none) |
+| `THPS_VSYNC` | 0, 1 | - | PC builds only: VSync (the Vita is always synced) |
+| `THPS_HEADLESS` | 1 | - | PC builds only: no visible window (automated runs) |
+
+### Rendering and performance
+
+| option | values | default | what it does |
+|---|---|---|---|
+| `THPS_R3D_BATCH` | 0, 1 | 1 | 0: 3D faces drawn in small groups as before batching (slower) |
+| `THPS_R3D_PREPASS` | 0, 1 | 1 | 0: opaque faces in one pass (a little faster, decals can flicker) |
+| `THPS_GL_NODISCARD` | 0, 1 | 1 | 0: no faster shader for solid surfaces without see-through texels |
+| `THPS_GL_DEPTHFS` | 0, 1 | 1 | 0: the depth pass uses the full texture shader instead of a texture-free one |
+| `THPS_GL_HALF` | 0, 1 | 1 | 0: colour maths of solid surfaces in full precision instead of half |
+| `THPS_GL_FBCACHE` | 0, 1 | 1 | 0: bind the render target again at every draw (old behaviour) |
+| `THPS_GL_LAYERVBO` | 0, 1 | 1 | 0: a 3D layer's vertices copied at every draw instead of once into graphics memory |
+| `THPS_R3D_NEARDROP` | 1 | off | drop faces crossing the near plane as the PS1 did (default: clip them) |
+| `THPS_R3D_RETAILFADE` | 1 | off | leave fade-to-colour levels (Downhill Jam, Streets, menus) to the PS1 code |
+| `THPS_FAR_RANGE` | n | 30000 | entire-level draw distance: items reaching past n take the precise path |
+| `THPS_FAST` | 1 | off | don't hold the game to 60 Hz (runs as fast as it can) |
+
+### Textures and shaders
+
+| option | values | default | what it does |
+|---|---|---|---|
+| `THPS_GL_TEXCACHE` | 0, 1 | 1 | 0: no decoded texture cache (every texel looked up per pixel: much slower) |
+| `THPS_GL_INPLACE` | 0, 1 | 1 | 0: textures written through vitaGL's copies instead of in place |
+| `THPS_GL_DECODE_THREADS` | 0-3 | 3 | threads on cores 1-3 that decode texture pages with the game thread; 0: game thread alone |
+| `THPS_GL_DECODEMS` | n | 25 | ms of texture decoding a frame may spend after the first 2 pages |
+| `THPS_GL_WARMFRAMES` | n | 30 | frames after a loading screen that decode every page they draw, uncapped; 0: off |
+| `THPS_GL_SAMEBYTES` | 0, 1 | 1 | 0: texture writes of unchanged bytes are done anyway |
+| `THPS_GL_PRECISEINV` | 0, 1 | 1 | 0: texture writes reach cached pages by 16x16 blocks instead of exact areas |
+| `THPS_GL_PARTIAL` | 0, 1 | 1 | 0: changed cached pages are thrown away instead of updated in place |
+| `THPS_GL_USEDBOX` | 0, 1 | 1 | 0: a write anywhere on a page counts, even where no face reads |
+| `THPS_GL_SHADERCACHE` | 0, 1 | 1 | 0: shaders compiled at every start instead of loaded from ux0:data/THPS/shaders |
+| `THPS_GL_SELFTEST` | 0, 1 | 1 | 0: skip the start-up check of the texture paths |
+
+### Movies and audio
+
+| option | values | default | what it does |
+|---|---|---|---|
+| `THPS_FMV_THREAD` | 0, 1 | 1 | 0: movie pictures and level video screens decoded by the game thread alone |
+| `THPS_MOVIES` | 0 | on | skip every movie |
+| `THPS_AUDIO` | 0 | on | no sound |
+| `THPS_AUDIO_DUMP` | file | off | also write the mixed sound as raw 16-bit stereo 44.1 kHz to that file |
+
+### Loading and files
+
+| option | values | default | what it does |
+|---|---|---|---|
+| `THPS_FILE_DIRECT` | 0, 1 | 1 | 0: game files read with the C library as before (slower on the card) |
+| `THPS_DATA_BUCKETS` | 0, 1, undo | 1 | 0: leave Data's files where they are; undo: move them back out of the bk00-bk63 subfolders |
+| `THPS_DATA_BUCKETS_SECS` | n | 60 | the most seconds one start spends sorting Data (the rest at the next start) |
+| `THPS_DATA_DIR` | path | ux0:data/THPS/Data | where the extracted game files are |
+| `THPS_DISC` | path | - | the disc image for the first-start extraction (a .gdi: the Dreamcast disc) |
+| `THPS_MODS` | paths; none | - | extra mod folders (';'-separated); none: no mods at all |
+| `THPS_SAVE_DIR` | path | ux0:data/THPS | where saves go |
+
+### Debugging and logging (debug only)
+
+| option | values | default | what it does |
+|---|---|---|---|
+| `THPS_GLSTATS` | 1 | off | renderer statistics in the log every 60 frames |
+| `THPS_GL_GPUTIME` | 1 | off | log the GPU time per frame ([gpu]); slows the game |
+| `THPS_LOG_SYNC` | 1 | off | write and sync every log line on its own thread (slow; for crashes that take the console down) |
+| `THPS_R3DSTATS` | 1 | off | native 3D statistics once a second |
+| `THPS_R3D_VERIFY` | 1 | off | check the 3D renderer's maths against the PS1's |
+| `THPS_R3D_NCLIP` | 1 | off | back-face tests the PS1's way (comparison) |
+| `THPS_R3D_PROBE` | frame,x,y | off | log the 3D faces covering one screen point on one frame |
+| `THPS_R3D_DUMP` | 1 | off | with THPS_SHOT: also dump the 3D faces as text |
+| `THPS_GL_FLAT` | 1 | off | vertex colours only, no textures (a measurement) |
+| `THPS_GL_FASTVAR` | 1-4 | 0 | variants of the texture shader (a measurement) |
+| `THPS_GPUSTATS` | 1 | off | polygon counts per frame |
+| `THPS_GPUTRACE` | frame | off | log fills and drawing-state changes on that frame |
+| `THPS_GPUDUMP` | from-to | off | log every triangle submitted in those frames |
+| `THPS_GPUBT` | frame,x0,y0,x1,y1 | off | log a backtrace for the first triangle in that box on that frame |
+| `THPS_TRACE` | 1 | off | log songs, movies, the game's debug prints and player 1's actions |
+| `THPS_TRACE_CULL` | 1 | off | frustum-culling trace |
+| `THPS_TRACE_RENDER` | 1 | off | renderer trace |
+| `THPS_TRACE_SOUND` | 1 | off | sound channel, bank and reverb trace (with THPS_TRACE=1) |
+| `THPS_STRICT` | 1 | off | stop on a call to an unimplemented function |
+| `THPS_LOWMEM_FATAL` | 1 | off | crash on a read near address 0 instead of tolerating it |
+| `THPS_DETERMINISTIC` | 1 | off | a virtual clock: identical runs every time |
+| `THPS_POKE` | name[+off]:value,... | off | write values into game globals every frame (e.g. Cheat_LevelSelect:1) |
+| `THPS_WATCH` | addr | off | PC builds only: hardware watchpoint on a word |
+| `THPS_FRAMES` | n | off | quit after n frames |
+| `THPS_SHOT` | f1,f2,... | off | save screenshots (and VRAM) at those frames |
+| `THPS_SHOTDIR` | path | . | where THPS_SHOT saves |
+| `THPS_INPUT` | frame:mask,... | off | scripted pad input for player 1 |
+| `THPS_KEYS` | frame:Key+Key,... | off | scripted keyboard input |
+| `THPS_NOGAMEPAD` | 1 | off | ignore connected gamepads (scripted runs) |
+| `THPS_DBG_FILL` | bbggrr | off | screen clears in that colour, to show gaps |
+| `THPS_DBG_NOCLIP` | 1 | off | ignore the drawing area's clipping |
+| `THPS_DBG_NOSEMI` | 1 | off | draw semi-transparent primitives opaque |
 
 ## Building
 
