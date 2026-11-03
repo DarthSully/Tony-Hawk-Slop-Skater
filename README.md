@@ -101,11 +101,6 @@ and report which one fixes it. The debug options are for development and can slo
 | `THPS_FOG` | 0, 1, 2 | Settings | fog: normal, light, off |
 | `THPS_SHADOWS` | 0, 1 | Settings | the skaters' shadows: the PS1's or the Dreamcast's |
 | `THPS_GLOWS` | retail | off | draw light glows the retail way instead of the port's round ones |
-| `THPS_WINDOW` | WxH | - | PC builds only: window size (no effect on the Vita) |
-| `THPS_SCALE` | n | 3 | PC builds only: headless window size (no effect on the Vita) |
-| `THPS_MSAA` | 0, 2, 4, 8 | - | PC builds only: antialiasing (the Vita has none) |
-| `THPS_VSYNC` | 0, 1 | - | PC builds only: VSync (the Vita is always synced) |
-| `THPS_HEADLESS` | 1 | - | PC builds only: no visible window (automated runs) |
 
 ### Rendering and performance
 
@@ -186,7 +181,6 @@ and report which one fixes it. The debug options are for development and can slo
 | `THPS_LOWMEM_FATAL` | 1 | off | crash on a read near address 0 instead of tolerating it |
 | `THPS_DETERMINISTIC` | 1 | off | a virtual clock: identical runs every time |
 | `THPS_POKE` | name[+off]:value,... | off | write values into game globals every frame (e.g. Cheat_LevelSelect:1) |
-| `THPS_WATCH` | addr | off | PC builds only: hardware watchpoint on a word |
 | `THPS_FRAMES` | n | off | quit after n frames |
 | `THPS_SHOT` | f1,f2,... | off | save screenshots (and VRAM) at those frames |
 | `THPS_SHOTDIR` | path | . | where THPS_SHOT saves |
