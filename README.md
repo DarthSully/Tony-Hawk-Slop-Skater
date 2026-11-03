@@ -1,15 +1,15 @@
 # Tony Hawk Slop Skater
 
 **Tony Hawk's Pro Skater (PS1, 1999) running natively on the PlayStation Vita**, built from the community
-decompilation and its Windows/Linux port. No emulator: the game's own code, recompiled for the Vita's ARM CPU,
-with a native OpenGL ES renderer through vitaGL.
+**decompilation of the PS1 game** (SLUS-00860): the PS1's own code, recompiled for the Vita's ARM CPU, with a
+native OpenGL ES renderer through vitaGL. No emulator.
 
 > This repository contains **no game code from the retail disc, no game assets and no disc images**. You need your
 > own copy of Tony Hawk's Pro Skater (USA, SLUS-00860). Don't ask for, and don't share, game files.
 
 ## Features
 
-- All of THPS1 (career, single session, free skate, 2 player), from the PC port's decompiled code.
+- All of THPS1 (career, single session, free skate, 2 player), from the PS1 game's decompiled code.
 - Native 3D renderer: the PS1's polygons drawn as real 3D with a depth buffer, perspective-correct textures and
   sub-pixel vertices (PGXP-style), so no wobble and no texture warping.
 - **16:9 widescreen** at the Vita's native **960x544**, or lighter render sizes (864x488, 832x472, 720x408,
@@ -72,7 +72,7 @@ wrong, try these and report which one fixes it): `THPS_R3D_BATCH=0`, `THPS_R3D_P
 - Full-screen movies were slow (about 14 fps); sped up in the latest build, confirmation welcome.
 - Occasional flicker of decals (graffiti, lighting) on some surfaces; much reduced, report where you see it.
 - Graphics settings need a restart; there's no automatic resolution yet.
-- No anti-aliasing. The PS1's reverb is approximated (from the PC port).
+- No anti-aliasing. The PS1's reverb is approximated (in the decomp's runtime).
 - An animated texture may change a frame early.
 - The first start is slow (see Installing).
 
@@ -80,7 +80,8 @@ Please report bugs with the log from `ux0:data/THPS/logs` (and a crash dump `ux0
 
 ## Building
 
-The Vita port is a series of patches on top of the PC port, in `vita-build/patches`, applied by
+The Vita port is a series of patches on top of the decompilation's repository
+([TonyWasAProSkater](https://github.com/LANCommander/TonyWasAProSkater)), in `vita-build/patches`, applied by
 `vita-build/build-wsl.sh` to upstream commit `ed0ac5149c744177781879cc501d1e626533a649` (see `vita-build/BASE`).
 
 You need (Linux or WSL):
@@ -89,7 +90,7 @@ You need (Linux or WSL):
   `vitaShaRK` (`vdpm pacman -- -S --noconfirm --needed <pkg>`), git, python3.
 - From your own disc: `SLUS_008.60` (the executable; `dumpsxiso` from
   [mkpsxiso](https://github.com/Lameguy64/mkpsxiso) extracts it), which the build reads the function layout from.
-- The PC port's other build inputs: `build/psyq_names.tsv` (made by its `tools/psyq_sigmatch.py` from the
+- The decompilation's other build inputs: `build/psyq_names.tsv` (made by its `tools/psyq_sigmatch.py` from the
   [ghidra_psx_ldr](https://github.com/lab313ru/ghidra_psx_ldr) Psy-Q signatures) and a GNU v2 C++ demangler
   (binutils 2.26 `c++filt`, or Ghidra's `DemanglerGnu`), set as `GNU_DEMANGLER`.
 
@@ -99,9 +100,10 @@ bash vita-build/build-wsl.sh      # clones upstream, applies the patches, builds
 
 ## Credits
 
-- **Pat Hartl** and **LANCommander**: the [Windows/Linux port](https://github.com/LANCommander/TonyWasAProSkater)
-  this is built on, and the [matching decompilation](https://github.com/LANCommander/THPS) it came from. All the
-  game code here is their work; this project only adds the Vita port.
+- **Pat Hartl** and **LANCommander**: the [matching decompilation of the PS1 game](https://github.com/LANCommander/THPS)
+  and [TonyWasAProSkater](https://github.com/LANCommander/TonyWasAProSkater), the repository with the decompiled
+  code and the runtime that stands in for the PS1's hardware, which these patches build on. All the game code here
+  is their work; this project adds the Vita version.
 - **Neversoft** and **Activision**: the original game. Tony Hawk's Pro Skater © 1999 Activision, Inc. and
   Neversoft Entertainment.
 - **Rinnegatamante**: [vitaGL](https://github.com/Rinnegatamante/vitaGL) (LGPL-3.0),
